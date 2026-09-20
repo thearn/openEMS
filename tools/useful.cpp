@@ -48,7 +48,7 @@ double CalcNyquistFrequency(unsigned int nyquist, double dT)
 namespace
 {
 #ifdef __linux__
-//! CPUs of a cgroup CPU quota (rounded up), 0 if there is none
+// cpus of a cgroup cpu quota (rounded up), 0 if there is none
 unsigned int CgroupCPUQuota()
 {
 	// cgroup v2: "<quota> <period>" or "max <period>"

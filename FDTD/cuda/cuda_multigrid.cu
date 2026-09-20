@@ -136,6 +136,7 @@ void CUDA_MultiGridLink::InterpolateToBase()
 GPU_MultiGridLink* GPU_Backend_CUDA::CreateMultiGridLink(GPU_Backend* sub_grid, const GPU_MultiGridInterpolation& interpol)
 {
 	GPU_Backend_CUDA* sub = dynamic_cast<GPU_Backend_CUDA*>(sub_grid);
+	// only for a sub-grid on the same context: the coupling kernels are ordered by the shared stream
 	if (!sub || sub->d->ctx!=d->ctx)
 		return NULL;
 	return new CUDA_MultiGridLink(d, sub->d, interpol);

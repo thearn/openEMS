@@ -1420,13 +1420,12 @@ bool openEMS::CheckAbortCond()
 
 void openEMS::WriteDryRun()
 {
-	// what a run of this setup would cost: the cell updates it has to do and the data it would
-	// write. Everything but the timestepping has happened at this point, so these are the numbers
-	// of the operator, not an estimate of them.
+	// everything but the timestepping has already happened, so the cell count and the dump
+	// sizes below are the numbers of the operator, not an estimate of them
 	const uint64_t cells = FDTD_Op->GetNumberCells();
 
-	// the dumps of the time domain are given per timestep: the number of timesteps is usually
-	// decided by the end criteria during the run, not by the maximum here
+	// the time domain dumps are reported per timestep: how many timesteps a run takes is
+	// decided by the end criteria, not by the maximum reported below
 	double td_bytes_per_ts = 0;
 	uint64_t fd_bytes = 0;
 	size_t td_dumps = 0, fd_dumps = 0, probes = 0;
@@ -1533,8 +1532,8 @@ void openEMS::RunFDTD()
 	ProcessFields* ProcField = new ProcessFields(NewEngineInterface());
 	PA->AddProcessing(ProcField);
 	double maxE=0,currE=0;
-	// evaluate the energy end criteria once per Nyquist period, but at most every 100 timesteps
-	// (Dirac and step excitations have a Nyquist period of a single timestep)
+	// the energy end criteria once per Nyquist period, and no more often than every 100
+	// timesteps: a Dirac or step excitation has a Nyquist period of a single timestep
 	if (Eng_Ext_SSD==NULL)
 		ProcField->SetProcessInterval((std::max)(FDTD_Op->GetExcitationSignal()->GetNyquistNum(), 100u));   // (): not the max macro of windows.h
 

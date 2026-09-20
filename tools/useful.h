@@ -27,7 +27,7 @@ unsigned int CalcNyquistNum(double fmax, double dT);
 //! Calc the highest frequency allowed for a given nyquist number of timesteps and timestep
 double CalcNyquistFrequency(unsigned int nyquist, double dT);
 
-//! Number of CPUs this process can use: the visible CPUs, limited by the CPU affinity and a cgroup CPU quota (e.g. a container with a CPU limit)
+//! Number of CPUs this process may use: the visible ones, capped by the CPU affinity and by a cgroup CPU quota (a container with a CPU limit)
 unsigned int AvailableCPUs();
 
 //! Calculate an optimal job distribution to a given number of threads. Will return a vector with the jobs for each thread.
