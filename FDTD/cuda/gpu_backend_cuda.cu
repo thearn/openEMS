@@ -378,27 +378,37 @@ __global__ void field_dft(const float* __restrict__ f, const GPU_GatherEntry* __
 // the currents of the given main nodes again (update_currents), after the voltage extensions
 // changed voltages they read (see GPU_Backend_CUDA::Impl::fixup)
 __global__ void update_currents_nodes(const float* __restrict__ curr_in, float* __restrict__ curr_out, const float* __restrict__ volt,
-                                      const unsigned int* nodes, unsigned int count,
+                                      const CUDA_FixupEntry* entries, unsigned int count,
                                       const void* index, const float* ia, const float* ib, unsigned int mode, CUDA_GridDim N)
 {
 	const unsigned int k = blockIdx.x*blockDim.x + threadIdx.x;
 	if (k>=count)
 		return;
 	const unsigned int sn = N.nx*N.ny*N.nz;
-	const unsigned int i  = nodes[k];
+	const unsigned int i  = entries[k].node;
+	const unsigned int mask = entries[k].mask;
 	const unsigned int xp = N.ny*N.nz;
 	const unsigned int yp = N.nz;
 	const CUDA_MainCoeff C = main_coeff(index, ia, ib, mode, sn, i, 6);
 	float c;
-	c  = curr_in[i] * C.a[0];
-	c += C.b[0] * (volt[2*sn+i] - volt[2*sn+i+yp] - volt[sn+i] + volt[sn+i+1]);
-	curr_out[i] = c;
-	c  = curr_in[sn+i] * C.a[C.s];
-	c += C.b[C.s] * (volt[i] - volt[i+1] - volt[2*sn+i] + volt[2*sn+i+xp]);
-	curr_out[sn+i] = c;
-	c  = curr_in[2*sn+i] * C.a[2*C.s];
-	c += C.b[2*C.s] * (volt[sn+i] - volt[sn+i+xp] - volt[i] + volt[i+yp]);
-	curr_out[2*sn+i] = c;
+	if (mask&1)
+	{
+		c  = curr_in[i] * C.a[0];
+		c += C.b[0] * (volt[2*sn+i] - volt[2*sn+i+yp] - volt[sn+i] + volt[sn+i+1]);
+		curr_out[i] = c;
+	}
+	if (mask&2)
+	{
+		c  = curr_in[sn+i] * C.a[C.s];
+		c += C.b[C.s] * (volt[i] - volt[i+1] - volt[2*sn+i] + volt[2*sn+i+xp]);
+		curr_out[sn+i] = c;
+	}
+	if (mask&4)
+	{
+		c  = curr_in[2*sn+i] * C.a[2*C.s];
+		c += C.b[2*C.s] * (volt[sn+i] - volt[sn+i+xp] - volt[i] + volt[i+yp]);
+		curr_out[2*sn+i] = c;
+	}
 }
 
 // Field energy: the squared voltages and currents of the nodes below L, summed along x
@@ -567,44 +577,59 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 	// again. With the UPML regions in the kernel, region nodes cannot (the current flux is
 	// updated in place): then the region kernels update the regions.
 	const bool folded = fregions.count>0;
-	std::set<unsigned int> nodes;
+	std::map<unsigned int, unsigned int> nodes;
+	const bool component_fixups = !getenv("OPENEMS_CUDA_FIXUP_COMPONENTS") || (atoi(getenv("OPENEMS_CUDA_FIXUP_COMPONENTS"))!=0);
+	auto add_node = [&](const unsigned int p[3], int lower_axis, unsigned int mask)
+	{
+		unsigned int c[3] = {p[0], p[1], p[2]};
+		if (lower_axis>=0)
+		{
+			if (c[lower_axis]==0)
+				return;
+			--c[lower_axis];
+		}
+		const unsigned int start[3] = {main_start.nx, main_start.ny, main_start.nz};
+		const unsigned int stop[3] = {main_stop.nx, main_stop.ny, main_stop.nz};
+		const unsigned int n_lines[3] = {dim.nx, dim.ny, dim.nz};
+		bool ok = true;
+		for (int n=0; n<3; ++n)
+			ok &= (folded || ((c[n]>=start[n]) && (c[n]<stop[n]))) && (c[n]+1<n_lines[n]);
+		if (!ok)
+			return;
+		if (folded && (fused_region_of(fregions, c[0], c[1], c[2])>=0))
+			fregions.count = 0;
+		nodes[(c[0]*dim.ny + c[1])*dim.nz + c[2]] |= mask;
+	};
 	for (size_t k=0; k<volt_modified.size(); ++k)
 	{
 		const unsigned int node = volt_modified[k] % numCells;
 		const unsigned int p[3] = {node/(dim.ny*dim.nz), (node/dim.nz)%dim.ny, node%dim.nz};
-		const unsigned int start[3] = {main_start.nx, main_start.ny, main_start.nz};
-		const unsigned int stop[3] = {main_stop.nx, main_stop.ny, main_stop.nz};
-		const unsigned int n_lines[3] = {dim.nx, dim.ny, dim.nz};
-		for (int m=-1; m<3; ++m)   // the node itself and its lower neighbours
+		if (!component_fixups)
 		{
-			unsigned int c[3] = {p[0], p[1], p[2]};
-			if (m>=0)
-			{
-				if (c[m]==0)
-					continue;
-				--c[m];
-			}
-			bool ok = true;
-			for (int n=0; n<3; ++n)
-				ok &= (folded || ((c[n]>=start[n]) && (c[n]<stop[n]))) && (c[n]+1<n_lines[n]);
-			if (!ok)
-				continue;
-			if (folded && (fused_region_of(fregions, c[0], c[1], c[2])>=0))
-				fregions.count = 0;   // a region node: no regions in the kernel
-			nodes.insert((c[0]*dim.ny + c[1])*dim.nz + c[2]);
+			for (int m=-1; m<3; ++m)
+				add_node(p, m, 7);
+			continue;
 		}
+		const unsigned int voltage_component = volt_modified[k]/numCells;
+		for (unsigned int current_component=0; current_component<3; ++current_component)
+			if (current_component!=voltage_component)
+			{
+				const unsigned int mask = 1u<<current_component;
+				add_node(p, -1, mask);
+				add_node(p, 3-current_component-voltage_component, mask);
+			}
 	}
-	std::vector<unsigned int> list;
-	for (std::set<unsigned int>::const_iterator it=nodes.begin(); it!=nodes.end(); ++it)
+	std::vector<CUDA_FixupEntry> list;
+	for (std::map<unsigned int, unsigned int>::const_iterator it=nodes.begin(); it!=nodes.end(); ++it)
 	{
-		const unsigned int c[3] = {*it/(dim.ny*dim.nz), (*it/dim.nz)%dim.ny, *it%dim.nz};
+		const unsigned int c[3] = {it->first/(dim.ny*dim.nz), (it->first/dim.nz)%dim.ny, it->first%dim.nz};
 		if ((c[0]>=main_start.nx) && (c[0]<main_stop.nx) && (c[1]>=main_start.ny) && (c[1]<main_stop.ny) && (c[2]>=main_start.nz) && (c[2]<main_stop.nz))
-			list.push_back(*it);   // main nodes only, the region kernels update the others after the extensions
+			list.push_back({it->first, it->second});
 		else if (fregions.count)
-			list.push_back(*it);
+			list.push_back({it->first, it->second});
 	}
 	fixup_count = list.size();
-	fixup = Alloc<unsigned int>(fixup_count, list.data());
+	fixup = Alloc<CUDA_FixupEntry>(fixup_count, list.data());
 
 	// both buffers start with the current fields
 	volt_next = Alloc<float>(3*numCells);
@@ -868,7 +893,7 @@ void GPU_Backend_CUDA::UpdateCurrents()
 		// done by update_fused, but for the currents next to voltages changed by extensions since
 		if (d->fixup_count)
 			CUDA_Launch(d, "update_currents_nodes", update_currents_nodes, d->fixup_count, 1, 1, (const float*)d->curr, d->curr_next, (const float*)d->volt,
-			            (const unsigned int*)d->fixup, d->fixup_count, (const void*)d->index,
+			            (const CUDA_FixupEntry*)d->fixup, d->fixup_count, (const void*)d->index,
 			            (const float*)(c ? d->coeff : d->ii), (const float*)(c ? d->coeff : d->iv), d->coeff_mode, d->dim);
 		std::swap(d->curr, d->curr_next);
 		return;

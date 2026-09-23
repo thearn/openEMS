@@ -80,6 +80,12 @@ struct CUDA_Context
 	~CUDA_Context();
 };
 
+struct CUDA_FixupEntry
+{
+	unsigned int node;
+	unsigned int mask;
+};
+
 //! State of one grid
 struct GPU_Backend_CUDA::Impl
 {
@@ -114,7 +120,7 @@ struct GPU_Backend_CUDA::Impl
 	float *volt_next, *curr_next;
 	std::vector<unsigned int> volt_modified; //!< flat indices of the voltages the extensions register as changed between the half-steps (excitation, lumped RLC)
 	CUDA_FusedRegions fregions;              //!< the UPML regions in the kernel (see CUDA_Ext_UPML::CanFuse())
-	unsigned int* fixup;                     //!< main nodes whose currents are recomputed after the voltage extensions
+	CUDA_FixupEntry* fixup;                  //!< main nodes/components recomputed after the voltage extensions
 	unsigned int fixup_count;
 	//! Decide once whether the fused step is used, and prepare it
 	bool DecideFusedStep();
