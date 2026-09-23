@@ -30,6 +30,8 @@
 #include "FDTD/extensions/engine_ext_upml.h"
 #include "FDTD/extensions/engine_ext_excitation.h"
 #include "FDTD/extensions/engine_ext_lumpedRLC.h"
+#include "FDTD/extensions/engine_ext_lorentzmaterial.h"
+#include "FDTD/extensions/engine_ext_mur_abc.h"
 #include "FDTD/extensions/engine_ext_steadystate.h"
 
 // Main FDTD updates, operation by operation the same as Engine::UpdateVoltages/UpdateCurrents,
@@ -1055,6 +1057,7 @@ GPU_Extension* GPU_Backend_CUDA::CreateExtension(Engine_Extension* eng_ext, Engi
 {
 	// the fused step (see update_fused) knows the UPML, the excitation, lumped RLC elements and the steady-state detection
 	if (!dynamic_cast<Engine_Ext_UPML*>(eng_ext) && !dynamic_cast<Engine_Ext_Excitation*>(eng_ext) && !dynamic_cast<Engine_Ext_LumpedRLC*>(eng_ext)
+	    && !dynamic_cast<Engine_Ext_LorentzMaterial*>(eng_ext) && !dynamic_cast<Engine_Ext_Mur_ABC*>(eng_ext)
 	    && !dynamic_cast<Engine_Ext_SteadyState*>(eng_ext))
 		d->fused_blockers++;
 	for (size_t n=0; n<sizeof(CUDA_EXTENSIONS)/sizeof(CUDA_EXTENSIONS[0]); ++n)

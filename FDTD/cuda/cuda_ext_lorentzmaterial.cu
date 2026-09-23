@@ -84,7 +84,7 @@ protected:
 		float *c_int, *c_ext, *c_lor;
 	};
 
-	void Setup(std::vector<Order>& orders, unsigned int count, unsigned int** pos,
+	void Setup(std::vector<Order>& orders, unsigned int count, unsigned int** pos, bool voltage,
 	           bool lorentz, FDTD_FLOAT** c_int, FDTD_FLOAT** c_ext, FDTD_FLOAT** c_lor);
 	float* Coefficients(unsigned int count, FDTD_FLOAT** c);
 	void Pre(Order& o, float* field)
@@ -109,10 +109,10 @@ CUDA_Ext_LorentzMaterial::CUDA_Ext_LorentzMaterial(GPU_Backend_CUDA::Impl* impl,
 	{
 		const unsigned int count = op_ext->m_LM_Count.at(o);
 		if (op_ext->m_volt_ADE_On[o])
-			Setup(m_Volt, count, op_ext->m_LM_pos[o], op_ext->m_volt_Lor_ADE_On[o],
+			Setup(m_Volt, count, op_ext->m_LM_pos[o], true, op_ext->m_volt_Lor_ADE_On[o],
 			      op_ext->v_int_ADE[o], op_ext->v_ext_ADE[o], op_ext->m_volt_Lor_ADE_On[o] ? op_ext->v_Lor_ADE[o] : NULL);
 		if (op_ext->m_curr_ADE_On[o])
-			Setup(m_Curr, count, op_ext->m_LM_pos[o], op_ext->m_curr_Lor_ADE_On[o],
+			Setup(m_Curr, count, op_ext->m_LM_pos[o], false, op_ext->m_curr_Lor_ADE_On[o],
 			      op_ext->i_int_ADE[o], op_ext->i_ext_ADE[o], op_ext->m_curr_Lor_ADE_On[o] ? op_ext->i_Lor_ADE[o] : NULL);
 	}
 }
@@ -127,7 +127,7 @@ float* CUDA_Ext_LorentzMaterial::Coefficients(unsigned int count, FDTD_FLOAT** c
 	return d->Alloc<float>(data.size(), data.data());
 }
 
-void CUDA_Ext_LorentzMaterial::Setup(std::vector<Order>& orders, unsigned int count, unsigned int** pos,
+void CUDA_Ext_LorentzMaterial::Setup(std::vector<Order>& orders, unsigned int count, unsigned int** pos, bool voltage,
                                      bool lorentz, FDTD_FLOAT** c_int, FDTD_FLOAT** c_ext, FDTD_FLOAT** c_lor)
 {
 	if (count==0)
@@ -140,6 +140,10 @@ void CUDA_Ext_LorentzMaterial::Setup(std::vector<Order>& orders, unsigned int co
 	std::vector<unsigned int> flat(count);
 	for (unsigned int i=0; i<count; ++i)
 		flat[i] = (pos[0][i]*d->dim.ny + pos[1][i])*d->dim.nz + pos[2][i];
+	if (voltage)
+		for (unsigned int n=0; n<3; ++n)
+			for (unsigned int i=0; i<count; ++i)
+				d->volt_modified.push_back(n*d->numCells + flat[i]);
 	ord.pos = d->Alloc<unsigned int>(count, flat.data());
 
 	ord.ade = d->Alloc<float>(3*(size_t)count);

@@ -110,6 +110,20 @@ CUDA_Ext_Mur_ABC::CUDA_Ext_Mur_ABC(GPU_Backend_CUDA::Impl* impl, Operator_Ext_Mu
 	m_Param.nj = op_ext->m_numLines[1];
 
 	const size_t count = (size_t)m_Param.ni*m_Param.nj;
+	// MUR overwrites both tangential boundary voltages between the voltage and
+	// current half-steps. The fused kernel computes currents before that
+	// overwrite, so register those voltage edges for the existing current
+	// fixup pass.
+	for (unsigned int i=0; i<m_Param.ni; ++i)
+		for (unsigned int j=0; j<m_Param.nj; ++j)
+		{
+			unsigned int pos[3];
+			pos[m_Param.ny] = m_Param.line;
+			pos[m_Param.nyP] = i;
+			pos[m_Param.nyPP] = j;
+			d->volt_modified.push_back(((m_Param.nyP*d->dim.nx + pos[0])*d->dim.ny + pos[1])*d->dim.nz + pos[2]);
+			d->volt_modified.push_back(((m_Param.nyPP*d->dim.nx + pos[0])*d->dim.ny + pos[1])*d->dim.nz + pos[2]);
+		}
 	m_Volt_nyP  = d->Alloc<float>(count);
 	m_Volt_nyPP = d->Alloc<float>(count);
 	m_Coeff_nyP  = d->Alloc<float>(count, op_ext->m_Mur_Coeff_nyP.data());
