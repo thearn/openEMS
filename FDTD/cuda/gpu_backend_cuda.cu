@@ -210,6 +210,7 @@ __device__ __forceinline__ void fused_volt(const float* __restrict__ volt, const
 // With the UPML regions in the kernel (F.count>0, [B, E) is the whole grid), the region nodes
 // are computed like the main nodes, from the current flux (the new voltage flux goes to a
 // second buffer, written by the node's own block; the current flux in place).
+template<unsigned int MODE, bool HAS_REGIONS>
 __global__ void __launch_bounds__(FUSED_TZ*FUSED_TY) update_fused(
 	const float* __restrict__ volt_in, const float* __restrict__ curr_in, float* volt_out, float* __restrict__ curr_out,
 	const void* index, const float* va, const float* vb, const float* ia, const float* ib, unsigned int mode,
@@ -225,15 +226,16 @@ __global__ void __launch_bounds__(FUSED_TZ*FUSED_TY) update_fused(
 	const bool owner = main_yz && (tz<FUSED_TZ-1) && (ty<FUSED_TY-1);  // written by this block
 	const bool in_grid = (z<N.nz) && (y<N.ny);
 	const unsigned int sn = N.nx*N.ny*N.nz;
+	const unsigned int coeff_mode = MODE<3 ? MODE : mode;
 
 	// the new voltages at x: computed on main nodes, else from the UPML regions (or unused)
 	auto volt_at = [&](unsigned int x, float v[3])
 	{
 		if (main_yz && (x<E.nx))
 		{
-			const int r = F.count ? fused_region_of(F, x, y, z) : -1;
+			const int r = HAS_REGIONS && F.count ? fused_region_of(F, x, y, z) : -1;
 			if (r<0)
-				fused_volt(volt_in, curr_in, index, va, vb, mode, N, x, y, z, v);
+				fused_volt(volt_in, curr_in, index, va, vb, coeff_mode, N, x, y, z, v);
 			else
 				upml_volt_value(volt_in, curr_in, F.volt[r], N, F.R[r], x, y, z, owner && (x<xe), v);
 			if (owner && (x<xe))
@@ -270,13 +272,13 @@ __global__ void __launch_bounds__(FUSED_TZ*FUSED_TY) update_fused(
 				curl[1] = (sV[0][ty][tz] - sV[0][ty][tz+1] - sV[2][ty][tz] + v1[2]);
 				curl[2] = (sV[1][ty][tz] - v1[1] - sV[0][ty][tz] + sV[0][ty+1][tz]);
 			}
-			const int r = F.count ? fused_region_of(F, x, y, z) : -1;
+			const int r = HAS_REGIONS && F.count ? fused_region_of(F, x, y, z) : -1;
 			if (r>=0)
 				upml_curr_value(curr_in, curr_out, F.curr[r], N, F.R[r], x, y, z, update, curl);
 			else if (update)
 			{
 				const unsigned int i = nijk(N, 0, x, y, z);
-				const CUDA_MainCoeff C = main_coeff(index, ia, ib, mode, sn, i, 6);
+				const CUDA_MainCoeff C = main_coeff(index, ia, ib, coeff_mode, sn, i, 6);
 				float c;
 				//for x
 				c  = curr_in[i] * C.a[0];
@@ -292,10 +294,21 @@ __global__ void __launch_bounds__(FUSED_TZ*FUSED_TY) update_fused(
 				curr_out[2*sn+i] = c;
 			}
 		}
+
 		__syncthreads();
 		sV[0][ty][tz] = v1[0]; sV[1][ty][tz] = v1[1]; sV[2][ty][tz] = v1[2];
 		__syncthreads();
 	}
+}
+
+template<unsigned int MODE, bool HAS_REGIONS>
+static void launch_update_fused(dim3 grid, dim3 block, cudaStream_t stream,
+	const float* volt_in, const float* curr_in, float* volt_out, float* curr_out,
+	const void* index, const float* va, const float* vb, const float* ia, const float* ib,
+	unsigned int mode, CUDA_GridDim N, CUDA_GridDim B, CUDA_GridDim E, CUDA_FusedRegions F, unsigned int xc)
+{
+	update_fused<MODE, HAS_REGIONS><<<grid, block, 0, stream>>>(
+		volt_in, curr_in, volt_out, curr_out, index, va, vb, ia, ib, mode, N, B, E, F, xc);
 }
 
 // the dumped values of a snapshot: entries [0, nv) from the voltages, [nv, n) from the currents
@@ -816,10 +829,23 @@ void GPU_Backend_CUDA::UpdateVoltages()
 		const bool timed = CUDA_KernelTimes::Enabled();
 		if (timed)
 			CUDA_KernelTimes::Begin(d->Stream());
-		update_fused<<<grid, block, 0, d->Stream()>>>((const float*)d->volt, (const float*)d->curr, d->volt_next, d->curr_next, (const void*)d->index,
-		                                              (const float*)(c ? d->coeff : d->vv), (const float*)(c ? d->coeff : d->vi),
-		                                              (const float*)(c ? d->coeff : d->ii), (const float*)(c ? d->coeff : d->iv),
-		                                              d->coeff_mode, d->dim, B, E, d->fregions, xc);
+		const float* va = (const float*)(c ? d->coeff : d->vv);
+		const float* vb = (const float*)(c ? d->coeff : d->vi);
+		const float* ia = (const float*)(c ? d->coeff : d->ii);
+		const float* ib = (const float*)(c ? d->coeff : d->iv);
+		const bool specialize = !(getenv("OPENEMS_CUDA_FUSED_SPECIALIZE") && atoi(getenv("OPENEMS_CUDA_FUSED_SPECIALIZE"))==0);
+		if (!specialize || d->fregions.count)
+			launch_update_fused<3, true>(grid, block, d->Stream(), (const float*)d->volt, (const float*)d->curr,
+				d->volt_next, d->curr_next, (const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, xc);
+		else if (d->coeff_mode==0)
+			launch_update_fused<0, false>(grid, block, d->Stream(), (const float*)d->volt, (const float*)d->curr,
+				d->volt_next, d->curr_next, (const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, xc);
+		else if (d->coeff_mode==1)
+			launch_update_fused<1, false>(grid, block, d->Stream(), (const float*)d->volt, (const float*)d->curr,
+				d->volt_next, d->curr_next, (const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, xc);
+		else
+			launch_update_fused<2, false>(grid, block, d->Stream(), (const float*)d->volt, (const float*)d->curr,
+				d->volt_next, d->curr_next, (const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, xc);
 		d->CheckLaunch("update_fused");
 		if (timed)
 			CUDA_KernelTimes::End(d->Stream(), "update_fused");
