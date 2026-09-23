@@ -65,6 +65,7 @@ cdef extern from "openEMS/openems.h":
         void RunFDTD()  nogil except +
 
         bool Write2XML(string file)
+        string GetOperatorIdentity()
         bool ReadFromXML(string file)
 
         @staticmethod

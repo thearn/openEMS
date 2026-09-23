@@ -712,9 +712,10 @@ cdef class openEMS:
         (which needs ``keep_operator=True``).
 
         The fields, engine extensions, and processing objects are recreated;
-        the discretized geometry and update coefficients are retained. The
-        caller must not mutate the CSX structure between runs. With
-        ``keep_operator=False`` the operator is freed after this run.
+        the discretized geometry and update coefficients are retained.
+        Operator-defining changes are rejected; stopping rules and
+        probe/dump-only changes are permitted. With ``keep_operator=False``
+        the operator is freed after this run.
         """
         sim_path = os.path.abspath(sim_path)
         if cleanup and os.path.exists(sim_path):
@@ -733,6 +734,10 @@ cdef class openEMS:
             return EC
         with nogil:
             self.thisptr.RunFDTD()
+
+    def GetOperatorIdentity(self):
+        """Return the versioned serialized identity of the reusable operator."""
+        return self.thisptr.GetOperatorIdentity().decode('UTF-8')
 
     def SetAbort(self, val):
         self.thisptr.SetAbort(val)
