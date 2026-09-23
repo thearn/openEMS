@@ -126,8 +126,10 @@ public:
 	bool Write2XML(TiXmlNode* rootNode);
 	bool Write2XML(std::string file);
 	bool ReadFromXML(std::string file);
+	std::string GetOperatorIdentity() const {return m_OperatorIdentity;}
 
 protected:
+	std::string BuildOperatorIdentity();
 	void collectCommandLineArguments();
 
 	bool CylinderCoords;
@@ -158,6 +160,7 @@ protected:
 	Engine* FDTD_Eng;
 	Engine_Ext_SteadyState* Eng_Ext_SSD; //!< non-owning observer; owned/deleted by the engine (m_Eng_exts)
 	ProcessingArray* PA;
+	std::string m_OperatorIdentity;
 
 	Excitation* m_Exc;
 

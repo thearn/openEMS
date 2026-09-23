@@ -19,6 +19,7 @@
 #include <iomanip>
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include "tools/signal.h"
 #include "tools/useful.h"
 #include "FDTD/operator_cylinder.h"
@@ -112,6 +113,7 @@ void openEMS::Reset()
 	delete m_Exc;
 	m_Exc=0;
 	Eng_Ext_SSD=0; // non-owning observer; deleted by the engine (m_Eng_exts) in 'delete FDTD_Eng' above
+	m_OperatorIdentity.clear();
 
 	CylinderCoords = false;
 	m_CC_MultiGrid.clear();
@@ -1099,6 +1101,60 @@ bool openEMS::Write2XML(std::string file)
 	return doc.SaveFile();
 }
 
+std::string openEMS::BuildOperatorIdentity()
+{
+	TiXmlDocument doc;
+	if (!Write2XML(&doc))
+		return "";
+
+	TiXmlElement* main = doc.FirstChildElement("openEMS");
+	TiXmlElement* fdtd = main ? main->FirstChildElement("FDTD") : NULL;
+	if (!fdtd)
+		return "";
+	fdtd->RemoveAttribute("NumberOfTimesteps");
+	fdtd->RemoveAttribute("MaxTime");
+	fdtd->RemoveAttribute("endCriteria");
+	fdtd->RemoveAttribute("OverSampling");
+
+	TiXmlElement* csx = main->FirstChildElement("ContinuousStructure");
+	TiXmlElement* props = csx ? csx->FirstChildElement("Properties") : NULL;
+	if (props)
+	{
+		for (TiXmlElement* elem = props->FirstChildElement(); elem;)
+		{
+			TiXmlElement* next = elem->NextSiblingElement();
+			const std::string name = elem->Value();
+			if (name=="ProbeBox" || name=="DumpBox")
+				props->RemoveChild(elem);
+			else
+			{
+				for (TiXmlElement* child = elem->FirstChildElement(); child;)
+				{
+					TiXmlElement* childNext = child->NextSiblingElement();
+					const std::string childName = child->Value();
+					if (childName=="FillColor" || childName=="EdgeColor")
+						elem->RemoveChild(child);
+					child = childNext;
+				}
+			}
+			elem = next;
+		}
+	}
+
+	TiXmlPrinter printer;
+	doc.Accept(&printer);
+	std::ostringstream identity;
+	identity << std::setprecision(17)
+	         << "openems-operator-identity-v1\n"
+	         << "engine=" << static_cast<int>(m_engine) << "\n"
+	         << "threads=" << m_engine_numThreads << "\n"
+	         << "time_step_method=" << m_TS_method << "\n"
+	         << "time_step=" << m_TS << "\n"
+	         << "time_step_factor=" << m_TS_fac << "\n"
+	         << printer.CStr();
+	return identity.str();
+}
+
 bool openEMS::ReadFromXML(std::string file)
 {
 	this->Reset();
@@ -1178,6 +1234,13 @@ int openEMS::SetupFDTD()
 	std::string ec = m_CSX->Update();
 	if (!ec.empty())
 		cerr << ec << endl;
+	const std::string operatorIdentity = BuildOperatorIdentity();
+	if (operatorIdentity.empty())
+	{
+		cerr << "openEMS::SetupFDTD: Error, unable to construct operator identity!" << endl;
+		Signal::SetupHandlerForSIGINT(SIGNAL_ORIGINAL);
+		return 3;
+	}
 	if (g_settings.GetVerboseLevel()>2)
 		m_CSX->ShowPropertyStatus(cerr);
 
@@ -1373,6 +1436,7 @@ int openEMS::SetupFDTD()
 		PA->DumpBoxes2File("box_dump_");
 	}
 
+	m_OperatorIdentity = operatorIdentity;
 	Signal::SetupHandlerForSIGINT(SIGNAL_ORIGINAL);
 	return 0;
 }
@@ -1384,6 +1448,21 @@ int openEMS::RestartFDTD()
 		cerr << "openEMS::RestartFDTD: Error, no existing operator to reuse!" << endl;
 		return 3;
 	}
+	std::string ec = m_CSX->Update();
+	if (!ec.empty())
+		cerr << ec << endl;
+	const bool checkIdentity = !getenv("OPENEMS_REUSE_IDENTITY") || atoi(getenv("OPENEMS_REUSE_IDENTITY"))!=0;
+	if (checkIdentity)
+	{
+		const std::string identity = BuildOperatorIdentity();
+		if (identity.empty() || identity != m_OperatorIdentity)
+		{
+			cerr << "openEMS::RestartFDTD: Error, operator-defining inputs changed since SetupFDTD; refusing stale operator reuse." << endl;
+			return 4;
+		}
+	}
+	if (!m_Exc->buildExcitationSignal(NrTS))
+		return 2;
 
 	if (PA)
 		PA->DeleteAll();
