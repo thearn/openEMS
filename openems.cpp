@@ -1377,6 +1377,40 @@ int openEMS::SetupFDTD()
 	return 0;
 }
 
+int openEMS::RestartFDTD()
+{
+	if (FDTD_Op==NULL)
+	{
+		cerr << "openEMS::RestartFDTD: Error, no existing operator to reuse!" << endl;
+		return 3;
+	}
+
+	if (PA)
+		PA->DeleteAll();
+	delete PA;
+	PA = NULL;
+	delete FDTD_Eng;
+	FDTD_Eng = FDTD_Op->CreateEngine();
+	Eng_Ext_SSD = NULL;
+
+	for (size_t n=0; n<FDTD_Op->GetNumberOfExtentions(); ++n)
+	{
+		Operator_Ext_SteadyState* op_ext =
+			dynamic_cast<Operator_Ext_SteadyState*>(FDTD_Op->GetExtension(n));
+		if (!op_ext)
+			continue;
+		Eng_Ext_SSD =
+			dynamic_cast<Engine_Ext_SteadyState*>(op_ext->GetEngineExtention());
+		if (Eng_Ext_SSD)
+			Eng_Ext_SSD->SetEngineInterface(this->NewEngineInterface());
+		break;
+	}
+
+	if (SetupProcessing()==false)
+		return 2;
+	return 0;
+}
+
 string FormatTime(int sec)
 {
 	stringstream ss;

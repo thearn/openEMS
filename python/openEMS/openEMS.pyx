@@ -682,6 +682,30 @@ cdef class openEMS:
         with nogil:
             self.thisptr.RunFDTD()
 
+    def RunReuse(self, sim_path, cleanup=False, **kw):
+        """Rerun using the operator built by the preceding :meth:`Run`.
+
+        The fields, engine extensions, and processing objects are recreated;
+        the discretized geometry and update coefficients are retained. The
+        caller must not mutate the CSX structure between runs.
+        """
+        sim_path = os.path.abspath(sim_path)
+        if cleanup and os.path.exists(sim_path):
+            self._cleanup_sim_path(sim_path, verbose=kw.get('verbose'))
+        if not os.path.exists(sim_path):
+            os.mkdir(sim_path)
+        os.chdir(sim_path)
+
+        self._SetLibraryArguments(kw)
+        cdef int EC
+        with nogil:
+            EC = self.thisptr.RestartFDTD()
+        if EC!=0:
+            print('RunReuse: Restart failed, error code: {}'.format(EC))
+            return EC
+        with nogil:
+            self.thisptr.RunFDTD()
+
     def SetAbort(self, val):
         self.thisptr.SetAbort(val)
 
