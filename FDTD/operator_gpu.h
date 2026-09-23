@@ -42,14 +42,15 @@ protected:
 	//! use New() for creating a new Operator
 	Operator_GPU(GPU_Backend* backend);
 
-	//! Calc_EC_Range() and CalcPEC_Range() over x line ranges in parallel
+	//! Calc_EC_Range(), CalcPEC_Range() and CalcUpdateCoefficientsRange() over x line ranges in parallel
 	/*!
 	  Operator_GPU derives from the basic Operator, whose storage the host mirror
 	  of Engine_GPU uses; Operator_Multithread is an Operator_SSE_Compressed and
-	  brings the wrong one. Only these two build steps are worth repeating here.
+	  brings the wrong one. Only these three build steps are worth repeating here.
 	  */
 	virtual bool Calc_EC();
 	virtual bool CalcPEC();
+	virtual void CalcUpdateCoefficients();
 	virtual double DeviceLanczosMaxEig(const float* SC, const float* IL, size_t i0, size_t sx, size_t sy, size_t sz, int iterations) const;
 
 	//! x line ranges of the threads, at most one per available CPU, bounds inclusive
