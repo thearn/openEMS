@@ -773,12 +773,13 @@ bool GPU_Backend_CUDA::Init(const Operator* op)
 	const size_t sn = d->numCells;
 	const std::vector<float>* src[4] = {&vv, &vi, &ii, &iv};
 	GPU_CoeffSets sets;
+	const char* force_compressed = getenv("OPENEMS_CUDA_COEFF_COMPRESSED");
 	if (GPU_FindSets(sn, 12, [&](size_t i, float* values)
 	    {
 		    for (int c=0; c<4; ++c)
 			    for (int n=0; n<3; ++n)
 				    values[3*c+n] = (*src[c])[n*sn+i];
-	    }, sets))
+	    }, sets) && ((force_compressed && atoi(force_compressed)!=0) || (sets.count<=sn/4)))
 	{
 		d->coeff_mode = sets.mode;
 		d->index = d->AllocIndex(sets);

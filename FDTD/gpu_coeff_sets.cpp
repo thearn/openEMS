@@ -16,6 +16,7 @@
 */
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <unordered_map>
@@ -46,6 +47,9 @@ struct SetKeyHash
 
 bool GPU_FindSets(size_t count, unsigned int width, const std::function<void(size_t, float*)>& get, GPU_CoeffSets& sets)
 {
+	const char* force_full = getenv("OPENEMS_CUDA_COEFF_FULL");
+	if (force_full && atoi(force_full)!=0)
+		return false;
 	if ((width==0) || (width>GPU_MAX_SET_WIDTH))
 		return false;
 	// at most half the size of the full arrays (width floats per item), counting
