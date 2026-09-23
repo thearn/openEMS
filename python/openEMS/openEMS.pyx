@@ -648,14 +648,15 @@ cdef class openEMS:
             except Exception:
                 pass
 
-    def Run(self, sim_path, cleanup=False, setup_only=False, **kw):
-        """ Run(sim_path, cleanup=False, setup_only=False, verbose=None)
+    def Run(self, sim_path, cleanup=False, setup_only=False, keep_operator=False, **kw):
+        """ Run(sim_path, cleanup=False, setup_only=False, keep_operator=False, verbose=None)
 
         Run the openEMS FDTD simulation.
 
         :param sim_path: str -- path to run in and create result data
         :param cleanup: bool -- delete known openEMS output files from sim_path before running (only whitelisted file patterns are removed)
         :param setup_only: bool -- only perform FDTD setup, do not run simulation
+        :param keep_operator: bool -- keep the operator after the run for :meth:`RunReuse`
 
         One can also pass almost all command-line options supported by the main
         openEMS executable via keyword parameters (replace dashes with
@@ -695,12 +696,40 @@ cdef class openEMS:
             raise RuntimeError('Current working directory is different from `sim_path`. If you encounter this error, please report it to the developers, because it should never happen in normal conditions, it is not your fault. ')
 
         _openEMS.WelcomeScreen()
+        self.thisptr.SetKeepOperator(keep_operator)
         cdef int EC
         with nogil:
             EC = self.thisptr.SetupFDTD()
         if EC!=0:
             print('Run: Setup failed, error code: {}'.format(EC))
         if setup_only or EC!=0:
+            return EC
+        with nogil:
+            self.thisptr.RunFDTD()
+
+    def RunReuse(self, sim_path, cleanup=False, keep_operator=True, **kw):
+        """Rerun using the operator built by the preceding :meth:`Run`
+        (which needs ``keep_operator=True``).
+
+        The fields, engine extensions, and processing objects are recreated;
+        the discretized geometry and update coefficients are retained. The
+        caller must not mutate the CSX structure between runs. With
+        ``keep_operator=False`` the operator is freed after this run.
+        """
+        sim_path = os.path.abspath(sim_path)
+        if cleanup and os.path.exists(sim_path):
+            self._cleanup_sim_path(sim_path, verbose=kw.get('verbose'))
+        if not os.path.exists(sim_path):
+            os.mkdir(sim_path)
+        os.chdir(sim_path)
+
+        self._SetLibraryArguments(kw)
+        self.thisptr.SetKeepOperator(keep_operator)
+        cdef int EC
+        with nogil:
+            EC = self.thisptr.RestartFDTD()
+        if EC!=0:
+            print('RunReuse: Restart failed, error code: {}'.format(EC))
             return EC
         with nogil:
             self.thisptr.RunFDTD()

@@ -97,6 +97,7 @@ openEMS::openEMS()
 	m_engine_numThreads = 0;
 
 	m_Abort = false;
+	m_KeepOperator = false;
 	m_Exc = 0;
 
 	Reset();
@@ -109,13 +110,19 @@ openEMS::~openEMS()
 	Reset();
 }
 
-void openEMS::FreeSimulation()
+void openEMS::FreeEngine()
 {
 	if (PA) PA->DeleteAll();
 	delete PA;
 	PA=0;
 	delete FDTD_Eng;
 	FDTD_Eng=0;
+	Eng_Ext_SSD=0; // non-owning observer; deleted by the engine (m_Eng_exts) in 'delete FDTD_Eng' above
+}
+
+void openEMS::FreeSimulation()
+{
+	FreeEngine();
 	delete FDTD_Op;
 	FDTD_Op=0;
 	Eng_Ext_SSD=0; // non-owning observer; deleted by the engine (m_Eng_exts) in 'delete FDTD_Eng' above
@@ -1494,6 +1501,35 @@ int openEMS::SetupFDTD()
 	return 0;
 }
 
+int openEMS::RestartFDTD()
+{
+	if (FDTD_Op==NULL)
+	{
+		cerr << "openEMS::RestartFDTD: Error, no existing operator to reuse!" << endl;
+		return 3;
+	}
+
+	FreeEngine();
+	FDTD_Eng = FDTD_Op->CreateEngine();
+
+	for (size_t n=0; n<FDTD_Op->GetNumberOfExtentions(); ++n)
+	{
+		Operator_Ext_SteadyState* op_ext =
+			dynamic_cast<Operator_Ext_SteadyState*>(FDTD_Op->GetExtension(n));
+		if (!op_ext)
+			continue;
+		Eng_Ext_SSD =
+			dynamic_cast<Engine_Ext_SteadyState*>(op_ext->GetEngineExtention());
+		if (Eng_Ext_SSD)
+			Eng_Ext_SSD->SetEngineInterface(this->NewEngineInterface());
+		break;
+	}
+
+	if (SetupProcessing()==false)
+		return 2;
+	return 0;
+}
+
 string FormatTime(int sec)
 {
 	stringstream ss;
@@ -1694,8 +1730,12 @@ void openEMS::RunFDTD()
 	PA->PostProcess();
 
 	// the results are written: free the memory of the operator and the engine,
-	// e.g. for a post-processing in the same process (NF2FF, SAR)
-	FreeSimulation();
+	// e.g. for a post-processing in the same process (NF2FF, SAR); the operator
+	// stays if a RestartFDTD() will reuse it
+	if (m_KeepOperator)
+		FreeEngine();
+	else
+		FreeSimulation();
 }
 
 bool openEMS::DumpStatistics(const string& filename, double time)

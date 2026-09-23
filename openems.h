@@ -57,11 +57,16 @@ public:
 	bool ParseFDTDSetup(std::string file);
 	virtual bool Parse_XML_FDTDSetup(TiXmlElement* openEMSxml);
 	virtual int SetupFDTD();
+	virtual int RestartFDTD();
 	virtual void RunFDTD();
 
 	void Reset();
 	//! Free the operator, the engine and the processings of a simulation, the setup is kept (called at the end of RunFDTD())
 	void FreeSimulation();
+	//! Free the engine and the processings only; the operator stays for RestartFDTD()
+	void FreeEngine();
+	//! Keep the operator at the end of RunFDTD() for a RestartFDTD() (default: freed with the engine)
+	void SetKeepOperator(bool val) {m_KeepOperator=val;}
 
 	void SetNumberOfTimeSteps(unsigned int val) {NrTS=val;}
 	void SetEnableDumps(bool val) {Enable_Dumps=val;}
@@ -163,6 +168,7 @@ protected:
 	Excitation* m_Exc;
 
 	bool m_Abort;
+	bool m_KeepOperator;
 
 	enum EngineType {EngineType_Basic, EngineType_SSE, EngineType_SSE_Compressed, EngineType_Multithreaded, EngineType_GPU, EngineType_GPU_Reference};
 	EngineType m_engine;

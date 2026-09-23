@@ -58,8 +58,10 @@ cdef extern from "openEMS/openems.h":
         void SetCustomExcite(string _str, double f0, double fmax)
 
         void SetAbort(bool val)
+        void SetKeepOperator(bool val)
 
         int SetupFDTD() nogil except +
+        int RestartFDTD() nogil except +
         void RunFDTD()  nogil except +
 
         bool Write2XML(string file)
