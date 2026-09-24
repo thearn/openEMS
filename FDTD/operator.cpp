@@ -28,6 +28,7 @@
 #include "Common/processfields.h"
 #include "tools/vtk_file_writer.h"
 #include "fparser.hh"
+#include "tools/useful.h"
 #include "extensions/operator_ext_excitation.h"
 
 #include "vtkPolyData.h"
@@ -2112,65 +2113,87 @@ double Operator::CalcTimestep_Var3()
 {
 	dT=1e200;
 	m_Used_TS_Name = std::string("Rennings_2");
-	double newT;
-	unsigned int pos[3];
 	unsigned int smallest_pos[3] = {0, 0, 0};
 	unsigned int smallest_n = 0;
-	unsigned int ipos;
-	double w_total=0;
-	double wqp=0,wt1=0,wt2=0;
-	double wt_4[4]={0,0,0,0};
 	MainOp->SetReflection2Cell();
-	for (int n=0; n<3; ++n)
+
+	// One minimum per (direction, z line), merged below in the serial loop order
+	// with the same strict comparison, so dT and its position are unchanged.
+	struct LineMin
 	{
+		double dT = 1e200;
+		unsigned int pos[3] = {0,0,0};
+	};
+	std::vector<LineMin> lineMin(3*numLines[2]);
+	unsigned int nThreads = SetupThreads(numLines[2]);
+	std::vector<AdrOp*> address(nThreads);
+	for (unsigned int t=0; t<nThreads; ++t)
+		address[t] = new AdrOp(MainOp);
+	ParallelLines(3*numLines[2], nThreads, [&](unsigned int line, unsigned int thread)
+	{
+		AdrOp* op = address[thread];
+		int n = line/numLines[2];
 		int nP = (n+1)%3;
 		int nPP = (n+2)%3;
-
-		for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
+		unsigned int pos[3];
+		unsigned int ipos;
+		double newT, w_total, wqp, wt1, wt2;
+		double wt_4[4];
+		LineMin& best = lineMin[line];
+		pos[2] = line%numLines[2];
+		for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
 		{
-			for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
+			for (pos[0]=0; pos[0]<numLines[0]; ++pos[0])
 			{
-				for (pos[0]=0; pos[0]<numLines[0]; ++pos[0])
+				op->ResetShift();
+				ipos = op->SetPos(pos[0],pos[1],pos[2]);
+				wqp  = 1/(EC_L[nPP][ipos]*EC_C[n][op->GetShiftedPos(nP ,1)]) + 1/(EC_L[nPP][ipos]*EC_C[n][ipos]);
+				wqp += 1/(EC_L[nP ][ipos]*EC_C[n][op->GetShiftedPos(nPP,1)]) + 1/(EC_L[nP ][ipos]*EC_C[n][ipos]);
+				ipos = op->Shift(nP,-1);
+				wqp += 1/(EC_L[nPP][ipos]*EC_C[n][op->GetShiftedPos(nP ,1)]) + 1/(EC_L[nPP][ipos]*EC_C[n][ipos]);
+				ipos = op->Shift(nPP,-1);
+				wqp += 1/(EC_L[nP ][ipos]*EC_C[n][op->GetShiftedPos(nPP,1)]) + 1/(EC_L[nP ][ipos]*EC_C[n][ipos]);
+
+				op->ResetShift();
+				ipos = op->SetPos(pos[0],pos[1],pos[2]);
+				wt_4[0] = 1/(EC_L[nPP][ipos]						  *EC_C[nP ][ipos]);
+				wt_4[1] = 1/(EC_L[nPP][op->GetShiftedPos(nP ,-1)] *EC_C[nP ][ipos]);
+				wt_4[2] = 1/(EC_L[nP ][ipos]						  *EC_C[nPP][ipos]);
+				wt_4[3] = 1/(EC_L[nP ][op->GetShiftedPos(nPP,-1)] *EC_C[nPP][ipos]);
+
+				wt1 = wt_4[0]+wt_4[1]+wt_4[2]+wt_4[3] - 2*min(wt_4,4);
+
+				op->ResetShift();
+				ipos = op->SetPos(pos[0],pos[1],pos[2]);
+				wt_4[0] = 1/(EC_L[nPP][ipos]						  *EC_C[nP ][op->GetShiftedPos(n,1)]);
+				wt_4[1] = 1/(EC_L[nPP][op->GetShiftedPos(nP ,-1)] *EC_C[nP ][op->GetShiftedPos(n,1)]);
+				wt_4[2] = 1/(EC_L[nP ][ipos]						  *EC_C[nPP][op->GetShiftedPos(n,1)]);
+				wt_4[3] = 1/(EC_L[nP ][op->GetShiftedPos(nPP,-1)] *EC_C[nPP][op->GetShiftedPos(n,1)]);
+
+				wt2 = wt_4[0]+wt_4[1]+wt_4[2]+wt_4[3] - 2*min(wt_4,4);
+
+				w_total = wqp + wt1 + wt2;
+				newT = 2/sqrt( w_total );
+				if ((newT<best.dT) && (newT>0.0))
 				{
-					MainOp->ResetShift();
-					ipos = MainOp->SetPos(pos[0],pos[1],pos[2]);
-					wqp  = 1/(EC_L[nPP][ipos]*EC_C[n][MainOp->GetShiftedPos(nP ,1)]) + 1/(EC_L[nPP][ipos]*EC_C[n][ipos]);
-					wqp += 1/(EC_L[nP ][ipos]*EC_C[n][MainOp->GetShiftedPos(nPP,1)]) + 1/(EC_L[nP ][ipos]*EC_C[n][ipos]);
-					ipos = MainOp->Shift(nP,-1);
-					wqp += 1/(EC_L[nPP][ipos]*EC_C[n][MainOp->GetShiftedPos(nP ,1)]) + 1/(EC_L[nPP][ipos]*EC_C[n][ipos]);
-					ipos = MainOp->Shift(nPP,-1);
-					wqp += 1/(EC_L[nP ][ipos]*EC_C[n][MainOp->GetShiftedPos(nPP,1)]) + 1/(EC_L[nP ][ipos]*EC_C[n][ipos]);
-
-					MainOp->ResetShift();
-					ipos = MainOp->SetPos(pos[0],pos[1],pos[2]);
-					wt_4[0] = 1/(EC_L[nPP][ipos]						  *EC_C[nP ][ipos]);
-					wt_4[1] = 1/(EC_L[nPP][MainOp->GetShiftedPos(nP ,-1)] *EC_C[nP ][ipos]);
-					wt_4[2] = 1/(EC_L[nP ][ipos]						  *EC_C[nPP][ipos]);
-					wt_4[3] = 1/(EC_L[nP ][MainOp->GetShiftedPos(nPP,-1)] *EC_C[nPP][ipos]);
-
-					wt1 = wt_4[0]+wt_4[1]+wt_4[2]+wt_4[3] - 2*min(wt_4,4);
-
-					MainOp->ResetShift();
-					ipos = MainOp->SetPos(pos[0],pos[1],pos[2]);
-					wt_4[0] = 1/(EC_L[nPP][ipos]						  *EC_C[nP ][MainOp->GetShiftedPos(n,1)]);
-					wt_4[1] = 1/(EC_L[nPP][MainOp->GetShiftedPos(nP ,-1)] *EC_C[nP ][MainOp->GetShiftedPos(n,1)]);
-					wt_4[2] = 1/(EC_L[nP ][ipos]						  *EC_C[nPP][MainOp->GetShiftedPos(n,1)]);
-					wt_4[3] = 1/(EC_L[nP ][MainOp->GetShiftedPos(nPP,-1)] *EC_C[nPP][MainOp->GetShiftedPos(n,1)]);
-
-					wt2 = wt_4[0]+wt_4[1]+wt_4[2]+wt_4[3] - 2*min(wt_4,4);
-
-					w_total = wqp + wt1 + wt2;
-					newT = 2/sqrt( w_total );
-					if ((newT<dT) && (newT>0.0))
-					{
-						dT=newT;
-						smallest_pos[0]=pos[0];smallest_pos[1]=pos[1];smallest_pos[2]=pos[2];
-						smallest_n = n;
-					}
+					best.dT=newT;
+					best.pos[0]=pos[0];best.pos[1]=pos[1];best.pos[2]=pos[2];
 				}
 			}
 		}
-	}
+	});
+	for (unsigned int t=0; t<nThreads; ++t)
+		delete address[t];
+	for (unsigned int line=0; line<lineMin.size(); ++line)
+		if (lineMin[line].dT<dT)
+		{
+			dT = lineMin[line].dT;
+			for (int m=0; m<3; ++m)
+				smallest_pos[m] = lineMin[line].pos[m];
+			smallest_n = line/numLines[2];
+		}
+	MainOp->ResetShift();
+	MainOp->SetPos(numLines[0]-1, numLines[1]-1, numLines[2]-1);
 	if (dT==0)
 	{
 		throw std::runtime_error("Operator::CalcTimestep: Timestep is zero... this is not supposed to happen!");
