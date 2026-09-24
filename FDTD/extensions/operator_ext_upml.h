@@ -96,7 +96,8 @@ protected:
 	std::string m_GradFunc;
 	FunctionParser* m_GradingFunction;
 
-	void CalcGradingKappa(int ny, unsigned int pos[3], double Zm, double kappa_v[3], double kappa_i[3]);
+	void CalcGradingKappa(int ny, unsigned int pos[3], double Zm, double kappa_v[3], double kappa_i[3], FunctionParser* parser);
+	void BuildRange(unsigned int xStart, unsigned int xStop, FunctionParser* parser);
 
 	void DeleteOp();
 
