@@ -183,7 +183,7 @@ CUDA_Ext_Mur_ABC::CUDA_Ext_Mur_ABC(GPU_Backend_CUDA::Impl* impl, Operator_Ext_Mu
 	d = impl;
 	m_Eng = eng;
 	m_StartTS = eng_ext->GetStartTimestep();
-	m_Merged = !getenv("OPENEMS_CUDA_MUR_MERGED") || (atoi(getenv("OPENEMS_CUDA_MUR_MERGED"))!=0);
+	m_Merged = getenv("OPENEMS_CUDA_MUR_MERGED") && (atoi(getenv("OPENEMS_CUDA_MUR_MERGED"))!=0);
 	m_Pairs = !getenv("OPENEMS_CUDA_MUR_PAIRS") || (atoi(getenv("OPENEMS_CUDA_MUR_PAIRS"))!=0);
 	m_PairLauncher = true;
 	m_Partner = NULL;
