@@ -250,3 +250,14 @@ int gettimeofday(struct timeval* tp, struct timezone* tzp) {
 }
 
 #endif // defined(_WIN32) && !defined(__GNUC__)
+
+unsigned int SetupThreads(unsigned int lines)
+{
+	const char* serial = getenv("OPENEMS_SERIAL_SETUP");
+	if (serial && atoi(serial))
+		return 1;
+	unsigned int n = AvailableCPUs();
+	if (n>lines)
+		n = lines;
+	return n ? n : 1;
+}

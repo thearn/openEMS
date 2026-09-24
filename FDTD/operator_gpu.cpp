@@ -71,32 +71,23 @@ bool Operator_GPU::Calc_EC()
 	}
 	MainOp->SetPos(0,0,0);
 
-	std::vector<unsigned int> start, stop;
-	ThreadRanges(start, stop);
-	std::vector<std::thread> threads;
-	for (size_t n=0; n<start.size(); ++n)
-		threads.push_back(std::thread(&Operator_GPU::Calc_EC_Range, this, start[n], stop[n]));
-	for (size_t n=0; n<threads.size(); ++n)
-		threads[n].join();
+	ParallelLines(numLines[0], SetupThreads(numLines[0]),
+		[this](unsigned int x, unsigned int) { Calc_EC_Range(x, x); });
 	return true;
 }
 
 // see Operator::CalcPEC() and Operator_Multithread
 bool Operator_GPU::CalcPEC()
 {
-	std::vector<unsigned int> start, stop;
-	ThreadRanges(start, stop);
-	std::vector<unsigned int> counter(3*start.size(), 0);   // three PEC counters per thread, summed up below
-	std::vector<std::thread> threads;
-	for (size_t n=0; n<start.size(); ++n)
-		threads.push_back(std::thread(&Operator_GPU::CalcPEC_Range, this, start[n], stop[n], &counter[3*n]));
-	for (size_t n=0; n<threads.size(); ++n)
-		threads[n].join();
+	unsigned int nThreads = SetupThreads(numLines[0]);
+	std::vector<unsigned int> counter(3*nThreads, 0);   // three PEC counters per thread, summed up below
+	ParallelLines(numLines[0], nThreads,
+		[this, &counter](unsigned int x, unsigned int t) { CalcPEC_Range(x, x, &counter[3*t]); });
 
 	for (int n=0; n<3; ++n)
 	{
 		m_Nr_PEC[n] = 0;
-		for (size_t t=0; t<start.size(); ++t)
+		for (unsigned int t=0; t<nThreads; ++t)
 			m_Nr_PEC[n] += counter[3*t+n];
 	}
 	CalcPEC_Curves();

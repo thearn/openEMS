@@ -20,6 +20,8 @@
 
 #include <vector>
 #include <string>
+#include <atomic>
+#include <thread>
 
 //! Calc the nyquist number of timesteps for a given frequency and timestep
 unsigned int CalcNyquistNum(double fmax, double dT);
@@ -29,6 +31,30 @@ double CalcNyquistFrequency(unsigned int nyquist, double dT);
 
 //! Number of CPUs this process may use: the visible ones, capped by the CPU affinity and by a cgroup CPU quota (a container with a CPU limit)
 unsigned int AvailableCPUs();
+
+//! Threads for operator setup loops over x lines; OPENEMS_SERIAL_SETUP=1 forces one.
+unsigned int SetupThreads(unsigned int lines);
+
+//! Call fn(line, thread) for every line in [0,lines). Lines are handed out one at a time because geometry is concentrated in few lines.
+template <class F> void ParallelLines(unsigned int lines, unsigned int threads, F fn)
+{
+	std::atomic<unsigned int> next(0);
+	auto work = [&](unsigned int thread)
+	{
+		for (unsigned int line=next++; line<lines; line=next++)
+			fn(line, thread);
+	};
+	if (threads<=1)
+	{
+		work(0);
+		return;
+	}
+	std::vector<std::thread> pool;
+	for (unsigned int t=0; t<threads; ++t)
+		pool.push_back(std::thread(work, t));
+	for (auto& t : pool)
+		t.join();
+}
 
 //! Calculate an optimal job distribution to a given number of threads. Will return a vector with the jobs for each thread.
 std::vector<unsigned int> AssignJobs2Threads(unsigned int jobs, unsigned int nrThreads, bool RemoveEmpty=false);

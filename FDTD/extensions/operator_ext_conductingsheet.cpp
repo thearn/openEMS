@@ -22,6 +22,9 @@
 #include "cond_sheet_parameter_complex4.h"
 
 #include "CSPropConductingSheet.h"
+#include "tools/useful.h"
+
+#include <set>
 
 using std::cerr;
 using std::endl;
@@ -54,97 +57,134 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 	ArrayLib::ArrayNIJK<float> Conductivity("Conductivity", numLines);
 	ArrayLib::ArrayNIJK<float> Thickness("Thickness", numLines);
 
-	CSPrimitives* cs_sheet = NULL;
-	double box[6];
-	int nP, nPP;
-	bool b_pos_on;
-	bool disable_pos;
-	for (pos[0]=0; pos[0]<numLines[0]; ++pos[0])
+	// Each x line fills its own cells and position list; the lists are joined
+	// in x order, so the result is identical to the serial scan.
+	struct ScanResult
 	{
-		for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
+		std::vector<unsigned int> pos[3];
+		unsigned int nr_pec[3] = {0,0,0};
+		std::set<CSPrimitives*> used;
+		bool failed = false;
+	};
+	auto scan = [&](unsigned int xStart, unsigned int xStop, ScanResult* result) -> void
+	{
+		unsigned int pos[3] = {0,0,0};
+		double coord[3];
+		CSPrimitives* cs_sheet = NULL;
+		double box[6];
+		int nP, nPP;
+		bool b_pos_on;
+		bool disable_pos;
+		std::vector<unsigned int>* my_pos = result->pos;
+		unsigned int* nr_pec = result->nr_pec;
+		std::set<CSPrimitives*>& used = result->used;
+		bool& failed = result->failed;
+		for (pos[0]=xStart; pos[0]<=xStop; ++pos[0])
 		{
-			std::vector<CSPrimitives*> vPrims = m_Op->GetPrimitivesBoundBox(
-				pos[0], pos[1], -1,
-				(CSProperties::PropertyType)(CSProperties::MATERIAL | CSProperties::METAL)
-			);
-
-			for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
+			for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
 			{
-				b_pos_on = false;
-				disable_pos = false;
-				// disable conducting sheet model inside the boundary conditions, especially inside a pml
-				for (int m=0;m<3;++m)
-					if ((pos[m]<=(unsigned int)m_Op->GetBCSize(2*m)) || (pos[m]>=(numLines[m]-m_Op->GetBCSize(2*m+1)-1)))
-						disable_pos = true;
+				std::vector<CSPrimitives*> vPrims = m_Op->GetPrimitivesBoundBox(
+					pos[0], pos[1], -1,
+					(CSProperties::PropertyType)(CSProperties::MATERIAL | CSProperties::METAL)
+				);
 
-				for (int n=0; n<3; ++n)
+				for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
 				{
-					nP = (n+1)%3;
-					nPP = (n+2)%3;
+					b_pos_on = false;
+					disable_pos = false;
+					// disable conducting sheet model inside the boundary conditions, especially inside a pml
+					for (int m=0;m<3;++m)
+						if ((pos[m]<=(unsigned int)m_Op->GetBCSize(2*m)) || (pos[m]>=(numLines[m]-m_Op->GetBCSize(2*m+1)-1)))
+							disable_pos = true;
 
-					tanDir(n, pos[0], pos[1], pos[2]) = -1; //deactivate by default
-					Conductivity(n, pos[0], pos[1], pos[2]) = 0; //deactivate by default
-					Thickness(n, pos[0], pos[1], pos[2]) = 0; //deactivate by default
-
-					if (m_Op->GetYeeCoords(n,pos,coord,false)==false)
-						continue;
-
-					// Ez at r==0 not supported --> set to PEC
-					if (m_CC_R0_included && (n==2) && (pos[0]==0))
-						disable_pos = true;
-
-//					CSProperties* prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord,(CSProperties::PropertyType)(CSProperties::METAL | CSProperties::MATERIAL), false, &cs_sheet);
-					CSProperties* prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord, vPrims, false, &cs_sheet);
-					CSPropConductingSheet* cs_prop = dynamic_cast<CSPropConductingSheet*>(prop);
-					if (cs_prop)
-					{
-						if (cs_sheet==NULL)
-							return false; //sanity check, this should never happen
-						if (cs_sheet->GetDimension()!=2)
-						{
-							cerr << "Operator_Ext_ConductingSheet::BuildExtension: A conducting sheet primitive (ID: " << cs_sheet->GetID() << ") with dimension: " << cs_sheet->GetDimension() << " found, fallback to PEC!" << endl;
-							m_Op->SetVV(n,pos[0],pos[1],pos[2], 0 );
-							m_Op->SetVI(n,pos[0],pos[1],pos[2], 0 );
-							++m_Op->m_Nr_PEC[n];
-							continue;
-						}
-						cs_sheet->SetPrimitiveUsed(true);
-
-						if (disable_pos)
-						{
-							m_Op->SetVV(n,pos[0],pos[1],pos[2], 0 );
-							m_Op->SetVI(n,pos[0],pos[1],pos[2], 0 );
-							++m_Op->m_Nr_PEC[n];
-							continue;
-						}
-
-						Conductivity(n, pos[0], pos[1], pos[2]) = cs_prop->GetConductivity();
-						Thickness(n, pos[0], pos[1], pos[2]) = cs_prop->GetThickness();
-
-						if ((Conductivity(n, pos[0], pos[1], pos[2])<=0) || (Thickness(n, pos[0], pos[1], pos[2])<=0))
-						{
-							cerr << "Operator_Ext_ConductingSheet::BuildExtension: Warning: Zero conductivity or thickness detected... fallback to PEC!" << endl;
-							m_Op->SetVV(n,pos[0],pos[1],pos[2], 0 );
-							m_Op->SetVI(n,pos[0],pos[1],pos[2], 0 );
-							++m_Op->m_Nr_PEC[n];
-							continue;
-						}
-
-						cs_sheet->GetBoundBox(box);
-						if (box[2*nP]!=box[2*nP+1])
-							tanDir(n, pos[0], pos[1], pos[2]) = nP;
-						if (box[2*nPP]!=box[2*nPP+1])
-							tanDir(n, pos[0], pos[1], pos[2]) = nPP;
-						b_pos_on = true;
-					}
-				}
-				if (b_pos_on)
-				{
 					for (int n=0; n<3; ++n)
-						v_pos[n].push_back(pos[n]);
+					{
+						nP = (n+1)%3;
+						nPP = (n+2)%3;
+
+						tanDir(n, pos[0], pos[1], pos[2]) = -1; //deactivate by default
+						Conductivity(n, pos[0], pos[1], pos[2]) = 0; //deactivate by default
+						Thickness(n, pos[0], pos[1], pos[2]) = 0; //deactivate by default
+
+						if (m_Op->GetYeeCoords(n,pos,coord,false)==false)
+							continue;
+
+						// Ez at r==0 not supported --> set to PEC
+						if (m_CC_R0_included && (n==2) && (pos[0]==0))
+							disable_pos = true;
+
+	//					CSProperties* prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord,(CSProperties::PropertyType)(CSProperties::METAL | CSProperties::MATERIAL), false, &cs_sheet);
+						CSProperties* prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord, vPrims, false, &cs_sheet);
+						CSPropConductingSheet* cs_prop = dynamic_cast<CSPropConductingSheet*>(prop);
+						if (cs_prop)
+						{
+							if (cs_sheet==NULL)
+							{
+								failed = true; //sanity check, this should never happen
+								return;
+							}
+							if (cs_sheet->GetDimension()!=2)
+							{
+								cerr << "Operator_Ext_ConductingSheet::BuildExtension: A conducting sheet primitive (ID: " << cs_sheet->GetID() << ") with dimension: " << cs_sheet->GetDimension() << " found, fallback to PEC!" << endl;
+								m_Op->SetVV(n,pos[0],pos[1],pos[2], 0 );
+								m_Op->SetVI(n,pos[0],pos[1],pos[2], 0 );
+								++nr_pec[n];
+								continue;
+							}
+							used.insert(cs_sheet);
+
+							if (disable_pos)
+							{
+								m_Op->SetVV(n,pos[0],pos[1],pos[2], 0 );
+								m_Op->SetVI(n,pos[0],pos[1],pos[2], 0 );
+								++nr_pec[n];
+								continue;
+							}
+
+							Conductivity(n, pos[0], pos[1], pos[2]) = cs_prop->GetConductivity();
+							Thickness(n, pos[0], pos[1], pos[2]) = cs_prop->GetThickness();
+
+							if ((Conductivity(n, pos[0], pos[1], pos[2])<=0) || (Thickness(n, pos[0], pos[1], pos[2])<=0))
+							{
+								cerr << "Operator_Ext_ConductingSheet::BuildExtension: Warning: Zero conductivity or thickness detected... fallback to PEC!" << endl;
+								m_Op->SetVV(n,pos[0],pos[1],pos[2], 0 );
+								m_Op->SetVI(n,pos[0],pos[1],pos[2], 0 );
+								++nr_pec[n];
+								continue;
+							}
+
+							cs_sheet->GetBoundBox(box);
+							if (box[2*nP]!=box[2*nP+1])
+								tanDir(n, pos[0], pos[1], pos[2]) = nP;
+							if (box[2*nPP]!=box[2*nPP+1])
+								tanDir(n, pos[0], pos[1], pos[2]) = nPP;
+							b_pos_on = true;
+						}
+					}
+					if (b_pos_on)
+					{
+						for (int n=0; n<3; ++n)
+							my_pos[n].push_back(pos[n]);
+					}
 				}
 			}
 		}
+	};
+
+	std::vector<ScanResult> results(numLines[0]);
+	ParallelLines(numLines[0], SetupThreads(numLines[0]),
+		[&](unsigned int x, unsigned int) { scan(x, x, &results[x]); });
+	for (size_t t=0; t<results.size(); ++t)
+	{
+		if (results[t].failed)
+			return false;
+		for (int n=0; n<3; ++n)
+		{
+			v_pos[n].insert(v_pos[n].end(), results[t].pos[n].begin(), results[t].pos[n].end());
+			m_Op->m_Nr_PEC[n] += results[t].nr_pec[n];
+		}
+		for (CSPrimitives* prim : results[t].used)
+			prim->SetPrimitiveUsed(true);
 	}
 
 	size_t numCS = v_pos[0].size();
