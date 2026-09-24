@@ -29,6 +29,20 @@ class Operator_Cylinder;
 class Engine_Extension;
 
 //! Abstract base-class for all operator extensions
+#include <cstdint>
+#include <cstddef>
+
+//! FNV-1a over raw bytes; used to compare operators built by different code paths.
+inline void OperatorHash(uint64_t& h, const void* data, size_t bytes)
+{
+	const unsigned char* p = static_cast<const unsigned char*>(data);
+	for (size_t i=0; i<bytes; ++i)
+	{
+		h ^= p[i];
+		h *= 1099511628211ULL;
+	}
+}
+
 class Operator_Extension
 {
 	friend class Engine_Extension;
@@ -67,6 +81,9 @@ public:
 	virtual void SetActive(bool active=true) {m_Active=active;}
 
 	virtual void Init() {}
+
+	//! Fold every coefficient this extension built into h, for OPENEMS_OPERATOR_CHECKSUM.
+	virtual void HashState(uint64_t& h) const {UNUSED(h);}
 	virtual void Reset() {}
 
 protected:

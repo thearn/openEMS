@@ -1122,6 +1122,28 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 			++it;
 	}
 
+	if (getenv("OPENEMS_OPERATOR_CHECKSUM") && atoi(getenv("OPENEMS_OPERATOR_CHECKSUM")))
+	{
+		uint64_t main_hash = 14695981039346656037ULL;
+		for (int n=0; n<3; ++n)
+			for (unsigned int x=0; x<numLines[0]; ++x)
+				for (unsigned int y=0; y<numLines[1]; ++y)
+					for (unsigned int z=0; z<numLines[2]; ++z)
+					{
+						FDTD_FLOAT c[4] = {GetVV(n,x,y,z), GetVI(n,x,y,z), GetII(n,x,y,z), GetIV(n,x,y,z)};
+						OperatorHash(main_hash, c, sizeof(c));
+					}
+		OperatorHash(main_hash, &dT, sizeof(dT));
+		OperatorHash(main_hash, m_Nr_PEC, sizeof(m_Nr_PEC));
+		cout << "OPENEMS_OPERATOR_CHECKSUM main " << std::hex << main_hash << std::dec << endl;
+		for (size_t n=0; n<m_Op_exts.size(); ++n)
+		{
+			uint64_t ext_hash = 14695981039346656037ULL;
+			m_Op_exts.at(n)->HashState(ext_hash);
+			cout << "OPENEMS_OPERATOR_CHECKSUM ext " << n << " " << m_Op_exts.at(n)->GetExtensionName() << " " << std::hex << ext_hash << std::dec << endl;
+		}
+	}
+
 	if (debugFlags & debugMaterial)
 		DumpMaterial2File( "material_dump" );
 	if (debugFlags & debugOperator)

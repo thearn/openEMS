@@ -464,3 +464,31 @@ void Operator_Ext_LorentzMaterial::ShowStat(std::ostream &ostr)  const
 		ostr << " N=" << i << ":\t Current Lor-ADE is \t: " << On_Off[m_curr_Lor_ADE_On[i]] << endl;
 	}
 }
+
+void Operator_Ext_LorentzMaterial::HashState(uint64_t& h) const
+{
+	OperatorHash(h, &m_Order, sizeof(m_Order));
+	for (int order=0; order<m_Order; ++order)
+	{
+		unsigned int count = m_LM_Count.at(order);
+		OperatorHash(h, &count, sizeof(count));
+		for (int n=0; n<3; ++n)
+		{
+			OperatorHash(h, m_LM_pos[order][n], count*sizeof(unsigned int));
+			if (m_volt_ADE_On[order])
+			{
+				OperatorHash(h, v_int_ADE[order][n], count*sizeof(FDTD_FLOAT));
+				OperatorHash(h, v_ext_ADE[order][n], count*sizeof(FDTD_FLOAT));
+			}
+			if (m_curr_ADE_On[order])
+			{
+				OperatorHash(h, i_int_ADE[order][n], count*sizeof(FDTD_FLOAT));
+				OperatorHash(h, i_ext_ADE[order][n], count*sizeof(FDTD_FLOAT));
+			}
+			if (m_volt_Lor_ADE_On[order])
+				OperatorHash(h, v_Lor_ADE[order][n], count*sizeof(FDTD_FLOAT));
+			if (m_curr_Lor_ADE_On[order])
+				OperatorHash(h, i_Lor_ADE[order][n], count*sizeof(FDTD_FLOAT));
+		}
+	}
+}

@@ -75,6 +75,7 @@ public:
 	}
 
 	virtual void ShowStat(std::ostream &ostr) const;
+	virtual void HashState(uint64_t& h) const;
 
 	//! Create the UPML
 	static bool Create_UPML(

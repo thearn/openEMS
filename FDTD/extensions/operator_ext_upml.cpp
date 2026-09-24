@@ -458,3 +458,20 @@ void Operator_Ext_UPML::ShowStat(ostream &ostr)  const
 	<<  m_StartPos[0]+m_numLines[0]-1 << "," << m_StartPos[1]+m_numLines[1]-1 << "," << m_StartPos[2]+m_numLines[2]-1 << "]" << endl;
 	ostr << " Grading function\t: \"" << m_GradFunc << "\"" << endl;
 }
+
+void Operator_Ext_UPML::HashState(uint64_t& h) const
+{
+	Operator_Ext_UPML* self = const_cast<Operator_Ext_UPML*>(this);
+	ArrayLib::ArrayNIJK<FDTD_FLOAT>* arrays[] = {&self->vv, &self->vvfo, &self->vvfn, &self->ii, &self->iifo, &self->iifn};
+	OperatorHash(h, m_StartPos, sizeof(m_StartPos));
+	OperatorHash(h, m_numLines, sizeof(m_numLines));
+	for (ArrayLib::ArrayNIJK<FDTD_FLOAT>* a : arrays)
+		for (int n=0; n<3; ++n)
+			for (unsigned int x=0; x<m_numLines[0]; ++x)
+				for (unsigned int y=0; y<m_numLines[1]; ++y)
+					for (unsigned int z=0; z<m_numLines[2]; ++z)
+					{
+						FDTD_FLOAT v = (*a)(n,x,y,z);
+						OperatorHash(h, &v, sizeof(v));
+					}
+}
