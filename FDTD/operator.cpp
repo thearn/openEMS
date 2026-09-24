@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <stdexcept>
+#include <cmath>
 #include "operator.h"
 #include "engine.h"
 #include "extensions/operator_extension.h"
@@ -34,6 +35,7 @@
 #include "vtkPoints.h"
 #include "vtkXMLPolyDataWriter.h"
 #include "CSPrimBox.h"
+#include "CSTransform.h"
 #include "CSPrimCurve.h"
 
 #include "CSPropMaterial.h"
@@ -1040,6 +1042,7 @@ void Operator::CalcUpdateCoefficients()
 int Operator::CalcECOperator( DebugFlags debugFlags )
 {
 	SetupPhaseTimer setup_timer;
+	InitPrimitiveBoxes();
 	Init_EC();
 	InitDataStorage();
 	setup_timer.Mark("allocate");
@@ -1869,6 +1872,35 @@ bool Operator::Calc_EC()
 	return true;
 }
 
+void Operator::CellBoundBox(const int pos[3], double box[6]) const
+{
+	for (int n=0;n<3;++n)
+	{
+		if (pos[n]<0)
+		{
+			box[2*n]   = this->GetDiscLine(n,0);
+			box[2*n+1] = this->GetDiscLine(n,numLines[n]-1);
+		}
+		else
+		{
+			box[2*n]   = this->GetDiscLine(n, std::max(0, pos[n]-1));
+			box[2*n+1] = this->GetDiscLine(n, std::min(int(numLines[n])-1, pos[n]+1));
+		}
+	}
+}
+
+bool Operator::PrimitiveMayTouch(const CSPrimitives* prim, const double box[6]) const
+{
+	auto it = m_PrimBoxes.find(prim);
+	if (it==m_PrimBoxes.end())
+		return true;
+	const std::array<double,6>& b = it->second;
+	for (int n=0;n<3;++n)
+		if ((box[2*n+1]<b[2*n]) || (box[2*n]>b[2*n+1]))
+			return false;
+	return true;
+}
+
 std::vector<CSPrimitives*>
 Operator::GetPrimitivesBoundBox(
 	int posX, int posY, int posZ,
@@ -1877,22 +1909,86 @@ Operator::GetPrimitivesBoundBox(
 {
 	double boundBox[6];
 	int BBpos[3] = {posX, posY, posZ};
-	for (int n=0;n<3;++n)
-	{
-		if (BBpos[n]<0)
-		{
-			boundBox[2*n]   = this->GetDiscLine(n,0);
-			boundBox[2*n+1] = this->GetDiscLine(n,numLines[n]-1);
-		}
-		else
-		{
-			boundBox[2*n]   = this->GetDiscLine(n, std::max(0, BBpos[n]-1));
-			boundBox[2*n+1] = this->GetDiscLine(n, std::min(int(numLines[n])-1, BBpos[n]+1));
-		}
-	}
-
+	CellBoundBox(BBpos, boundBox);
 	std::vector<CSPrimitives*> vPrim = this->CSX->GetPrimitivesByBoundBox(boundBox, true, type);
-	return vPrim;
+	if (m_PrimBoxes.empty())
+		return vPrim;
+	std::vector<CSPrimitives*> narrowed;
+	narrowed.reserve(vPrim.size());
+	for (CSPrimitives* prim : vPrim)
+		if (PrimitiveMayTouch(prim, boundBox))
+			narrowed.push_back(prim);
+	return narrowed;
+}
+
+void Operator::NarrowPrimitives(const std::vector<CSPrimitives*>& in, std::vector<CSPrimitives*>& out, int posX, int posY, int posZ) const
+{
+	out.clear();
+	if (m_PrimBoxes.empty())
+	{
+		out = in;
+		return;
+	}
+	double box[6];
+	int pos[3] = {posX, posY, posZ};
+	CellBoundBox(pos, box);
+	for (CSPrimitives* prim : in)
+		if (PrimitiveMayTouch(prim, box))
+			out.push_back(prim);
+}
+
+void Operator::InitPrimitiveBoxes()
+{
+	m_PrimBoxes.clear();
+	const char* env = getenv("OPENEMS_PRIMITIVE_BOXES");
+	if ((env && atoi(env)==0) || (m_MeshType!=CARTESIAN) || (CSX==NULL))
+		return;
+	// CSPrimitives::IsInsideBox answers "unknown" for every transformed primitive
+	// (and every polygon), so column filtering keeps them all. For these types
+	// IsInside is false outside the local bounding box, whose transformed
+	// corners bound the primitive in world coordinates.
+	for (CSPrimitives* prim : CSX->GetAllPrimitives(false, CSProperties::ANY))
+	{
+		int type = prim->GetType();
+		if ((type!=CSPrimitives::BOX) && (type!=CSPrimitives::CYLINDER) && (type!=CSPrimitives::CYLINDRICALSHELL) &&
+			(type!=CSPrimitives::POLYGON) && (type!=CSPrimitives::LINPOLY))
+			continue;
+		if (prim->GetCoordInputType()!=CARTESIAN)
+			continue;
+		CoordinateSystem bb_cs = prim->GetBoundBoxCoordSystem();
+		if ((bb_cs!=CARTESIAN) && (bb_cs!=UNDEFINED_CS))
+			continue;
+		double local[6];
+		prim->GetBoundBox(local);
+		std::array<double,6> world = {INFINITY,-INFINITY,INFINITY,-INFINITY,INFINITY,-INFINITY};
+		bool finite = true;
+		for (int corner=0; corner<8; ++corner)
+		{
+			double c[3];
+			for (int n=0;n<3;++n)
+				c[n] = local[2*n + ((corner>>n)&1)];
+			if (prim->HasTransform())
+				prim->GetTransform()->Transform(c,c);
+			for (int n=0;n<3;++n)
+			{
+				finite = finite && std::isfinite(c[n]);
+				world[2*n]   = std::min(world[2*n], c[n]);
+				world[2*n+1] = std::max(world[2*n+1], c[n]);
+			}
+		}
+		if (!finite)
+			continue;
+		double scale = 1;
+		for (int n=0;n<6;++n)
+			scale = std::max(scale, fabs(world[n]));
+		const double pad = 1e-6*scale;  // far above the rounding of the corner transform
+		for (int n=0;n<3;++n)
+		{
+			world[2*n]   -= pad;
+			world[2*n+1] += pad;
+		}
+		m_PrimBoxes[prim] = world;
+	}
 }
 
 void Operator::Calc_EC_Range(unsigned int xStart, unsigned int xStop)
@@ -1910,12 +2006,14 @@ void Operator::Calc_EC_Range(unsigned int xStart, unsigned int xStop)
 				CSProperties::MATERIAL
 			);
 
+			std::vector<CSPrimitives*> vPrimsZ;
 			for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
 			{
+				NarrowPrimitives(vPrims, vPrimsZ, pos[0], pos[1], pos[2]);
 				ipos = MainOp->GetPos(pos[0],pos[1],pos[2]);
 				for (int n=0; n<3; ++n)
 				{
-					Calc_ECPos(n,pos,inEC,vPrims);
+					Calc_ECPos(n,pos,inEC,vPrimsZ);
 					EC_C[n][ipos]=inEC[0];
 					EC_G[n][ipos]=inEC[1];
 					EC_L[n][ipos]=inEC[2];
@@ -2110,12 +2208,14 @@ void Operator::CalcPEC_Range(unsigned int startX, unsigned int stopX, unsigned i
 				(CSProperties::PropertyType)(CSProperties::MATERIAL | CSProperties::METAL)
 			);
 
+			std::vector<CSPrimitives*> vPrimsZ;
 			for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
 			{
+				NarrowPrimitives(vPrims, vPrimsZ, pos[0], pos[1], pos[2]);
 				for (int n=0; n<3; ++n)
 				{
 					GetYeeCoords(n,pos,coord,false);
-					CSProperties* prop = CSX->GetPropertyByCoordPriority(coord, vPrims, true);
+					CSProperties* prop = CSX->GetPropertyByCoordPriority(coord, vPrimsZ, true);
 					if (prop)
 					{
 						if (prop->GetType()==CSProperties::METAL) //set to PEC

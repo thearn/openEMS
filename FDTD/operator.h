@@ -25,6 +25,9 @@
 
 #include "tools/arraylib/array_nijk.h"
 
+#include <array>
+#include <unordered_map>
+
 class Operator_Extension;
 class Operator_Ext_Excitation;
 class Engine;
@@ -238,7 +241,16 @@ public:
 		CSProperties::PropertyType type=CSProperties::ANY
 	) const;
 
+	//! Copy to out, in order, the primitives of in that may contain a point of the cell box around pos (a negative pos keeps the whole axis).
+	void NarrowPrimitives(const std::vector<CSPrimitives*>& in, std::vector<CSPrimitives*>& out, int posX, int posY, int posZ) const;
+
 protected:
+	//! Cache padded world-space bounding boxes for the primitive types whose IsInside cannot succeed outside them.
+	void InitPrimitiveBoxes();
+	void CellBoundBox(const int pos[3], double box[6]) const;
+	bool PrimitiveMayTouch(const CSPrimitives* prim, const double box[6]) const;
+	std::unordered_map<const CSPrimitives*, std::array<double,6>> m_PrimBoxes;
+
 	//! use New() for creating a new Operator
 	Operator();
 

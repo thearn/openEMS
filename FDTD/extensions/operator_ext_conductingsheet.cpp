@@ -88,8 +88,10 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 					(CSProperties::PropertyType)(CSProperties::MATERIAL | CSProperties::METAL)
 				);
 
+				std::vector<CSPrimitives*> vPrimsZ;
 				for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
 				{
+					m_Op->NarrowPrimitives(vPrims, vPrimsZ, pos[0], pos[1], pos[2]);
 					b_pos_on = false;
 					disable_pos = false;
 					// disable conducting sheet model inside the boundary conditions, especially inside a pml
@@ -114,7 +116,7 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 							disable_pos = true;
 
 	//					CSProperties* prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord,(CSProperties::PropertyType)(CSProperties::METAL | CSProperties::MATERIAL), false, &cs_sheet);
-						CSProperties* prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord, vPrims, false, &cs_sheet);
+						CSProperties* prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord, vPrimsZ, false, &cs_sheet);
 						CSPropConductingSheet* cs_prop = dynamic_cast<CSPropConductingSheet*>(prop);
 						if (cs_prop)
 						{
