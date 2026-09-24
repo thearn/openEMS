@@ -65,6 +65,8 @@ __device__ __forceinline__ CUDA_MainCoeff main_coeff(const void* index, const fl
 
 #include "cuda_upml.cuh"
 
+class CUDA_Ext_Mur_ABC;
+
 //! Throw a std::runtime_error if \a err is an error
 void CUDA_Check(cudaError_t err, const char* what);
 
@@ -119,6 +121,7 @@ struct GPU_Backend_CUDA::Impl
 	int fused_blockers;                      //!< extensions or grids that do not allow it
 	float *volt_next, *curr_next;
 	std::vector<unsigned int> volt_modified; //!< flat indices of the voltages the extensions register as changed between the half-steps (excitation, lumped RLC)
+	std::vector<CUDA_Ext_Mur_ABC*> mur_extensions;
 	CUDA_FusedRegions fregions;              //!< the UPML regions in the kernel (see CUDA_Ext_UPML::CanFuse())
 	CUDA_FixupEntry* fixup;                  //!< main nodes/components recomputed after the voltage extensions
 	unsigned int fixup_count;

@@ -48,6 +48,32 @@ __global__ void mur_pre(const float* volt, float* v_nyP, float* v_nyPP, const fl
 	v_nyPP[ij] = volt[mur_index(N, P, P.nyPP, P.line_shift, i, j)] - c_nyPP[ij] * volt[mur_index(N, P, P.nyPP, P.line, i, j)];
 }
 
+__device__ __forceinline__ void mur_pre_at(unsigned int i, unsigned int j, const float* volt, float* v_nyP, float* v_nyPP,
+                                           const float* c_nyP, const float* c_nyPP, CUDA_GridDim N, MurParam P)
+{
+	if (i>=P.ni || j>=P.nj)
+		return;
+	const unsigned int ij = i*P.nj + j;
+	v_nyP[ij]  = volt[mur_index(N, P, P.nyP, P.line_shift, i, j)] - c_nyP[ij]  * volt[mur_index(N, P, P.nyP, P.line, i, j)];
+	v_nyPP[ij] = volt[mur_index(N, P, P.nyPP, P.line_shift, i, j)] - c_nyPP[ij] * volt[mur_index(N, P, P.nyPP, P.line, i, j)];
+}
+
+__global__ void mur_pre_pair(const float* volt,
+	float* a_nyP, float* a_nyPP, const float* ac_nyP, const float* ac_nyPP, MurParam A, bool active_a,
+	float* b_nyP, float* b_nyPP, const float* bc_nyP, const float* bc_nyPP, MurParam B, bool active_b,
+	CUDA_GridDim N)
+{
+	const unsigned int j = blockIdx.x*blockDim.x + threadIdx.x;
+	const unsigned int i = blockIdx.y*blockDim.y + threadIdx.y;
+	if (blockIdx.z==0)
+	{
+		if (active_a)
+			mur_pre_at(i, j, volt, a_nyP, a_nyPP, ac_nyP, ac_nyPP, N, A);
+	}
+	else if (active_b)
+		mur_pre_at(i, j, volt, b_nyP, b_nyPP, bc_nyP, bc_nyPP, N, B);
+}
+
 __global__ void mur_post(const float* volt, float* v_nyP, float* v_nyPP, const float* c_nyP, const float* c_nyPP, CUDA_GridDim N, MurParam P)
 {
 	MUR_THREAD
@@ -62,6 +88,58 @@ __global__ void mur_apply(float* volt, const float* v_nyP, const float* v_nyPP, 
 	volt[mur_index(N, P, P.nyPP, P.line, i, j)] = v_nyPP[ij];
 }
 
+__device__ __forceinline__ void mur_post_at(unsigned int i, unsigned int j, const float* volt, float* v_nyP, float* v_nyPP,
+                                            const float* c_nyP, const float* c_nyPP, CUDA_GridDim N, MurParam P)
+{
+	if (i>=P.ni || j>=P.nj)
+		return;
+	const unsigned int ij = i*P.nj + j;
+	v_nyP[ij]  = v_nyP[ij]  + c_nyP[ij]  * volt[mur_index(N, P, P.nyP,  P.line_shift, i, j)];
+	v_nyPP[ij] = v_nyPP[ij] + c_nyPP[ij] * volt[mur_index(N, P, P.nyPP, P.line_shift, i, j)];
+}
+
+__global__ void mur_post_pair(const float* volt,
+	float* a_nyP, float* a_nyPP, const float* ac_nyP, const float* ac_nyPP, MurParam A, bool active_a,
+	float* b_nyP, float* b_nyPP, const float* bc_nyP, const float* bc_nyPP, MurParam B, bool active_b,
+	CUDA_GridDim N)
+{
+	const unsigned int j = blockIdx.x*blockDim.x + threadIdx.x;
+	const unsigned int i = blockIdx.y*blockDim.y + threadIdx.y;
+	if (blockIdx.z==0)
+	{
+		if (active_a)
+			mur_post_at(i, j, volt, a_nyP, a_nyPP, ac_nyP, ac_nyPP, N, A);
+	}
+	else if (active_b)
+		mur_post_at(i, j, volt, b_nyP, b_nyPP, bc_nyP, bc_nyPP, N, B);
+}
+
+__device__ __forceinline__ void mur_apply_at(unsigned int i, unsigned int j, float* volt,
+                                             const float* v_nyP, const float* v_nyPP, CUDA_GridDim N, MurParam P)
+{
+	if (i>=P.ni || j>=P.nj)
+		return;
+	const unsigned int ij = i*P.nj + j;
+	volt[mur_index(N, P, P.nyP,  P.line, i, j)] = v_nyP[ij];
+	volt[mur_index(N, P, P.nyPP, P.line, i, j)] = v_nyPP[ij];
+}
+
+__global__ void mur_apply_pair(float* volt,
+	const float* a_nyP, const float* a_nyPP, MurParam A, bool active_a,
+	const float* b_nyP, const float* b_nyPP, MurParam B, bool active_b,
+	CUDA_GridDim N)
+{
+	const unsigned int j = blockIdx.x*blockDim.x + threadIdx.x;
+	const unsigned int i = blockIdx.y*blockDim.y + threadIdx.y;
+	if (blockIdx.z==0)
+	{
+		if (active_a)
+			mur_apply_at(i, j, volt, a_nyP, a_nyPP, N, A);
+	}
+	else if (active_b)
+		mur_apply_at(i, j, volt, b_nyP, b_nyPP, N, B);
+}
+
 class CUDA_Ext_Mur_ABC : public GPU_Extension
 {
 public:
@@ -69,27 +147,39 @@ public:
 
 	virtual void DoPreVoltageUpdates()
 	{
-		if (IsActive())
+		if (m_Partner && m_PairLauncher)
+			LaunchPrePair();
+		else if (!m_Partner && IsActive())
 			CUDA_Launch(d, "mur_pre", mur_pre, m_Param.nj, m_Param.ni, 1, (const float*)d->volt, m_Volt_nyP, m_Volt_nyPP, (const float*)m_Coeff_nyP, (const float*)m_Coeff_nyPP, d->dim, m_Param);
 	}
 	virtual void DoPostVoltageUpdates()
 	{
-		if (IsActive())
+		if (m_Partner && m_PairLauncher)
+			LaunchPostPair();
+		else if (!m_Partner && IsActive())
 			CUDA_Launch(d, "mur_post", mur_post, m_Param.nj, m_Param.ni, 1, (const float*)d->volt, m_Volt_nyP, m_Volt_nyPP, (const float*)m_Coeff_nyP, (const float*)m_Coeff_nyPP, d->dim, m_Param);
 	}
 	virtual void Apply2Voltages()
 	{
-		if (IsActive())
+		if (m_Partner && m_PairLauncher)
+			LaunchApplyPair();
+		else if (!m_Partner && IsActive())
 			CUDA_Launch(d, "mur_apply", mur_apply, m_Param.nj, m_Param.ni, 1, d->volt, (const float*)m_Volt_nyP, (const float*)m_Volt_nyPP, d->dim, m_Param);
 	}
 
 protected:
 	//! the ABC is off until an excitation on its plane is done
 	bool IsActive() {return m_Eng->GetNumberOfTimesteps()>=m_StartTS;}
+	void LaunchPrePair();
+	void LaunchPostPair();
+	void LaunchApplyPair();
 
 	GPU_Backend_CUDA::Impl* d;
 	Engine* m_Eng;
 	unsigned int m_StartTS;
+	bool m_Pairs;
+	bool m_PairLauncher;
+	CUDA_Ext_Mur_ABC* m_Partner;
 	MurParam m_Param;
 
 	float *m_Volt_nyP, *m_Volt_nyPP;
@@ -101,6 +191,9 @@ CUDA_Ext_Mur_ABC::CUDA_Ext_Mur_ABC(GPU_Backend_CUDA::Impl* impl, Operator_Ext_Mu
 	d = impl;
 	m_Eng = eng;
 	m_StartTS = eng_ext->GetStartTimestep();
+	m_Pairs = !getenv("OPENEMS_CUDA_MUR_PAIRS") || (atoi(getenv("OPENEMS_CUDA_MUR_PAIRS"))!=0);
+	m_PairLauncher = true;
+	m_Partner = NULL;
 	m_Param.ny = op_ext->m_ny;
 	m_Param.nyP = op_ext->m_nyP;
 	m_Param.nyPP = op_ext->m_nyPP;
@@ -128,6 +221,60 @@ CUDA_Ext_Mur_ABC::CUDA_Ext_Mur_ABC(GPU_Backend_CUDA::Impl* impl, Operator_Ext_Mu
 	m_Volt_nyPP = d->Alloc<float>(count);
 	m_Coeff_nyP  = d->Alloc<float>(count, op_ext->m_Mur_Coeff_nyP.data());
 	m_Coeff_nyPP = d->Alloc<float>(count, op_ext->m_Mur_Coeff_nyPP.data());
+	if (m_Pairs)
+		for (size_t n=0; n<d->mur_extensions.size(); ++n)
+			if (d->mur_extensions[n]->m_Param.ny==m_Param.ny)
+			{
+				m_Partner = d->mur_extensions[n];
+				m_Partner->m_Partner = this;
+				m_Partner->m_PairLauncher = false;
+				break;
+			}
+	d->mur_extensions.push_back(this);
+}
+
+void CUDA_Ext_Mur_ABC::LaunchPrePair()
+{
+	const bool active_a = IsActive();
+	const bool active_b = m_Partner->IsActive();
+	if (!active_a && !active_b)
+		return;
+	CUDA_Launch(d, "mur_pre_pair", mur_pre_pair,
+	            std::max(m_Param.nj, m_Partner->m_Param.nj), std::max(m_Param.ni, m_Partner->m_Param.ni), 2,
+	            (const float*)d->volt,
+	            m_Volt_nyP, m_Volt_nyPP, (const float*)m_Coeff_nyP, (const float*)m_Coeff_nyPP, m_Param, active_a,
+	            m_Partner->m_Volt_nyP, m_Partner->m_Volt_nyPP,
+	            (const float*)m_Partner->m_Coeff_nyP, (const float*)m_Partner->m_Coeff_nyPP, m_Partner->m_Param, active_b,
+	            d->dim);
+}
+
+void CUDA_Ext_Mur_ABC::LaunchPostPair()
+{
+	const bool active_a = IsActive();
+	const bool active_b = m_Partner->IsActive();
+	if (!active_a && !active_b)
+		return;
+	CUDA_Launch(d, "mur_post_pair", mur_post_pair,
+	            std::max(m_Param.nj, m_Partner->m_Param.nj), std::max(m_Param.ni, m_Partner->m_Param.ni), 2,
+	            (const float*)d->volt,
+	            m_Volt_nyP, m_Volt_nyPP, (const float*)m_Coeff_nyP, (const float*)m_Coeff_nyPP, m_Param, active_a,
+	            m_Partner->m_Volt_nyP, m_Partner->m_Volt_nyPP,
+	            (const float*)m_Partner->m_Coeff_nyP, (const float*)m_Partner->m_Coeff_nyPP, m_Partner->m_Param, active_b,
+	            d->dim);
+}
+
+void CUDA_Ext_Mur_ABC::LaunchApplyPair()
+{
+	const bool active_a = IsActive();
+	const bool active_b = m_Partner->IsActive();
+	if (!active_a && !active_b)
+		return;
+	CUDA_Launch(d, "mur_apply_pair", mur_apply_pair,
+	            std::max(m_Param.nj, m_Partner->m_Param.nj), std::max(m_Param.ni, m_Partner->m_Param.ni), 2,
+	            d->volt,
+	            (const float*)m_Volt_nyP, (const float*)m_Volt_nyPP, m_Param, active_a,
+	            (const float*)m_Partner->m_Volt_nyP, (const float*)m_Partner->m_Volt_nyPP, m_Partner->m_Param, active_b,
+	            d->dim);
 }
 
 GPU_Extension* CUDA_CreateExt_Mur_ABC(GPU_Backend_CUDA::Impl* d, Engine_Extension* eng_ext, Engine* eng)
