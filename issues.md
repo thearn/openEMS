@@ -146,3 +146,47 @@ fallback uploads both fields before every main update for this reason).
 
 **Suggested fix:** document the actual contract (hooks may modify the field
 in the region the extension owns), or move the writes to `Apply2*`.
+
+## 8. Merging the CUDA Mur post and apply passes breaks the cross-face ordering — fixed
+
+**Where:** `FDTD/cuda/cuda_ext_mur_abc.cu`, the `mur_post_apply` kernels added
+in `19ea80d` and removed in `3abba41`.
+
+**What:** `Engine_GPU::VoltageHalfStep` runs every extension's
+`DoPostVoltageUpdates`, and only then every extension's `Apply2Voltages`. That
+second loop is what orders **all** boundary reads before **all** boundary
+writes. Merging post into apply collapses the two loops into one, so one Mur
+face writes `volt` before the next face reads it.
+
+The faces do share cells. For normal direction `ny`, `mur_index` writes
+components `nyP` and `nyPP` on the plane `pos[ny] = line`, so an x-normal face
+writes `volt[z]` at `(0, y, z)` for every `y`, while a y-normal face reads
+`volt[z]` at `(x, 1, z)` for every `x`. They meet along the edge `x=0, y=1`.
+Every pair of non-opposite faces meets along one such edge.
+
+This is a concrete instance of issue 7: the merge relied on the hook ordering
+that issue 7 warns cannot be relied on.
+
+**Reproduce:** `python/Tests/GPU_Engine.py`, case `mur`, on the commit before
+the fix:
+
+| build | result | worst deviation from the basic engine |
+|---|---|---|
+| merged pass on | FAIL | `3.1e-04` of peak |
+| `OPENEMS_CUDA_MUR_MERGED=0` | pass | `1.6e-06` |
+| `OPENEMS_CUDA_MUR_PAIRS=0` | FAIL | `3.1e-04` |
+
+so the face pairing was never implicated, only the merge.
+
+**Why it hid:** models excited in the interior show nothing at all. Three
+replication articles (a CP patch, a 2x2 array, a multi-board CP antenna, 22-32
+M cells, all six faces Mur) were **bit-identical** with the merge on and off,
+because their edge fields are ~1e-20 and `a + 1e-20*c == a` in float32.
+`GPU_Engine.py`'s `mur` case exposes it because its excitation sits inside the
+Mur-ABC region, so the ABC switches on late and the edges carry real energy.
+A GPU-vs-GPU comparison cannot see this either; it needs the basic engine as
+the reference, which is what `GPU_Engine.py` does.
+
+**Fix:** `3abba41` drops the merge and pairs `post` and `apply` separately, the
+way `pre` already was, which keeps the read-then-write barrier. Launches per
+timestep for six faces: 18 originally, 15 with the merge disabled, 9 now.
