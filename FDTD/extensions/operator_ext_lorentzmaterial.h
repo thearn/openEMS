@@ -47,6 +47,8 @@ public:
 
 	virtual void ShowStat(std::ostream &ostr) const;
 
+	virtual void HashState(uint64_t& h) const;
+
 protected:
 	//! Copy constructor
 	Operator_Ext_LorentzMaterial(Operator* op, Operator_Ext_LorentzMaterial* op_ext);
