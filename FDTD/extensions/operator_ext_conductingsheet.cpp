@@ -19,6 +19,7 @@
 #include "tools/arraylib/array_nijk.h"
 #include "tools/constants.h"
 #include "cond_sheet_parameter.h"
+#include "cond_sheet_parameter_complex4.h"
 
 #include "CSPropConductingSheet.h"
 
@@ -150,51 +151,48 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 	if (numCS==0)
 		return false;
 
-	m_LM_Count.push_back(numCS);
-	m_LM_Count.push_back(numCS);
+	m_Order	= 4;
+	for (int order=0; order<m_Order; ++order)
+		m_LM_Count.push_back(numCS);
 
-	m_Order	= 2;
 	m_volt_ADE_On = new bool[m_Order];
-	m_volt_ADE_On[0] = m_volt_ADE_On[1]=true;
 	m_curr_ADE_On = new bool[m_Order];
-	m_curr_ADE_On[0] = m_curr_ADE_On[1]=false;
-
 	m_volt_Lor_ADE_On = new bool[m_Order];
-	m_volt_Lor_ADE_On[0] = m_volt_Lor_ADE_On[1]=false;
 	m_curr_Lor_ADE_On = new bool[m_Order];
-	m_curr_Lor_ADE_On[0] = m_curr_Lor_ADE_On[1]=false;
+	for (int order=0; order<m_Order; ++order)
+	{
+		m_volt_ADE_On[order]=true;
+		m_curr_ADE_On[order]=false;
+		m_volt_Lor_ADE_On[order]=false;
+		m_curr_Lor_ADE_On[order]=false;
+	}
 
 	m_LM_pos = new unsigned int**[m_Order];
-	m_LM_pos[0] = new unsigned int*[3];
-	m_LM_pos[1] = new unsigned int*[3];
-
 	v_int_ADE = new FDTD_FLOAT**[m_Order];
 	v_ext_ADE = new FDTD_FLOAT**[m_Order];
-
-	v_int_ADE[0] = new FDTD_FLOAT*[3];
-	v_ext_ADE[0] = new FDTD_FLOAT*[3];
-	v_int_ADE[1] = new FDTD_FLOAT*[3];
-	v_ext_ADE[1] = new FDTD_FLOAT*[3];
+	for (int order=0; order<m_Order; ++order)
+	{
+		m_LM_pos[order] = new unsigned int*[3];
+		v_int_ADE[order] = new FDTD_FLOAT*[3];
+		v_ext_ADE[order] = new FDTD_FLOAT*[3];
+	}
 
 	for (int n=0; n<3; ++n)
 	{
-		m_LM_pos[0][n] = new unsigned int[numCS];
-		m_LM_pos[1][n] = new unsigned int[numCS];
-		for (unsigned int i=0; i<numCS; ++i)
+		for (int order=0; order<m_Order; ++order)
 		{
-			m_LM_pos[0][n][i] = v_pos[n].at(i);
-			m_LM_pos[1][n][i] = v_pos[n].at(i);
+			m_LM_pos[order][n] = new unsigned int[numCS];
+			for (unsigned int i=0; i<numCS; ++i)
+				m_LM_pos[order][n][i] = v_pos[n].at(i);
+			v_int_ADE[order][n] = new FDTD_FLOAT[numCS];
+			v_ext_ADE[order][n] = new FDTD_FLOAT[numCS];
 		}
-		v_int_ADE[0][n]  = new FDTD_FLOAT[numCS];
-		v_int_ADE[1][n]  = new FDTD_FLOAT[numCS];
-		v_ext_ADE[0][n]  = new FDTD_FLOAT[numCS];
-		v_ext_ADE[1][n]  = new FDTD_FLOAT[numCS];
 	}
 
 	unsigned int index;
 	float w_stop = m_f_max*2*PI;
 	float Omega_max=0;
-	float G,L1,L2,R1,R2,Lmin;
+	float G,L[4],R[4],Lmin;
 	float G0, w0;
 	float wtl; //width to length factor
 	float factor=1;
@@ -222,10 +220,11 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 				cerr << " --> max f: " << m_f_max << "Hz,  Conductivity: " << Conductivity(n, pos[0], pos[1], pos[2]) << "S/m, Thickness " << Thickness(n, pos[0], pos[1], pos[2])*1e6 << "um" << endl;
 				optParaPos = numOptPara-1;
 			}
-			v_int_ADE[0][n][i]=0;
-			v_ext_ADE[0][n][i]=0;
-			v_int_ADE[1][n][i]=0;
-			v_ext_ADE[1][n][i]=0;
+			for (int order=0; order<m_Order; ++order)
+			{
+				v_int_ADE[order][n][i]=0;
+				v_ext_ADE[order][n][i]=0;
+			}
 			if (t_dir>=0)
 			{
 				wtl = m_Op->GetEdgeLength(n,pos)/m_Op->GetNodeWidth(t_dir,pos);
@@ -236,29 +235,52 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 				if (tanDir(t_dir, tpos[0], tpos[1], tpos[2])<0)
 					factor = 2;
 
-				L1 = l1[optParaPos]/G0/w0*factor;
-				L2 = l2[optParaPos]/G0/w0*factor;
-				R1 = r1[optParaPos]/G0*factor;
-				R2 = r2[optParaPos]/G0*factor;
-				G = G0*g[optParaPos]/factor;
-
-				L1*=wtl;
-				L2*=wtl;
-				R1*=wtl;
-				R2*=wtl;
+				// The legacy two-branch model is already accurate for Omega_max<1 and
+				// has less stabilization capacitance.  Above that range, four passive
+				// branches approximate the full complex sheet impedance.  The unused
+				// branches below Omega=1 are open circuits.
+				double normalized_L[4];
+				double normalized_R[4];
+				double normalized_G;
+				if (Omega_max<1.0)
+				{
+					normalized_L[0]=l1[optParaPos]; normalized_L[1]=l2[optParaPos];
+					normalized_R[0]=r1[optParaPos]; normalized_R[1]=r2[optParaPos];
+					normalized_L[2]=normalized_L[3]=1e20;
+					normalized_R[2]=normalized_R[3]=1e20;
+					normalized_G=g[optParaPos];
+				}
+				else
+				{
+					normalized_L[0]=l1_complex4[optParaPos]; normalized_L[1]=l2_complex4[optParaPos];
+					normalized_L[2]=l3_complex4[optParaPos]; normalized_L[3]=l4_complex4[optParaPos];
+					normalized_R[0]=r1_complex4[optParaPos]; normalized_R[1]=r2_complex4[optParaPos];
+					normalized_R[2]=r3_complex4[optParaPos]; normalized_R[3]=r4_complex4[optParaPos];
+					normalized_G=g_complex4[optParaPos];
+				}
+				G = G0*normalized_G/factor;
+				for (int order=0; order<m_Order; ++order)
+				{
+					L[order] = normalized_L[order]/G0/w0*factor*wtl;
+					R[order] = normalized_R[order]/G0*factor*wtl;
+				}
 				G/=wtl;
 
-				Lmin = L1;
-				if (L2<L1)
-					Lmin = L2;
+				Lmin = L[0];
+				for (int order=1; order<m_Order; ++order)
+					if (L[order]<Lmin)
+						Lmin = L[order];
 				m_Op->EC_G[n][index]= G;
-				m_Op->EC_C[n][index]= dT*dT/4.0*(16.0/Lmin + 1/L1 + 1/L2);
+				m_Op->EC_C[n][index]= dT*dT/4.0*16.0/Lmin;
+				for (int order=0; order<m_Order; ++order)
+					m_Op->EC_C[n][index] += dT*dT/4.0/L[order];
 				m_Op->Calc_ECOperatorPos(n,pos);
 
-				v_int_ADE[0][n][i]=(2.0*L1-dT*R1)/(2.0*L1+dT*R1);
-				v_ext_ADE[0][n][i]=dT/(L1+dT*R1/2.0)*m_Op->GetVI(n,pos[0],pos[1],pos[2]);
-				v_int_ADE[1][n][i]=(2.0*L2-dT*R2)/(2.0*L2+dT*R2);
-				v_ext_ADE[1][n][i]=dT/(L2+dT*R2/2.0)*m_Op->GetVI(n,pos[0],pos[1],pos[2]);
+				for (int order=0; order<m_Order; ++order)
+				{
+					v_int_ADE[order][n][i]=(2.0*L[order]-dT*R[order])/(2.0*L[order]+dT*R[order]);
+					v_ext_ADE[order][n][i]=dT/(L[order]+dT*R[order]/2.0)*m_Op->GetVI(n,pos[0],pos[1],pos[2]);
+				}
 			}
 		}
 	}
