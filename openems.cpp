@@ -52,6 +52,12 @@
 #include "Common/processfields_fd.h"
 #include "Common/processfields_sar.h"
 #include <hdf5.h>            // only for H5get_libversion()
+#ifndef _WIN32
+#include <sys/file.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cerrno>
+#endif
 #include <boost/version.hpp> // only for BOOST_LIB_VERSION
 #include <zlib.h>
 
@@ -83,6 +89,7 @@ openEMS::openEMS()
 	setlocale(LC_NUMERIC, "en_US.UTF-8");
 	FDTD_Op=NULL;
 	FDTD_Eng=NULL;
+	m_DeviceLockFD=-1;
 	Eng_Ext_SSD=NULL;
 	m_CSX=NULL;
 	PA=NULL;
@@ -118,6 +125,7 @@ void openEMS::FreeEngine()
 	PA=0;
 	delete FDTD_Eng;
 	FDTD_Eng=0;
+	ReleaseDeviceLock();
 	Eng_Ext_SSD=0; // non-owning observer; deleted by the engine (m_Eng_exts) in 'delete FDTD_Eng' above
 }
 
@@ -1531,6 +1539,7 @@ int openEMS::SetupFDTD()
 	}
 
 	//create FDTD engine
+	AcquireDeviceLock();
 	try
 	{
 		FDTD_Eng = FDTD_Op->CreateEngine();
@@ -1539,6 +1548,7 @@ int openEMS::SetupFDTD()
 	{
 		// e.g. the GPU engine without a device: do not run something else instead
 		cerr << "openEMS::SetupFDTD: Error: creating the FDTD engine failed: " << e.what() << endl;
+		ReleaseDeviceLock();
 		return 4;
 	}
 
@@ -1594,6 +1604,7 @@ int openEMS::RestartFDTD()
 		return 2;
 
 	FreeEngine();
+	AcquireDeviceLock();
 	FDTD_Eng = FDTD_Op->CreateEngine();
 
 	for (size_t n=0; n<FDTD_Op->GetNumberOfExtentions(); ++n)
@@ -1820,6 +1831,42 @@ void openEMS::RunFDTD()
 		FreeEngine();
 	else
 		FreeSimulation();
+}
+
+void openEMS::AcquireDeviceLock()
+{
+#ifndef _WIN32
+	const char* path = getenv("OPENEMS_DEVICE_LOCK");
+	if ((path==NULL) || (path[0]==0) || (m_DeviceLockFD>=0))
+		return;
+	m_DeviceLockFD = open(path, O_CREAT | O_RDWR, 0666);
+	if (m_DeviceLockFD<0)
+	{
+		cerr << "openEMS: cannot open the device lock " << path << endl;
+		return;
+	}
+	timeval start, end;
+	gettimeofday(&start,NULL);
+	while (flock(m_DeviceLockFD, LOCK_EX)!=0)
+		if (errno!=EINTR)
+		{
+			cerr << "openEMS: cannot lock " << path << endl;
+			break;
+		}
+	gettimeofday(&end,NULL);
+	cout << "openEMS: device lock " << path << " acquired after " << CalcDiffTime(end,start) << " s" << endl;
+#endif
+}
+
+void openEMS::ReleaseDeviceLock()
+{
+#ifndef _WIN32
+	if (m_DeviceLockFD<0)
+		return;
+	flock(m_DeviceLockFD, LOCK_UN);
+	close(m_DeviceLockFD);
+	m_DeviceLockFD = -1;
+#endif
 }
 
 bool openEMS::DumpStatistics(const string& filename, double time)
