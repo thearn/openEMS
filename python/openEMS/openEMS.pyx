@@ -61,6 +61,7 @@ cdef class openEMS:
     :param MultiGrid:      define a cylindrical sub-grid radius
     :param TimeStep:       force to use a given timestep (dangerous!)
     :param TimeStepFactor: reduce the timestep by a given factor (>0 to <=1)
+    :param ConductingSheetMaxFreq: upper frequency (Hz) the conducting-sheet model is fitted for (default: the excitation's maximum)
     :param TimeStepMethod: 1 or 3 chose timestep method (1=CFL, 3=Rennigs (default))
     :param CellConstantMaterial: set to 1 to assume a material is constant inside a cell (material probing in cell center). Required for SAR, see :meth:`SetCellConstantMaterial`.
     """
@@ -101,6 +102,9 @@ cdef class openEMS:
         if 'TimeStepMethod' in kw:
             self.SetTimeStepMethod(kw['TimeStepMethod'])
             del kw['TimeStepMethod']
+        if 'ConductingSheetMaxFreq' in kw:
+            self.SetConductingSheetMaxFreq(kw['ConductingSheetMaxFreq'])
+            del kw['ConductingSheetMaxFreq']
         if 'CellConstantMaterial' in kw:
             self.SetCellConstantMaterial(kw['CellConstantMaterial'])
             del kw['CellConstantMaterial']
@@ -132,6 +136,16 @@ cdef class openEMS:
         Set the end criteria value. E.g. 1e-6 for -60dB
         """
         self.thisptr.SetEndCriteria(val)
+
+    def SetConductingSheetMaxFreq(self, val):
+        """ SetConductingSheetMaxFreq(val)
+
+        Upper frequency the conducting-sheet model is fitted for. By default it is
+        the excitation's maximum frequency, which ties the sheet model to the pulse.
+
+        :param val: float -- frequency in Hz (0: use the excitation's maximum)
+        """
+        self.thisptr.SetConductingSheetMaxFreq(val)
 
     def SetOverSampling(self, val):
         """ SetOverSampling(val)

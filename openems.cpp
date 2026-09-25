@@ -132,6 +132,7 @@ void openEMS::Reset()
 	m_TS_method=3;
 	m_TS=0;
 	m_TS_fac=1.0;
+	m_SheetMaxFreq=0;
 	m_maxTime=0.0;
 
 	for (int n=0;n<6;++n)
@@ -1011,6 +1012,8 @@ bool openEMS::Parse_XML_FDTDSetup(TiXmlElement* FDTD_Opts)
 		this->SetTimeStep(dhelp);
 	if (FDTD_Opts->QueryDoubleAttribute("TimeStepFactor",&dhelp)==TIXML_SUCCESS)
 		this->SetTimeStepFactor(dhelp);
+	if (FDTD_Opts->QueryDoubleAttribute("ConductingSheetMaxFreq",&dhelp)==TIXML_SUCCESS)
+		this->SetConductingSheetMaxFreq(dhelp);
 	return true;
 }
 
@@ -1072,6 +1075,8 @@ bool openEMS::Write2XML(TiXmlNode* rootNode)
 		fdtd.SetDoubleAttribute("TimeStep", m_TS);
 	if (m_TS_fac>1)
 		fdtd.SetDoubleAttribute("TimeStepFactor", m_TS_fac);
+	if (m_SheetMaxFreq>0)
+		fdtd.SetDoubleAttribute("ConductingSheetMaxFreq", m_SheetMaxFreq);
 	fdtd.InsertEndChild(exc);
 
 	TiXmlElement BC("BoundaryCond");
@@ -1345,7 +1350,7 @@ int openEMS::SetupFDTD()
 	if ((m_CSX->GetQtyPropertyType(CSProperties::LORENTZMATERIAL)>0) || (m_CSX->GetQtyPropertyType(CSProperties::DEBYEMATERIAL)>0))
 		FDTD_Op->AddExtension(new Operator_Ext_LorentzMaterial(FDTD_Op));
 	if (m_CSX->GetQtyPropertyType(CSProperties::CONDUCTINGSHEET)>0)
-		FDTD_Op->AddExtension(new Operator_Ext_ConductingSheet(FDTD_Op, m_Exc->GetMaxFreq()));
+		FDTD_Op->AddExtension(new Operator_Ext_ConductingSheet(FDTD_Op, m_SheetMaxFreq>0 ? m_SheetMaxFreq : m_Exc->GetMaxFreq()));
 	if (m_CSX->GetQtyPropertyType(CSProperties::LUMPED_ELEMENT)>0)
 		FDTD_Op->AddExtension(new Operator_Ext_LumpedRLC(FDTD_Op));
 	if (m_CSX->GetQtyPropertyType(CSProperties::ABSORBING_BC)>0)
