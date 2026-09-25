@@ -22,6 +22,7 @@
 #include <unordered_map>
 
 #include "gpu_coeff_sets.h"
+#include "tools/useful.h"
 
 namespace
 {
@@ -58,36 +59,82 @@ bool GPU_FindSets(size_t count, unsigned int width, const std::function<void(siz
 	const size_t max_sets = std::max(max_sets16, (2*width*count - 4*count)/(4*width));
 	sets.index.resize(count);
 	sets.table.clear();
-	std::unordered_map<SetKey, uint32_t, SetKeyHash> found;
 
-	SetKey prev;
-	bool have_prev = false;
-	float values[GPU_MAX_SET_WIDTH];
-	for (size_t i=0; i<count; ++i)
+	// Chunks in parallel, each numbering its sets in order of first occurrence; merged in chunk
+	// order, which numbers the sets exactly as one scan in item order would.
+	struct Chunk
 	{
-		SetKey key;
-		key.width = width;
-		get(i, values);
-		std::memcpy(key.v, values, width*sizeof(float));
-		// neighbours mostly share the set
-		if (have_prev && (key==prev))
+		std::vector<SetKey> keys;   //!< local sets, in order of first occurrence
+		bool overflow = false;
+	};
+	const size_t per_chunk = 1<<16;
+	const size_t chunks = (count+per_chunk-1)/per_chunk;
+	std::vector<Chunk> local(chunks);
+	auto scan = [&](unsigned int c, unsigned int)
+	{
+		Chunk& ch = local[c];
+		std::unordered_map<SetKey, uint32_t, SetKeyHash> found;
+		SetKey prev;
+		bool have_prev = false;
+		float values[GPU_MAX_SET_WIDTH];
+		const size_t begin = c*per_chunk, end = std::min(count, begin+per_chunk);
+		for (size_t i=begin; i<end; ++i)
 		{
-			sets.index[i] = sets.index[i-1];
-			continue;
+			SetKey key;
+			key.width = width;
+			get(i, values);
+			std::memcpy(key.v, values, width*sizeof(float));
+			// neighbours mostly share the set
+			if (have_prev && (key==prev))
+			{
+				sets.index[i] = sets.index[i-1];
+				continue;
+			}
+			std::unordered_map<SetKey, uint32_t, SetKeyHash>::const_iterator it = found.find(key);
+			if (it==found.end())
+			{
+				if (found.size()>=max_sets)
+				{
+					ch.overflow = true;
+					return;
+				}
+				it = found.insert(std::make_pair(key, (uint32_t)found.size())).first;
+				ch.keys.push_back(key);
+			}
+			sets.index[i] = it->second;   // local number, mapped below
+			prev = key;
+			have_prev = true;
 		}
-		std::unordered_map<SetKey, uint32_t, SetKeyHash>::const_iterator it = found.find(key);
-		if (it==found.end())
+	};
+	ParallelLines(chunks, SetupThreads(chunks), scan);
+	std::unordered_map<SetKey, uint32_t, SetKeyHash> global;
+	std::vector<std::vector<uint32_t>> map(chunks);
+	for (size_t c=0; c<chunks; ++c)
+	{
+		if (local[c].overflow)
+			return false;
+		map[c].resize(local[c].keys.size());
+		for (size_t k=0; k<local[c].keys.size(); ++k)
 		{
-			if (found.size()>=max_sets)
-				return false;
-			it = found.insert(std::make_pair(key, (uint32_t)found.size())).first;
-			sets.table.insert(sets.table.end(), values, values+width);
+			const SetKey& key = local[c].keys[k];
+			std::unordered_map<SetKey, uint32_t, SetKeyHash>::const_iterator it = global.find(key);
+			if (it==global.end())
+			{
+				if (global.size()>=max_sets)
+					return false;
+				it = global.insert(std::make_pair(key, (uint32_t)global.size())).first;
+				sets.table.insert(sets.table.end(), (const float*)key.v, (const float*)key.v+width);
+			}
+			map[c][k] = it->second;
 		}
-		sets.index[i] = it->second;
-		prev = key;
-		have_prev = true;
 	}
-	sets.count = found.size();
+	ParallelLines(chunks, SetupThreads(chunks), [&](unsigned int c, unsigned int)
+	{
+		const size_t begin = c*per_chunk, end = std::min(count, begin+per_chunk);
+		for (size_t i=begin; i<end; ++i)
+			sets.index[i] = map[c][sets.index[i]];
+	});
+	sets.count = global.size();
 	sets.mode = (sets.count<=max_sets16) ? 1 : 2;
 	return true;
 }
