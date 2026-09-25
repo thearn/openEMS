@@ -21,6 +21,7 @@
 #include <stdexcept>
 #include "fparser.hh"
 #include "excitation.h"
+#include <cstdlib>
 
 using namespace std;
 
@@ -153,7 +154,12 @@ void Excitation::CalcGaussianPulsExcitation(double f0, double fc, int nTS)
 {
 	if (m_dT==0) return;
 
-	m_length = (unsigned int)ceil(2.0 * 9.0/(2.0*PI*fc) / m_dT);
+	// experiment (speedups campaign P2.2): OPENEMS_GAUSS_ONSET_WIDTHS starts the pulse that many
+	// Gaussian widths 3/(2 pi fc) before its peak instead of 3
+	double w = 3.0;
+	if (getenv("OPENEMS_GAUSS_ONSET_WIDTHS"))
+		w = atof(getenv("OPENEMS_GAUSS_ONSET_WIDTHS"));
+	m_length = (unsigned int)ceil(2.0 * 3.0*w/(2.0*PI*fc) / m_dT);
 	if (m_length>(unsigned int)nTS)
 	{
 		cerr << "Operator::CalcGaussianPulsExcitation: Requested excitation pusle would be " << m_length << " timesteps or " << m_length * m_dT << " s long. Cutting to max number of timesteps!" << endl;
@@ -168,9 +174,9 @@ void Excitation::CalcGaussianPulsExcitation(double f0, double fc, int nTS)
 	for (unsigned int n=1; n<m_length; ++n)
 	{
 		double t = n*m_dT;
-		m_signal_volt[n] = cos(2.0*PI*f0*(t-9.0/(2.0*PI*fc)))*exp(-1*pow(2.0*PI*fc*t/3.0-3,2));
+		m_signal_volt[n] = cos(2.0*PI*f0*(t-3.0*w/(2.0*PI*fc)))*exp(-1*pow(2.0*PI*fc*t/3.0-w,2));
 		t += 0.5*m_dT;
-		m_signal_curr[n] = cos(2.0*PI*f0*(t-9.0/(2.0*PI*fc)))*exp(-1*pow(2.0*PI*fc*t/3.0-3,2));
+		m_signal_curr[n] = cos(2.0*PI*f0*(t-3.0*w/(2.0*PI*fc)))*exp(-1*pow(2.0*PI*fc*t/3.0-w,2));
 	}
 
 	m_foi = f0;
