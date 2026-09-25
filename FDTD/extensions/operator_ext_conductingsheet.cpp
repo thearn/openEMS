@@ -24,6 +24,7 @@
 #include "CSPropConductingSheet.h"
 #include "tools/useful.h"
 
+#include <map>
 #include <set>
 
 using std::cerr;
@@ -66,12 +67,30 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 		std::set<CSPrimitives*> used;
 		bool failed = false;
 	};
+	// CSXCAD primitives recompute their dimension inside GetBoundBox (reset to 0,
+	// then counted up), so calling it from several scan threads lets another
+	// thread read a transient dimension and wrongly fall back to PEC. Read each
+	// sheet primitive's dimension and bounding box once, before the scan.
+	struct SheetShape
+	{
+		int dimension;
+		double box[6];
+	};
+	std::map<CSPrimitives*, SheetShape> sheetShapes;
+	for (CSPrimitives* prim : m_Op->GetGeometryCSX()->GetAllPrimitives(false, CSProperties::ANY))
+	{
+		if (dynamic_cast<CSPropConductingSheet*>(prim->GetProperty())==NULL)
+			continue;
+		SheetShape& shape = sheetShapes[prim];
+		prim->GetBoundBox(shape.box);
+		shape.dimension = prim->GetDimension();
+	}
+
 	auto scan = [&](unsigned int xStart, unsigned int xStop, ScanResult* result) -> void
 	{
 		unsigned int pos[3] = {0,0,0};
 		double coord[3];
 		CSPrimitives* cs_sheet = NULL;
-		double box[6];
 		int nP, nPP;
 		bool b_pos_on;
 		bool disable_pos;
@@ -125,9 +144,15 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 								failed = true; //sanity check, this should never happen
 								return;
 							}
-							if (cs_sheet->GetDimension()!=2)
+							auto shape = sheetShapes.find(cs_sheet);
+							if (shape==sheetShapes.end())
 							{
-								cerr << "Operator_Ext_ConductingSheet::BuildExtension: A conducting sheet primitive (ID: " << cs_sheet->GetID() << ") with dimension: " << cs_sheet->GetDimension() << " found, fallback to PEC!" << endl;
+								failed = true; //sanity check, every sheet primitive was recorded above
+								return;
+							}
+							if (shape->second.dimension!=2)
+							{
+								cerr << "Operator_Ext_ConductingSheet::BuildExtension: A conducting sheet primitive (ID: " << cs_sheet->GetID() << ") with dimension: " << shape->second.dimension << " found, fallback to PEC!" << endl;
 								m_Op->SetVV(n,pos[0],pos[1],pos[2], 0 );
 								m_Op->SetVI(n,pos[0],pos[1],pos[2], 0 );
 								++nr_pec[n];
@@ -155,7 +180,7 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 								continue;
 							}
 
-							cs_sheet->GetBoundBox(box);
+							const double* box = shape->second.box;
 							if (box[2*nP]!=box[2*nP+1])
 								tanDir(n, pos[0], pos[1], pos[2]) = nP;
 							if (box[2*nPP]!=box[2*nPP+1])
