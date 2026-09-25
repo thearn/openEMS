@@ -431,3 +431,29 @@ void Operator_Ext_TFSF::ShowStat(std::ostream &ostr) const
 	int dirs = m_ActiveDir[0][0] + m_ActiveDir[0][1] + m_ActiveDir[1][0] + m_ActiveDir[1][1] + m_ActiveDir[2][0] + m_ActiveDir[2][1] ;
 	cout << "Memory usage (est.)\t: ~" << m_numLines[0] * m_numLines[1] * m_numLines[2] * dirs * 4 * 4 / 1024 << " kiB" << endl;
 }
+
+void Operator_Ext_TFSF::HashState(uint64_t& h) const
+{
+	OperatorHash(h, m_Start, sizeof(m_Start));
+	OperatorHash(h, m_Stop, sizeof(m_Stop));
+	OperatorHash(h, &m_maxDelay, sizeof(m_maxDelay));
+	for (int n=0; n<3; ++n)
+	{
+		unsigned int numP = m_numLines[(n+1)%3]*m_numLines[(n+2)%3];
+		for (int l=0; l<2; ++l)
+		{
+			OperatorHash(h, &m_ActiveDir[n][l], sizeof(bool));
+			if (!m_ActiveDir[n][l])
+				continue;
+			for (int c=0; c<2; ++c)
+			{
+				OperatorHash(h, m_VoltDelay[n][l][c], sizeof(unsigned int)*numP);
+				OperatorHash(h, m_VoltDelayDelta[n][l][c], sizeof(FDTD_FLOAT)*numP);
+				OperatorHash(h, m_VoltAmp[n][l][c], sizeof(FDTD_FLOAT)*numP);
+				OperatorHash(h, m_CurrDelay[n][l][c], sizeof(unsigned int)*numP);
+				OperatorHash(h, m_CurrDelayDelta[n][l][c], sizeof(FDTD_FLOAT)*numP);
+				OperatorHash(h, m_CurrAmp[n][l][c], sizeof(FDTD_FLOAT)*numP);
+			}
+		}
+	}
+}

@@ -198,3 +198,20 @@ void Operator_Ext_Mur_ABC::ShowStat(std::ostream &ostr)  const
 	if (m_v_phase>0.0)
 		ostr << " Used phase velocity\t: " << m_v_phase << " (" << m_v_phase/C0 << " * c_0)" <<endl;
 }
+
+void Operator_Ext_Mur_ABC::HashState(uint64_t& h) const
+{
+	OperatorHash(h, &m_ny, sizeof(m_ny));
+	OperatorHash(h, &m_top, sizeof(m_top));
+	OperatorHash(h, m_numLines, sizeof(m_numLines));
+	OperatorHash(h, &m_LineNr, sizeof(m_LineNr));
+	OperatorHash(h, &m_LineNr_Shift, sizeof(m_LineNr_Shift));
+	OperatorHash(h, &m_v_phase, sizeof(m_v_phase));
+	Operator_Ext_Mur_ABC* self = const_cast<Operator_Ext_Mur_ABC*>(this);
+	for (unsigned int i=0; i<m_numLines[0]; ++i)
+		for (unsigned int j=0; j<m_numLines[1]; ++j)
+		{
+			FDTD_FLOAT c[2] = {self->m_Mur_Coeff_nyP(i,j), self->m_Mur_Coeff_nyPP(i,j)};
+			OperatorHash(h, c, sizeof(c));
+		}
+}

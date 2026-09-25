@@ -377,3 +377,28 @@ void Operator_Ext_Excitation::ShowStat(std::ostream &ostr)  const
 	cout << "Excitation Length (s)\t: " << m_Exc->GetLength()*m_Op->GetTimestep() << endl;
 }
 
+void Operator_Ext_Excitation::HashState(uint64_t& h) const
+{
+	OperatorHash(h, &Volt_Count, sizeof(Volt_Count));
+	OperatorHash(h, Volt_Count_Dir, sizeof(Volt_Count_Dir));
+	for (int n=0; n<3; ++n)
+		if (Volt_Count)
+			OperatorHash(h, Volt_index[n], sizeof(unsigned int)*Volt_Count);
+	if (Volt_Count)
+	{
+		OperatorHash(h, Volt_dir, sizeof(unsigned short)*Volt_Count);
+		OperatorHash(h, Volt_amp, sizeof(FDTD_FLOAT)*Volt_Count);
+		OperatorHash(h, Volt_delay, sizeof(unsigned int)*Volt_Count);
+	}
+	OperatorHash(h, &Curr_Count, sizeof(Curr_Count));
+	OperatorHash(h, Curr_Count_Dir, sizeof(Curr_Count_Dir));
+	for (int n=0; n<3; ++n)
+		if (Curr_Count)
+			OperatorHash(h, Curr_index[n], sizeof(unsigned int)*Curr_Count);
+	if (Curr_Count)
+	{
+		OperatorHash(h, Curr_dir, sizeof(unsigned short)*Curr_Count);
+		OperatorHash(h, Curr_amp, sizeof(FDTD_FLOAT)*Curr_Count);
+		OperatorHash(h, Curr_delay, sizeof(unsigned int)*Curr_Count);
+	}
+}
