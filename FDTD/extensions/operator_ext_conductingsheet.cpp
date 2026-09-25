@@ -135,7 +135,7 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 							disable_pos = true;
 
 	//					CSProperties* prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord,(CSProperties::PropertyType)(CSProperties::METAL | CSProperties::MATERIAL), false, &cs_sheet);
-						CSProperties* prop = m_Op->GetGeometryCSX()->GetPropertyByCoordPriority(coord, vPrimsZ, false, &cs_sheet);
+						CSProperties* prop = m_Op->PropertyByPriority(coord, vPrimsZ, false, &cs_sheet);
 						CSPropConductingSheet* cs_prop = dynamic_cast<CSPropConductingSheet*>(prop);
 						if (cs_prop)
 						{

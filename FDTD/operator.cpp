@@ -1266,7 +1266,7 @@ bool Operator::Calc_ECPos(
 	int ny,
 	const unsigned int* pos,
 	double* EC,
-	std::vector<CSPrimitives*> vPrims
+	const std::vector<CSPrimitives*>& vPrims
 ) const
 {
 	double EffMat[4];
@@ -1349,15 +1349,30 @@ bool Operator::GetCellCenterMaterialAvgCoord(const int pos[], double coord[3]) c
 	return true;
 }
 
+CSProperties* Operator::PropertyByPriority(const double* coord, const std::vector<CSPrimitives*>& prims, bool markAsUsed, CSPrimitives** found) const
+{
+	// the candidate list is priority sorted, so the first primitive containing coord wins
+	for (CSPrimitives* prim : prims)
+		if (prim->IsInside(coord))
+		{
+			if (found)
+				*found = prim;
+			if (markAsUsed)
+				prim->SetPrimitiveUsed(true);
+			return prim->GetProperty();
+		}
+	return NULL;
+}
+
 double Operator::GetMaterial(
 	int ny,
 	const double* coords,
 	int MatType,
-	std::vector<CSPrimitives*> vPrims,
+	const std::vector<CSPrimitives*>& vPrims,
 	bool markAsUsed
 ) const
 {
-	CSProperties* prop = CSX->GetPropertyByCoordPriority(coords,vPrims,markAsUsed);
+	CSProperties* prop = PropertyByPriority(coords,vPrims,markAsUsed);
 
 	CSPropMaterial* mat = dynamic_cast<CSPropMaterial*>(prop);
 	if (mat)
@@ -1402,7 +1417,7 @@ bool Operator::AverageMatCellCenter(
 	int ny,
 	const unsigned int* pos,
 	double* EffMat,
-	std::vector<CSPrimitives *> vPrims
+	const std::vector<CSPrimitives*>& vPrims
 ) const
 {
 	int n=ny;
@@ -1513,7 +1528,7 @@ bool Operator::AverageMatQuarterCell(
 	int ny,
 	const unsigned int* pos,
 	double* EffMat,
-	std::vector<CSPrimitives*> vPrims
+	const std::vector<CSPrimitives*>& vPrims
 ) const
 {
 	int n=ny;
@@ -1632,7 +1647,7 @@ bool Operator::Calc_EffMatPos(
 	int ny,
 	const unsigned int* pos,
 	double* EffMat,
-	std::vector<CSPrimitives *> vPrims
+	const std::vector<CSPrimitives*>& vPrims
 ) const
 {
 	switch (m_MatAverageMethod)
@@ -2238,7 +2253,7 @@ void Operator::CalcPEC_Range(unsigned int startX, unsigned int stopX, unsigned i
 				for (int n=0; n<3; ++n)
 				{
 					GetYeeCoords(n,pos,coord,false);
-					CSProperties* prop = CSX->GetPropertyByCoordPriority(coord, vPrimsZ, true);
+					CSProperties* prop = PropertyByPriority(coord, vPrimsZ, true);
 					if (prop)
 					{
 						if (prop->GetType()==CSProperties::METAL) //set to PEC

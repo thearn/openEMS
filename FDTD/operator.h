@@ -243,6 +243,10 @@ public:
 
 	//! Copy to out, in order, the primitives of in that may contain a point of the cell box around pos (a negative pos keeps the whole axis).
 	void NarrowPrimitives(const std::vector<CSPrimitives*>& in, std::vector<CSPrimitives*>& out, int posX, int posY, int posZ) const;
+	//! The property of the first primitive in \a prims (priority order) that contains \a coord;
+	//! the semantics of ContinuousStructure::GetPropertyByCoordPriority(coord, primList, ...)
+	//! without copying the candidate list
+	CSProperties* PropertyByPriority(const double* coord, const std::vector<CSPrimitives*>& prims, bool markAsUsed, CSPrimitives** found=NULL) const;
 
 protected:
 	//! Cache padded world-space bounding boxes for the primitive types whose IsInside cannot succeed outside them.
@@ -291,7 +295,7 @@ protected:
 	virtual bool Calc_ECPos(
 		int ny,
 		const unsigned int* pos,
-		double* EC, std::vector<CSPrimitives *> vPrims
+		double* EC, const std::vector<CSPrimitives*>& vPrims
 	) const;
 
 	//! Get the FDTD raw disc delta, needed by Calc_EffMatPos() \sa Calc_EffMatPos
@@ -307,7 +311,7 @@ protected:
 		int ny,
 		const double coords[3],
 		int MatType,
-		std::vector<CSPrimitives*> vPrims,
+		const std::vector<CSPrimitives*>& vPrims,
 		bool markAsUsed=true
 	) const;
 
@@ -318,21 +322,21 @@ protected:
 		int ny,
 		const unsigned int* pos,
 		double* EffMat,
-		std::vector<CSPrimitives*> vPrims
+		const std::vector<CSPrimitives*>& vPrims
 	) const;
 
 	virtual bool AverageMatCellCenter(
 		int ny,
 		const unsigned int* pos,
 		double* EffMat,
-		std::vector<CSPrimitives*> vPrims
+		const std::vector<CSPrimitives*>& vPrims
 	) const;
 
 	virtual bool AverageMatQuarterCell(
 		int ny,
 		const unsigned int* pos,
 		double* EffMat,
-		std::vector<CSPrimitives*> vPrims
+		const std::vector<CSPrimitives*>& vPrims
 	) const;
 
 	//! Calc operator at certain \a pos
