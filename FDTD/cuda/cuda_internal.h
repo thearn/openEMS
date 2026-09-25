@@ -92,6 +92,7 @@ struct CUDA_Context
 struct CUDA_FusedADE
 {
 	unsigned int count, orders;
+	const unsigned char* zflag;   //!< per z line: the group has nodes on it
 	const unsigned int* bits;
 	const unsigned int* prefix;
 	const unsigned char* mask;

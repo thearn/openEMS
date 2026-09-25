@@ -198,6 +198,8 @@ __device__ __forceinline__ void fused_volt(const float* __restrict__ volt, const
 __device__ __forceinline__ void fused_ade(const CUDA_FusedADE& A, const CUDA_GridDim& N,
                                           unsigned int x, unsigned int y, unsigned int z, float v[3])
 {
+	if (!A.zflag[z])   // most z lines carry no node of the group (sheets lie in a few planes)
+		return;
 	const unsigned int flat = nijk(N, 0, x, y, z);
 	const unsigned int word = A.bits[flat>>5];
 	const unsigned int bit = flat & 31;
@@ -669,8 +671,12 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 			if (ok)
 			{
 				std::vector<unsigned int> bits((numCells+31)/32, 0), prefix(bits.size(), 0);
+				std::vector<unsigned char> zflag(dim.nz, 0);
 				for (unsigned int f : C.flat)
+				{
 					bits[f>>5] |= 1u<<(f&31);
+					zflag[f%dim.nz] = 1;
+				}
 				unsigned int running = 0;
 				for (size_t w=0; w<bits.size(); ++w)
 				{
@@ -679,6 +685,7 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 				}
 				fade.count = C.count;
 				fade.orders = C.orders;
+				fade.zflag = Alloc<unsigned char>(zflag.size(), zflag.data());
 				fade.bits = Alloc<unsigned int>(bits.size(), bits.data());
 				fade.prefix = Alloc<unsigned int>(prefix.size(), prefix.data());
 				fade.mask = Alloc<unsigned char>(C.mask.size(), C.mask.data());
