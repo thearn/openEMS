@@ -96,7 +96,12 @@ public:
 	CUDA_Ext_LorentzMaterial(GPU_Backend_CUDA::Impl* impl, Operator_Ext_LorentzMaterial* op_ext);
 
 	virtual void DoPreVoltageUpdates() {for (size_t g=0; g<m_VoltGroups.size(); ++g) Pre(m_VoltGroups[g], d->volt);}
-	virtual void Apply2Voltages()      {for (size_t g=0; g<m_VoltGroups.size(); ++g) Apply(m_VoltGroups[g], d->volt);}
+	virtual void Apply2Voltages()
+	{
+		for (size_t g=0; g<m_VoltGroups.size(); ++g)
+			if (!m_VoltFolded[g])   // else applied in the fused kernel (see CUDA_FusedADE)
+				Apply(m_VoltGroups[g], d->volt);
+	}
 	virtual void DoPreCurrentUpdates() {for (size_t g=0; g<m_CurrGroups.size(); ++g) Pre(m_CurrGroups[g], d->curr);}
 	virtual void Apply2Current()       {for (size_t g=0; g<m_CurrGroups.size(); ++g) Apply(m_CurrGroups[g], d->curr);}
 
@@ -122,6 +127,7 @@ protected:
 
 	GPU_Backend_CUDA::Impl* d;
 	std::vector<ADEGroup> m_VoltGroups;
+	std::vector<char> m_VoltFolded;   //!< per voltage group: applied in the fused kernel
 	std::vector<ADEGroup> m_CurrGroups;
 };
 
@@ -189,19 +195,25 @@ void CUDA_Ext_LorentzMaterial::Build(std::vector<ADEGroup>& groups, const std::v
 			g.c_ext[k] = Coefficients(count, orders[o].c_ext);
 			g.c_lor[k] = Coefficients(count, orders[o].c_lor);
 		}
-		// fused step: the currents next to the voltages this group changes are recomputed
-		// (only the components it changes: an inactive component keeps its field)
-		if (voltage)
-		{
-			d->volt_modified_from.push_back(std::make_pair(d->volt_modified.size(), "lorentz/conducting-sheet ADE"));
-			for (unsigned int n=0; n<3; ++n)
-				for (unsigned int i=0; i<count; ++i)
-					if ((mask[i]>>n)&1)
-						d->volt_modified.push_back(n*d->numCells + orders[first].flat[i]);
-		}
 		g.pos = d->Alloc<unsigned int>(count, orders[first].flat.data());
 		g.mask = d->Alloc<unsigned char>(count, mask.data());
 		groups.push_back(g);
+		// fused step: the voltages this group changes (only its active components) are either
+		// corrected in the fused kernel or registered for the current fix-up (DecideFusedStep)
+		if (voltage)
+		{
+			const size_t index = groups.size()-1;
+			m_VoltFolded.push_back(0);
+			CUDA_ADECandidate C;
+			C.count = count;
+			C.orders = g.orders;
+			C.flat = orders[first].flat;
+			C.mask = mask;
+			for (unsigned int o=0; o<g.orders; ++o)
+				C.ade[o] = g.ade[o];
+			C.fold = [this, index]() {m_VoltFolded[index] = 1;};
+			d->ade_candidates.push_back(C);
+		}
 		first = last;
 	}
 }

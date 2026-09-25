@@ -193,6 +193,29 @@ __device__ __forceinline__ void fused_volt(const float* __restrict__ volt, const
 	v[2] = t;
 }
 
+// the ADE correction of the voltage ADE group applied in the fused kernel (see CUDA_FusedADE),
+// the operations of dispersive_apply_group in the same order, for a node the group contains
+__device__ __forceinline__ void fused_ade(const CUDA_FusedADE& A, const CUDA_GridDim& N,
+                                          unsigned int x, unsigned int y, unsigned int z, float v[3])
+{
+	const unsigned int flat = nijk(N, 0, x, y, z);
+	const unsigned int word = A.bits[flat>>5];
+	const unsigned int bit = flat & 31;
+	if (!((word>>bit)&1))
+		return;
+	const unsigned int rank = A.prefix[flat>>5] + __popc(word & ((1u<<bit)-1));
+	const unsigned int m = A.mask[rank];
+	for (unsigned int n=0; n<3; ++n)
+	{
+		if (!((m>>n)&1))
+			continue;
+		float t = v[n];
+		for (unsigned int o=0; o<A.orders; ++o)
+			t = t - A.ade[o][n*A.count + rank];
+		v[n] = t;
+	}
+}
+
 #define FUSED_TZ 32   // threads along z, the last one computes the border voltages only
 #define FUSED_TY 8    // threads along y, the last row computes the border voltages only
 #define FUSED_XC 4    // x lines per block (default): short blocks are faster, despite the voltages of one more x line
@@ -214,7 +237,7 @@ template<unsigned int MODE, bool HAS_REGIONS>
 __global__ void __launch_bounds__(FUSED_TZ*FUSED_TY) update_fused(
 	const float* __restrict__ volt_in, const float* __restrict__ curr_in, float* volt_out, float* __restrict__ curr_out,
 	const void* index, const float* va, const float* vb, const float* ia, const float* ib, unsigned int mode,
-	CUDA_GridDim N, CUDA_GridDim B, CUDA_GridDim E, CUDA_FusedRegions F, unsigned int xc)
+	CUDA_GridDim N, CUDA_GridDim B, CUDA_GridDim E, CUDA_FusedRegions F, CUDA_FusedADE A, unsigned int xc)
 {
 	__shared__ float sV[3][FUSED_TY][FUSED_TZ];
 	const unsigned int tz = threadIdx.x, ty = threadIdx.y;
@@ -235,7 +258,11 @@ __global__ void __launch_bounds__(FUSED_TZ*FUSED_TY) update_fused(
 		{
 			const int r = HAS_REGIONS && F.count ? fused_region_of(F, x, y, z) : -1;
 			if (r<0)
+			{
 				fused_volt(volt_in, curr_in, index, va, vb, coeff_mode, N, x, y, z, v);
+				if (A.count)
+					fused_ade(A, N, x, y, z, v);
+			}
 			else
 				upml_volt_value(volt_in, curr_in, F.volt[r], N, F.R[r], x, y, z, owner && (x<xe), v);
 			if (owner && (x<xe))
@@ -305,10 +332,10 @@ template<unsigned int MODE, bool HAS_REGIONS>
 static void launch_update_fused(dim3 grid, dim3 block, cudaStream_t stream,
 	const float* volt_in, const float* curr_in, float* volt_out, float* curr_out,
 	const void* index, const float* va, const float* vb, const float* ia, const float* ib,
-	unsigned int mode, CUDA_GridDim N, CUDA_GridDim B, CUDA_GridDim E, CUDA_FusedRegions F, unsigned int xc)
+	unsigned int mode, CUDA_GridDim N, CUDA_GridDim B, CUDA_GridDim E, CUDA_FusedRegions F, CUDA_FusedADE A, unsigned int xc)
 {
 	update_fused<MODE, HAS_REGIONS><<<grid, block, 0, stream>>>(
-		volt_in, curr_in, volt_out, curr_out, index, va, vb, ia, ib, mode, N, B, E, F, xc);
+		volt_in, curr_in, volt_out, curr_out, index, va, vb, ia, ib, mode, N, B, E, F, A, xc);
 }
 
 // the dumped values of a snapshot: entries [0, nv) from the voltages, [nv, n) from the currents
@@ -554,6 +581,8 @@ GPU_Backend_CUDA::Impl::Impl()
 	volt_next = curr_next = NULL;
 	fixup = NULL;
 	fixup_count = 0;
+	fade.count = 0;
+	fade.orders = 0;
 	snap_entries = NULL;
 	snap_nv = snap_n = 0;
 	snap_dev = NULL;
@@ -617,6 +646,56 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 	const bool report = getenv("OPENEMS_CUDA_FUSION_REPORT") && atoi(getenv("OPENEMS_CUDA_FUSION_REPORT"));
 	std::vector<std::string> in_region;
 	const char* source = "unknown";
+	// Voltage ADE groups: one group whose nodes are all main nodes (not in a UPML region, not
+	// changed by another extension) is applied in the kernel, which needs no fix-up for it; the
+	// other groups register their changed voltages for the fix-up.
+	{
+		const bool fold_env = !getenv("OPENEMS_CUDA_FUSED_ADE") || atoi(getenv("OPENEMS_CUDA_FUSED_ADE"))!=0;
+		std::set<unsigned int> others(volt_modified.begin(), volt_modified.end());
+		bool folded_one = false;
+		for (size_t g=0; g<ade_candidates.size(); ++g)
+		{
+			CUDA_ADECandidate& C = ade_candidates[g];
+			bool ok = fold_env && !folded_one && (C.orders<=ADE_GROUP_MAX) && std::is_sorted(C.flat.begin(), C.flat.end());
+			for (size_t i=0; ok && i<C.flat.size(); ++i)
+			{
+				const unsigned int f = C.flat[i];
+				const unsigned int c[3] = {f/(dim.ny*dim.nz), (f/dim.nz)%dim.ny, f%dim.nz};
+				ok = (c[0]>=main_start.nx) && (c[0]<main_stop.nx) && (c[1]>=main_start.ny) && (c[1]<main_stop.ny)
+				     && (c[2]>=main_start.nz) && (c[2]<main_stop.nz) && !(fregions.count && (fused_region_of(fregions, c[0], c[1], c[2])>=0));
+				for (unsigned int n=0; ok && n<3; ++n)
+					ok = !(((C.mask[i]>>n)&1) && others.count(n*numCells + f));
+			}
+			if (ok)
+			{
+				std::vector<unsigned int> bits((numCells+31)/32, 0), prefix(bits.size(), 0);
+				for (unsigned int f : C.flat)
+					bits[f>>5] |= 1u<<(f&31);
+				unsigned int running = 0;
+				for (size_t w=0; w<bits.size(); ++w)
+				{
+					prefix[w] = running;
+					running += __builtin_popcount(bits[w]);
+				}
+				fade.count = C.count;
+				fade.orders = C.orders;
+				fade.bits = Alloc<unsigned int>(bits.size(), bits.data());
+				fade.prefix = Alloc<unsigned int>(prefix.size(), prefix.data());
+				fade.mask = Alloc<unsigned char>(C.mask.size(), C.mask.data());
+				for (unsigned int o=0; o<C.orders; ++o)
+					fade.ade[o] = C.ade[o];
+				C.fold();
+				folded_one = true;
+				std::cout << "GPU_Backend_CUDA: ADE correction of " << C.count << " nodes (" << C.orders << " orders) in the fused kernel" << std::endl;
+				continue;
+			}
+			volt_modified_from.push_back(std::make_pair(volt_modified.size(), "lorentz/conducting-sheet ADE"));
+			for (unsigned int n=0; n<3; ++n)
+				for (size_t i=0; i<C.flat.size(); ++i)
+					if ((C.mask[i]>>n)&1)
+						volt_modified.push_back(n*numCells + C.flat[i]);
+		}
+	}
 	std::map<unsigned int, unsigned int> nodes;
 	const bool component_fixups = !getenv("OPENEMS_CUDA_FIXUP_COMPONENTS") || (atoi(getenv("OPENEMS_CUDA_FIXUP_COMPONENTS"))!=0);
 	auto add_node = [&](const unsigned int p[3], int lower_axis, unsigned int mask)
@@ -912,16 +991,16 @@ void GPU_Backend_CUDA::UpdateVoltages()
 		const bool specialize = !(getenv("OPENEMS_CUDA_FUSED_SPECIALIZE") && atoi(getenv("OPENEMS_CUDA_FUSED_SPECIALIZE"))==0);
 		if (!specialize || d->fregions.count)
 			launch_update_fused<3, true>(grid, block, d->Stream(), (const float*)d->volt, (const float*)d->curr,
-				d->volt_next, d->curr_next, (const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, xc);
+				d->volt_next, d->curr_next, (const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, d->fade, xc);
 		else if (d->coeff_mode==0)
 			launch_update_fused<0, false>(grid, block, d->Stream(), (const float*)d->volt, (const float*)d->curr,
-				d->volt_next, d->curr_next, (const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, xc);
+				d->volt_next, d->curr_next, (const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, d->fade, xc);
 		else if (d->coeff_mode==1)
 			launch_update_fused<1, false>(grid, block, d->Stream(), (const float*)d->volt, (const float*)d->curr,
-				d->volt_next, d->curr_next, (const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, xc);
+				d->volt_next, d->curr_next, (const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, d->fade, xc);
 		else
 			launch_update_fused<2, false>(grid, block, d->Stream(), (const float*)d->volt, (const float*)d->curr,
-				d->volt_next, d->curr_next, (const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, xc);
+				d->volt_next, d->curr_next, (const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, d->fade, xc);
 		d->CheckLaunch("update_fused");
 		if (timed)
 			CUDA_KernelTimes::End(d->Stream(), "update_fused");

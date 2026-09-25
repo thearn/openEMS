@@ -27,6 +27,7 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <functional>
 
 #include "gpu_backend_cuda.h"
 #include "FDTD/gpu_coeff_sets.h"
@@ -82,6 +83,32 @@ struct CUDA_Context
 	~CUDA_Context();
 };
 
+#ifndef ADE_GROUP_MAX
+#define ADE_GROUP_MAX 8
+#endif
+//! A voltage ADE group whose correction the fused step applies in its kernel (see fused_ade()):
+//! node flags (one bit per node), per-word prefix counts of the flags (the rank of a flagged node
+//! is its index in the group, whose positions are sorted), the active components and the state
+struct CUDA_FusedADE
+{
+	unsigned int count, orders;
+	const unsigned int* bits;
+	const unsigned int* prefix;
+	const unsigned char* mask;
+	const float* ade[ADE_GROUP_MAX];
+};
+
+//! A voltage ADE group registered by an extension; DecideFusedStep() either applies it in the
+//! fused kernel (fold is called) or registers its changed voltages for the current fix-up
+struct CUDA_ADECandidate
+{
+	unsigned int count, orders;
+	std::vector<unsigned int> flat;
+	std::vector<unsigned char> mask;
+	const float* ade[ADE_GROUP_MAX];
+	std::function<void()> fold;
+};
+
 struct CUDA_FixupEntry
 {
 	unsigned int node;
@@ -124,6 +151,8 @@ struct GPU_Backend_CUDA::Impl
 	std::vector<std::pair<size_t,const char*>> volt_modified_from; //!< (first index, extension) of each registration, for the fusion report
 	std::vector<CUDA_Ext_Mur_ABC*> mur_extensions;
 	CUDA_FusedRegions fregions;              //!< the UPML regions in the kernel (see CUDA_Ext_UPML::CanFuse())
+	std::vector<CUDA_ADECandidate> ade_candidates; //!< voltage ADE groups (see CUDA_ADECandidate)
+	CUDA_FusedADE fade;                      //!< the group applied in the fused kernel (count 0: none)
 	CUDA_FixupEntry* fixup;                  //!< main nodes/components recomputed after the voltage extensions
 	unsigned int fixup_count;
 	//! Decide once whether the fused step is used, and prepare it
