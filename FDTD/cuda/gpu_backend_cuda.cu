@@ -377,9 +377,12 @@ __global__ void field_dft(const float* __restrict__ f, const GPU_GatherEntry* __
 
 // the currents of the given main nodes again (update_currents), after the voltage extensions
 // changed voltages they read (see GPU_Backend_CUDA::Impl::fixup)
+// With the UPML regions in the fused kernel (F.count>0), a node of a region is computed with the
+// region update (upml_curr_value) from the flux before the step, as the kernel did.
 __global__ void update_currents_nodes(const float* __restrict__ curr_in, float* __restrict__ curr_out, const float* __restrict__ volt,
                                       const CUDA_FixupEntry* entries, unsigned int count,
-                                      const void* index, const float* ia, const float* ib, unsigned int mode, CUDA_GridDim N)
+                                      const void* index, const float* ia, const float* ib, unsigned int mode, CUDA_GridDim N,
+                                      CUDA_FusedRegions F)
 {
 	const unsigned int k = blockIdx.x*blockDim.x + threadIdx.x;
 	if (k>=count)
@@ -389,6 +392,20 @@ __global__ void update_currents_nodes(const float* __restrict__ curr_in, float* 
 	const unsigned int mask = entries[k].mask;
 	const unsigned int xp = N.ny*N.nz;
 	const unsigned int yp = N.nz;
+	if (F.count)
+	{
+		const unsigned int x = i/(N.ny*N.nz), y = (i/N.nz)%N.ny, z = i%N.nz;
+		const int r = fused_region_of(F, x, y, z);
+		if (r>=0)
+		{
+			// fix-up nodes are never on the last mesh lines (see DecideFusedStep)
+			const float curl[3] = {(volt[2*sn+i] - volt[2*sn+i+yp] - volt[sn+i] + volt[sn+i+1]),
+			                       (volt[i] - volt[i+1] - volt[2*sn+i] + volt[2*sn+i+xp]),
+			                       (volt[sn+i] - volt[sn+i+xp] - volt[i] + volt[i+yp])};
+			upml_curr_value(curr_in, curr_out, F.curr[r], N, F.R[r], x, y, z, true, curl, mask);
+			return;
+		}
+	}
 	const CUDA_MainCoeff C = main_coeff(index, ia, ib, mode, sn, i, 6);
 	float c;
 	if (mask&1)
@@ -574,9 +591,12 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 		return false;
 
 	// The currents of the nodes that read a voltage changed between the half-steps are computed
-	// again. With the UPML regions in the kernel, region nodes cannot (the current flux is
-	// updated in place): then the region kernels update the regions.
+	// again; with the UPML regions in the kernel a region node is computed with the region update
+	// from the current flux before the step (the kernel writes the new flux to a second buffer).
 	const bool folded = fregions.count>0;
+	const bool report = getenv("OPENEMS_CUDA_FUSION_REPORT") && atoi(getenv("OPENEMS_CUDA_FUSION_REPORT"));
+	std::vector<std::string> in_region;
+	const char* source = "unknown";
 	std::map<unsigned int, unsigned int> nodes;
 	const bool component_fixups = !getenv("OPENEMS_CUDA_FIXUP_COMPONENTS") || (atoi(getenv("OPENEMS_CUDA_FIXUP_COMPONENTS"))!=0);
 	auto add_node = [&](const unsigned int p[3], int lower_axis, unsigned int mask)
@@ -596,12 +616,16 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 			ok &= (folded || ((c[n]>=start[n]) && (c[n]<stop[n]))) && (c[n]+1<n_lines[n]);
 		if (!ok)
 			return;
-		if (folded && (fused_region_of(fregions, c[0], c[1], c[2])>=0))
-			fregions.count = 0;
+		if (folded && (fused_region_of(fregions, c[0], c[1], c[2])>=0) && report && (in_region.size()<24))
+			in_region.push_back(std::string(source) + " voltage fixes node (" + std::to_string(c[0]) + "," +
+				std::to_string(c[1]) + "," + std::to_string(c[2]) + ") in UPML region " + std::to_string(fused_region_of(fregions, c[0], c[1], c[2])));
 		nodes[(c[0]*dim.ny + c[1])*dim.nz + c[2]] |= mask;
 	};
 	for (size_t k=0; k<volt_modified.size(); ++k)
 	{
+		for (size_t m=0; m<volt_modified_from.size(); ++m)
+			if (volt_modified_from[m].first<=k)
+				source = volt_modified_from[m].second;
 		const unsigned int node = volt_modified[k] % numCells;
 		const unsigned int p[3] = {node/(dim.ny*dim.nz), (node/dim.nz)%dim.ny, node%dim.nz};
 		if (!component_fixups)
@@ -618,6 +642,13 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 				add_node(p, -1, mask);
 				add_node(p, 3-current_component-voltage_component, mask);
 			}
+	}
+	if (report)
+	{
+		std::cout << "GPU_Backend_CUDA fusion report: " << (folded ? "UPML regions folded into the main kernel" : "UPML regions not folded")
+		          << "; " << volt_modified.size() << " modified voltages; fix-up nodes in UPML regions (computed with the region update):" << std::endl;
+		for (size_t n=0; n<in_region.size(); ++n)
+			std::cout << "  " << in_region[n] << std::endl;
 	}
 	std::vector<CUDA_FixupEntry> list;
 	for (std::map<unsigned int, unsigned int>::const_iterator it=nodes.begin(); it!=nodes.end(); ++it)
@@ -894,7 +925,7 @@ void GPU_Backend_CUDA::UpdateCurrents()
 		if (d->fixup_count)
 			CUDA_Launch(d, "update_currents_nodes", update_currents_nodes, d->fixup_count, 1, 1, (const float*)d->curr, d->curr_next, (const float*)d->volt,
 			            (const CUDA_FixupEntry*)d->fixup, d->fixup_count, (const void*)d->index,
-			            (const float*)(c ? d->coeff : d->ii), (const float*)(c ? d->coeff : d->iv), d->coeff_mode, d->dim);
+			            (const float*)(c ? d->coeff : d->ii), (const float*)(c ? d->coeff : d->iv), d->coeff_mode, d->dim, d->fregions);
 		std::swap(d->curr, d->curr_next);
 		return;
 	}

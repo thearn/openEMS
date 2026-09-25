@@ -162,11 +162,14 @@ __device__ __forceinline__ void upml_volt_value(const float* volt, const float* 
 	}
 }
 
-// ... and the currents of a region node (the node's own block only, the flux in place), with the
-// curl of the new voltages (the expressions of upml_fused_curr_node); update: not on the last mesh lines
+// ... and the currents of a region node (the node's own block only), with the curl of the new
+// voltages (the expressions of upml_fused_curr_node): the flux from A.flux, the new flux into
+// A.flux_out (a second buffer, so that the current fix-up can compute a node again, see
+// update_currents_nodes); update: not on the last mesh lines. mask: the components to compute.
 __device__ __forceinline__ void upml_curr_value(const float* curr_in, float* curr_out, const UPMLFusedArgs& A,
                                                 const CUDA_GridDim& N, const UPMLRegion& R,
-                                                unsigned int gx, unsigned int gy, unsigned int gz, bool update, const float curl[3])
+                                                unsigned int gx, unsigned int gy, unsigned int gz, bool update, const float curl[3],
+                                                unsigned int mask=7)
 {
 	const unsigned int x = gx-R.sx, y = gy-R.sy, z = gz-R.sz;
 	const unsigned int sn = N.nx*N.ny*N.nz;
@@ -178,6 +181,8 @@ __device__ __forceinline__ void upml_curr_value(const float* curr_in, float* cur
 		C = main_coeff(A.index, A.ca, A.cb, A.mode, sn, i, 6);
 	for (unsigned int n=0; n<3; ++n)
 	{
+		if (!((mask>>n)&1))
+			continue;
 		const unsigned int l = upml_local(R, n, x, y, z);
 		const unsigned int g = n*sn + i;
 		const float f_help = U.old[n*U.s]*curr_in[g] - U.fo[n*U.s]*A.flux[l];
@@ -187,7 +192,7 @@ __device__ __forceinline__ void upml_curr_value(const float* curr_in, float* cur
 			c  = c * C.a[n*C.s];
 			c += C.b[n*C.s] * curl[n];
 		}
-		A.flux[l] = c;
+		A.flux_out[l] = c;
 		curr_out[g] = f_help + U.fn[n*U.s]*c;
 	}
 }

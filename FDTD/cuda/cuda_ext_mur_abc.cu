@@ -207,6 +207,7 @@ CUDA_Ext_Mur_ABC::CUDA_Ext_Mur_ABC(GPU_Backend_CUDA::Impl* impl, Operator_Ext_Mu
 	// current half-steps. The fused kernel computes currents before that
 	// overwrite, so register those voltage edges for the existing current
 	// fixup pass.
+	d->volt_modified_from.push_back(std::make_pair(d->volt_modified.size(), "Mur ABC"));
 	for (unsigned int i=0; i<m_Param.ni; ++i)
 		for (unsigned int j=0; j<m_Param.nj; ++j)
 		{

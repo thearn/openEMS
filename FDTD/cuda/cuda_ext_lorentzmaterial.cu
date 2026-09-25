@@ -140,6 +140,7 @@ void CUDA_Ext_LorentzMaterial::Setup(std::vector<Order>& orders, unsigned int co
 	std::vector<unsigned int> flat(count);
 	for (unsigned int i=0; i<count; ++i)
 		flat[i] = (pos[0][i]*d->dim.ny + pos[1][i])*d->dim.nz + pos[2][i];
+	d->volt_modified_from.push_back(std::make_pair(d->volt_modified.size(), "lorentz/conducting-sheet ADE"));
 	if (voltage)
 		for (unsigned int n=0; n<3; ++n)
 			for (unsigned int i=0; i<count; ++i)
