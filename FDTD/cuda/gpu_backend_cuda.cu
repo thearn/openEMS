@@ -996,8 +996,18 @@ void GPU_Backend_CUDA::UpdateVoltages()
 		const float* ia = (const float*)(c ? d->coeff : d->ii);
 		const float* ib = (const float*)(c ? d->coeff : d->iv);
 		const bool specialize = !(getenv("OPENEMS_CUDA_FUSED_SPECIALIZE") && atoi(getenv("OPENEMS_CUDA_FUSED_SPECIALIZE"))==0);
-		if (!specialize || d->fregions.count)
+		if (!specialize)
 			launch_update_fused<3, true>(grid, block, d->Stream(), (const float*)d->volt, (const float*)d->curr,
+				d->volt_next, d->curr_next, (const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, d->fade, xc);
+		// with the UPML regions in the kernel: specialized on the coefficient mode as well
+		else if (d->fregions.count && (d->coeff_mode==0))
+			launch_update_fused<0, true>(grid, block, d->Stream(), (const float*)d->volt, (const float*)d->curr,
+				d->volt_next, d->curr_next, (const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, d->fade, xc);
+		else if (d->fregions.count && (d->coeff_mode==1))
+			launch_update_fused<1, true>(grid, block, d->Stream(), (const float*)d->volt, (const float*)d->curr,
+				d->volt_next, d->curr_next, (const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, d->fade, xc);
+		else if (d->fregions.count)
+			launch_update_fused<2, true>(grid, block, d->Stream(), (const float*)d->volt, (const float*)d->curr,
 				d->volt_next, d->curr_next, (const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, d->fade, xc);
 		else if (d->coeff_mode==0)
 			launch_update_fused<0, false>(grid, block, d->Stream(), (const float*)d->volt, (const float*)d->curr,
