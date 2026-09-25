@@ -149,6 +149,9 @@ bool Operator_Ext_Excitation::BuildExtension()
 				-1, pos[1], pos[2],
 				CSProperties::EXCITATION
 			);
+			// no excitation primitive can contain a point of this row
+			if (vPrims.empty())
+				continue;
 
 			for (pos[0]=0; pos[0]<numLines[0]; ++pos[0])
 			{
