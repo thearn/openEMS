@@ -36,6 +36,8 @@ public:
 
 	virtual bool BuildExtension();
 
+	virtual void MarkConductorEdges(std::vector<uint8_t>& mask) const;
+
 	virtual bool IsCylinderCoordsSave(bool closedAlpha, bool R0_included) const {UNUSED(closedAlpha); UNUSED(R0_included); return true;}
 	virtual bool IsCylindricalMultiGridSave(bool child) const {UNUSED(child); return true;}
 

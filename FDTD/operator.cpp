@@ -16,6 +16,7 @@
 */
 
 #include <fstream>
+#include <cstdio>
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -669,6 +670,35 @@ void Operator::DumpPEC2File(std::string filename , unsigned int *range)
 
 	std::vector<float> points;
 	std::vector<int64_t> lines;
+	// Edges that extensions model as conductors (conducting sheets) are dumped as
+	// well, flagged 1 in the "sheet" cell array, so the dump shows the conductor
+	// topology of the operator that is actually stepped.
+	std::vector<uint8_t> conductorMask((size_t)numLines[0]*numLines[1]*numLines[2], 0);
+	for (size_t n=0; n<m_Op_exts.size(); ++n)
+		m_Op_exts.at(n)->MarkConductorEdges(conductorMask);
+	std::vector<unsigned char> sheetFlag;
+	unsigned int sheetEdges = 0;
+
+	// The PEC and sheet edges of each z plane are collected in parallel (in the order of the serial
+	// x, y, n loops); points are then numbered serially plane by plane exactly as before.
+	struct PlaneEdge { unsigned int x, y; unsigned char n, sheet; };
+	std::vector<std::vector<PlaneEdge>> planes(stop[2]>start[2] ? stop[2]-start[2] : 0);
+	ParallelLines(planes.size(), SetupThreads(planes.size()), [&](unsigned int k, unsigned int)
+	{
+		unsigned int pos[3];
+		pos[2] = start[2]+k;
+		for (pos[0]=start[0];pos[0]<stop[0];++pos[0])
+			for (pos[1]=start[1];pos[1]<stop[1];++pos[1])
+				for (int n=0;n<3;++n)
+				{
+					const int nP = (n+1)%3;
+					const int nPP = (n+2)%3;
+					const bool pec = (GetVV(n,pos) == 0) && (GetVI(n,pos) == 0);
+					const bool sheet = !pec && ((conductorMask[pos[0] + (size_t)numLines[0]*(pos[1] + (size_t)numLines[1]*pos[2])]>>n)&1);
+					if ((pec || sheet) && (pos[nP]>0) && (pos[nPP]>0))
+						planes[k].push_back({pos[0], pos[1], (unsigned char)n, (unsigned char)sheet});
+				}
+	});
 
 	int* pointIdx[2];
 	pointIdx[0] = new int[numLines[0]*numLines[1]];
@@ -680,66 +710,66 @@ void Operator::DumpPEC2File(std::string filename , unsigned int *range)
 		pointIdx[1][n]=-1;
 	}
 
-	int nP,nPP;
 	double coord[3];
-	unsigned int pos[3],rpos[3];
+	unsigned int rpos[3];
 	unsigned int mesh_idx=0;
-	for (pos[2]=start[2];pos[2]<stop[2];++pos[2])
+	for (size_t k=0; k<planes.size(); ++k)
 	{ // each xy-plane
 		for (unsigned int n=0;n<numLines[0]*numLines[1];++n)
 		{
 			pointIdx[0][n]=pointIdx[1][n];
 			pointIdx[1][n]=-1;
 		}
-		for (pos[0]=start[0];pos[0]<stop[0];++pos[0])
-			for (pos[1]=start[1];pos[1]<stop[1];++pos[1])
+		for (const PlaneEdge& e : planes[k])
+		{
+			const int n = e.n;
+			sheetFlag.push_back(e.sheet);
+			sheetEdges += e.sheet;
+			rpos[0]=e.x;
+			rpos[1]=e.y;
+			rpos[2]=start[2]+k;
+
+			mesh_idx = rpos[0] + rpos[1]*numLines[0];
+			if (pointIdx[0][mesh_idx]<0)
 			{
-				for (int n=0;n<3;++n)
-				{
-					nP = (n+1)%3;
-					nPP = (n+2)%3;
-					if ((GetVV(n,pos) == 0) && (GetVI(n,pos) == 0) && (pos[nP]>0) && (pos[nPP]>0))
-					{
-						rpos[0]=pos[0];
-						rpos[1]=pos[1];
-						rpos[2]=pos[2];
-
-
-						mesh_idx = rpos[0] + rpos[1]*numLines[0];
-						if (pointIdx[0][mesh_idx]<0)
-						{
-							for (int m=0;m<3;++m)
-								coord[m] = discLines[m][rpos[m]];
-							TransformCoordSystem(coord, coord, m_MeshType, CARTESIAN);
-							for (int m=0;m<3;++m)
-								coord[m] *= scaling;
-							pointIdx[0][mesh_idx] = (int)(points.size()/3);
-							points.insert(points.end(), coord, coord+3);
-						}
-						lines.push_back(pointIdx[0][mesh_idx]);
-
-						++rpos[n];
-						mesh_idx = rpos[0] + rpos[1]*numLines[0];
-						if (pointIdx[n==2][mesh_idx]<0)
-						{
-							for (int m=0;m<3;++m)
-								coord[m] = discLines[m][rpos[m]];
-							TransformCoordSystem(coord, coord, m_MeshType, CARTESIAN);
-							for (int m=0;m<3;++m)
-								coord[m] *= scaling;
-							pointIdx[n==2][mesh_idx] = (int)(points.size()/3);
-							points.insert(points.end(), coord, coord+3);
-						}
-						lines.push_back(pointIdx[n==2][mesh_idx]);
-					}
-				}
+				for (int m=0;m<3;++m)
+					coord[m] = discLines[m][rpos[m]];
+				TransformCoordSystem(coord, coord, m_MeshType, CARTESIAN);
+				for (int m=0;m<3;++m)
+					coord[m] *= scaling;
+				pointIdx[0][mesh_idx] = (int)(points.size()/3);
+				points.insert(points.end(), coord, coord+3);
 			}
+			lines.push_back(pointIdx[0][mesh_idx]);
+
+			++rpos[n];
+			mesh_idx = rpos[0] + rpos[1]*numLines[0];
+			if (pointIdx[n==2][mesh_idx]<0)
+			{
+				for (int m=0;m<3;++m)
+					coord[m] = discLines[m][rpos[m]];
+				TransformCoordSystem(coord, coord, m_MeshType, CARTESIAN);
+				for (int m=0;m<3;++m)
+					coord[m] *= scaling;
+				pointIdx[n==2][mesh_idx] = (int)(points.size()/3);
+				points.insert(points.end(), coord, coord+3);
+			}
+			lines.push_back(pointIdx[n==2][mesh_idx]);
+		}
+		planes[k].clear();
+		planes[k].shrink_to_fit();
 	}
 	delete[] pointIdx[0];
 	delete[] pointIdx[1];
 
-	if (VTK_File_Writer::WriteLines(filename + ".vtp", points, lines))
-		cout << " done." << endl;
+	filename += ".vtp";
+	// written under a temporary name and renamed, so a reader never sees a partial file
+	const std::string partial = filename + ".partial";
+	if (!VTK_File_Writer::WriteLines(partial, points, lines, "sheet", sheetFlag))
+		return;
+	if (std::rename(partial.c_str(), filename.c_str())!=0)
+		cerr << "Operator::DumpPEC2File: cannot rename " << partial << " to " << filename << endl;
+	cout << " done (" << sheetEdges << " conducting-sheet edges)." << endl;
 }
 
 void Operator::DumpMaterial2File(std::string filename)

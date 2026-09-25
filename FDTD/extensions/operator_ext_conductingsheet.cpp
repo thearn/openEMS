@@ -353,3 +353,19 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 	}
 	return true;
 }
+
+void Operator_Ext_ConductingSheet::MarkConductorEdges(std::vector<uint8_t>& mask) const
+{
+	if ((m_Order<1) || m_LM_Count.empty())
+		return;
+	const unsigned int nx = m_Op->GetNumberOfLines(0,true);
+	const unsigned int ny = m_Op->GetNumberOfLines(1,true);
+	// an edge carries the sheet model exactly where its ADE coupling is nonzero
+	for (unsigned int i=0; i<m_LM_Count.at(0); ++i)
+	{
+		const size_t index = m_LM_pos[0][0][i] + (size_t)nx*(m_LM_pos[0][1][i] + (size_t)ny*m_LM_pos[0][2][i]);
+		for (int n=0; n<3; ++n)
+			if (v_ext_ADE[0][n][i]!=0)
+				mask[index] |= (uint8_t)(1<<n);
+	}
+}
