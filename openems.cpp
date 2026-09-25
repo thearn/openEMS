@@ -1136,6 +1136,11 @@ std::string openEMS::BuildOperatorIdentity()
 				props->RemoveChild(elem);
 			else
 			{
+				// the amplitude of a soft excitation (E type 0, H type 2) is not part of the
+				// operator: RestartFDTD rebuilds the excitation extension from it
+				int type = -1;
+				if ((name=="Excitation") && (elem->QueryIntAttribute("Type",&type)==TIXML_SUCCESS) && ((type==0) || (type==2)))
+					elem->RemoveAttribute("Excite");
 				for (TiXmlElement* child = elem->FirstChildElement(); child;)
 				{
 					TiXmlElement* childNext = child->NextSiblingElement();
@@ -1472,6 +1477,16 @@ int openEMS::RestartFDTD()
 	}
 	if (!m_Exc->buildExcitationSignal(NrTS))
 		return 2;
+	// soft excitation amplitudes may differ from the preceding run (e.g. another driven port)
+	for (size_t n=0; n<FDTD_Op->GetNumberOfExtentions(); ++n)
+	{
+		Operator_Ext_Excitation* exc = dynamic_cast<Operator_Ext_Excitation*>(FDTD_Op->GetExtension(n));
+		if (exc && !exc->BuildExtension())
+		{
+			cerr << "openEMS::RestartFDTD: Error, rebuilding the excitation failed" << endl;
+			return 5;
+		}
+	}
 
 	if (PA)
 		PA->DeleteAll();
