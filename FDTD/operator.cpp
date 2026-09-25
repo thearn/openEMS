@@ -687,6 +687,27 @@ void Operator::DumpPEC2File(std::string filename , unsigned int *range)
 	sheetFlag->SetName("sheet");
 	unsigned int sheetEdges = 0;
 
+	// The PEC and sheet edges of each z plane are collected in parallel (in the order of the serial
+	// x, y, n loops); points are then numbered serially plane by plane exactly as before.
+	struct PlaneEdge { unsigned int x, y; unsigned char n, sheet; };
+	std::vector<std::vector<PlaneEdge>> planes(stop[2]>start[2] ? stop[2]-start[2] : 0);
+	ParallelLines(planes.size(), SetupThreads(planes.size()), [&](unsigned int k, unsigned int)
+	{
+		unsigned int pos[3];
+		pos[2] = start[2]+k;
+		for (pos[0]=start[0];pos[0]<stop[0];++pos[0])
+			for (pos[1]=start[1];pos[1]<stop[1];++pos[1])
+				for (int n=0;n<3;++n)
+				{
+					const int nP = (n+1)%3;
+					const int nPP = (n+2)%3;
+					const bool pec = (GetVV(n,pos) == 0) && (GetVI(n,pos) == 0);
+					const bool sheet = !pec && ((conductorMask[pos[0] + (size_t)numLines[0]*(pos[1] + (size_t)numLines[1]*pos[2])]>>n)&1);
+					if ((pec || sheet) && (pos[nP]>0) && (pos[nPP]>0))
+						planes[k].push_back({pos[0], pos[1], (unsigned char)n, (unsigned char)sheet});
+				}
+	});
+
 	int* pointIdx[2];
 	pointIdx[0] = new int[numLines[0]*numLines[1]];
 	pointIdx[1] = new int[numLines[0]*numLines[1]];
@@ -697,63 +718,54 @@ void Operator::DumpPEC2File(std::string filename , unsigned int *range)
 		pointIdx[1][n]=-1;
 	}
 
-	int nP,nPP;
 	double coord[3];
-	unsigned int pos[3],rpos[3];
+	unsigned int rpos[3];
 	unsigned int mesh_idx=0;
-	for (pos[2]=start[2];pos[2]<stop[2];++pos[2])
+	for (size_t k=0; k<planes.size(); ++k)
 	{ // each xy-plane
 		for (unsigned int n=0;n<numLines[0]*numLines[1];++n)
 		{
 			pointIdx[0][n]=pointIdx[1][n];
 			pointIdx[1][n]=-1;
 		}
-		for (pos[0]=start[0];pos[0]<stop[0];++pos[0])
-			for (pos[1]=start[1];pos[1]<stop[1];++pos[1])
+		for (const PlaneEdge& e : planes[k])
+		{
+			const int n = e.n;
+			sheetFlag->InsertNextValue(e.sheet);
+			sheetEdges += e.sheet;
+			rpos[0]=e.x;
+			rpos[1]=e.y;
+			rpos[2]=start[2]+k;
+
+			poly->InsertNextCell(2);
+
+			mesh_idx = rpos[0] + rpos[1]*numLines[0];
+			if (pointIdx[0][mesh_idx]<0)
 			{
-				for (int n=0;n<3;++n)
-				{
-					nP = (n+1)%3;
-					nPP = (n+2)%3;
-					const bool pec = (GetVV(n,pos) == 0) && (GetVI(n,pos) == 0);
-					const bool sheet = !pec && ((conductorMask[pos[0] + (size_t)numLines[0]*(pos[1] + (size_t)numLines[1]*pos[2])]>>n)&1);
-					if ((pec || sheet) && (pos[nP]>0) && (pos[nPP]>0))
-					{
-						sheetFlag->InsertNextValue(sheet ? 1 : 0);
-						sheetEdges += sheet;
-						rpos[0]=pos[0];
-						rpos[1]=pos[1];
-						rpos[2]=pos[2];
-
-						poly->InsertNextCell(2);
-
-						mesh_idx = rpos[0] + rpos[1]*numLines[0];
-						if (pointIdx[0][mesh_idx]<0)
-						{
-							for (int m=0;m<3;++m)
-								coord[m] = discLines[m][rpos[m]];
-							TransformCoordSystem(coord, coord, m_MeshType, CARTESIAN);
-							for (int m=0;m<3;++m)
-								coord[m] *= scaling;
-							pointIdx[0][mesh_idx] = (int)points->InsertNextPoint(coord);
-						}
-						poly->InsertCellPoint(pointIdx[0][mesh_idx]);
-
-						++rpos[n];
-						mesh_idx = rpos[0] + rpos[1]*numLines[0];
-						if (pointIdx[n==2][mesh_idx]<0)
-						{
-							for (int m=0;m<3;++m)
-								coord[m] = discLines[m][rpos[m]];
-							TransformCoordSystem(coord, coord, m_MeshType, CARTESIAN);
-							for (int m=0;m<3;++m)
-								coord[m] *= scaling;
-							pointIdx[n==2][mesh_idx] = (int)points->InsertNextPoint(coord);
-						}
-						poly->InsertCellPoint(pointIdx[n==2][mesh_idx]);
-					}
-				}
+				for (int m=0;m<3;++m)
+					coord[m] = discLines[m][rpos[m]];
+				TransformCoordSystem(coord, coord, m_MeshType, CARTESIAN);
+				for (int m=0;m<3;++m)
+					coord[m] *= scaling;
+				pointIdx[0][mesh_idx] = (int)points->InsertNextPoint(coord);
 			}
+			poly->InsertCellPoint(pointIdx[0][mesh_idx]);
+
+			++rpos[n];
+			mesh_idx = rpos[0] + rpos[1]*numLines[0];
+			if (pointIdx[n==2][mesh_idx]<0)
+			{
+				for (int m=0;m<3;++m)
+					coord[m] = discLines[m][rpos[m]];
+				TransformCoordSystem(coord, coord, m_MeshType, CARTESIAN);
+				for (int m=0;m<3;++m)
+					coord[m] *= scaling;
+				pointIdx[n==2][mesh_idx] = (int)points->InsertNextPoint(coord);
+			}
+			poly->InsertCellPoint(pointIdx[n==2][mesh_idx]);
+		}
+		planes[k].clear();
+		planes[k].shrink_to_fit();
 	}
 	delete[] pointIdx[0];
 	delete[] pointIdx[1];
@@ -770,6 +782,10 @@ void Operator::DumpPEC2File(std::string filename , unsigned int *range)
 	// written under a temporary name and renamed, so a reader never sees a partial file
 	const std::string partial = filename + ".partial";
 	writer->SetFileName(partial.c_str());
+	// raw appended data without compression: the dump is scratch evidence, written once and read once
+	writer->SetDataModeToAppended();
+	writer->EncodeAppendedDataOff();
+	writer->SetCompressorTypeToNone();
 
 #if VTK_MAJOR_VERSION>=6
 	writer->SetInputData(polydata);
