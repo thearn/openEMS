@@ -21,46 +21,72 @@
 #include "FDTD/extensions/engine_ext_lorentzmaterial.h"
 
 // Drude/Lorentz/Debye materials and conducting sheets, see Engine_Ext_LorentzMaterial
-// and Engine_Ext_Dispersive. One launch per dispersion order, one thread per mesh
-// position of that order (unique within an order). The ADE state and coefficients
-// are stored per order as [direction][position].
-struct ADEParam { unsigned int count; unsigned int lorentz; unsigned int sn; };
+// and Engine_Ext_Dispersive. One thread per mesh position of a group of orders. The ADE
+// state and coefficients are stored per order as [direction][position].
 
-// ADE update before the main update, reads the field
-__global__ void lorentz_pre(const float* field, float* ade, float* lor, const float* c_int, const float* c_ext,
-                            const float* c_lor, const unsigned int* pos, ADEParam P)
+// Orders that share their mesh positions (e.g. the four branches of a conducting sheet) in one
+// launch: the field is read (pre) or written (apply) once per active component, the orders are
+// processed in their order with the same operations as lorentz_pre/dispersive_apply. A component
+// whose c_ext is zero in every order keeps a zero ADE state and is skipped (mask).
+#define ADE_GROUP_MAX 8
+struct ADEGroup
+{
+	unsigned int count, orders, lorentz, sn;
+	const unsigned int* pos;
+	const unsigned char* mask;
+	float* ade[ADE_GROUP_MAX];
+	float* lor[ADE_GROUP_MAX];
+	const float* c_int[ADE_GROUP_MAX];
+	const float* c_ext[ADE_GROUP_MAX];
+	const float* c_lor[ADE_GROUP_MAX];
+};
+
+__global__ void lorentz_pre_group(const float* field, ADEGroup G)
 {
 	const unsigned int i = blockIdx.x*blockDim.x + threadIdx.x;
-	if (i>=P.count)
+	if (i>=G.count)
 		return;
+	const unsigned int m = G.mask[i];
 	for (unsigned int n=0; n<3; ++n)
 	{
-		const unsigned int k = n*P.count + i;
-		const float f = field[n*P.sn + pos[i]];
-		if (P.lorentz)
+		if (!((m>>n)&1))
+			continue;
+		const unsigned int k = n*G.count + i;
+		const float f = field[n*G.sn + G.pos[i]];
+		for (unsigned int o=0; o<G.orders; ++o)
 		{
-			lor[k] = lor[k] + c_lor[k]*ade[k];
-			ade[k] = ade[k] * c_int[k];
-			ade[k] = ade[k] + c_ext[k]*(f - lor[k]);
-		}
-		else
-		{
-			ade[k] = ade[k] * c_int[k];
-			ade[k] = ade[k] + c_ext[k]*f;
+			float* ade = G.ade[o];
+			if (G.lorentz)
+			{
+				float* lor = G.lor[o];
+				lor[k] = lor[k] + G.c_lor[o][k]*ade[k];
+				ade[k] = ade[k] * G.c_int[o][k];
+				ade[k] = ade[k] + G.c_ext[o][k]*(f - lor[k]);
+			}
+			else
+			{
+				ade[k] = ade[k] * G.c_int[o][k];
+				ade[k] = ade[k] + G.c_ext[o][k]*f;
+			}
 		}
 	}
 }
 
-// subtract the ADE current from the field
-__global__ void dispersive_apply(float* field, const float* ade, const unsigned int* pos, ADEParam P)
+__global__ void dispersive_apply_group(float* field, ADEGroup G)
 {
 	const unsigned int i = blockIdx.x*blockDim.x + threadIdx.x;
-	if (i>=P.count)
+	if (i>=G.count)
 		return;
+	const unsigned int m = G.mask[i];
 	for (unsigned int n=0; n<3; ++n)
 	{
-		const unsigned int g = n*P.sn + pos[i];
-		field[g] = field[g] - ade[n*P.count + i];
+		if (!((m>>n)&1))
+			continue;
+		const unsigned int g = n*G.sn + G.pos[i];
+		float v = field[g];
+		for (unsigned int o=0; o<G.orders; ++o)
+			v = v - G.ade[o][n*G.count + i];
+		field[g] = v;
 	}
 }
 
@@ -69,52 +95,58 @@ class CUDA_Ext_LorentzMaterial : public GPU_Extension
 public:
 	CUDA_Ext_LorentzMaterial(GPU_Backend_CUDA::Impl* impl, Operator_Ext_LorentzMaterial* op_ext);
 
-	virtual void DoPreVoltageUpdates() {for (size_t o=0; o<m_Volt.size(); ++o) Pre(m_Volt[o], d->volt);}
-	virtual void Apply2Voltages()      {for (size_t o=0; o<m_Volt.size(); ++o) Apply(m_Volt[o], d->volt);}
-	virtual void DoPreCurrentUpdates() {for (size_t o=0; o<m_Curr.size(); ++o) Pre(m_Curr[o], d->curr);}
-	virtual void Apply2Current()       {for (size_t o=0; o<m_Curr.size(); ++o) Apply(m_Curr[o], d->curr);}
+	virtual void DoPreVoltageUpdates() {for (size_t g=0; g<m_VoltGroups.size(); ++g) Pre(m_VoltGroups[g], d->volt);}
+	virtual void Apply2Voltages()      {for (size_t g=0; g<m_VoltGroups.size(); ++g) Apply(m_VoltGroups[g], d->volt);}
+	virtual void DoPreCurrentUpdates() {for (size_t g=0; g<m_CurrGroups.size(); ++g) Pre(m_CurrGroups[g], d->curr);}
+	virtual void Apply2Current()       {for (size_t g=0; g<m_CurrGroups.size(); ++g) Apply(m_CurrGroups[g], d->curr);}
 
 protected:
-	//! one dispersion order of the voltages or currents
-	struct Order
+	//! the host description of an order, grouped with the orders at the same positions in Build()
+	struct HostOrder
 	{
-		ADEParam param;
-		unsigned int* pos;          //!< flat NIJK index of direction 0
-		float *ade, *lor;           //!< state
-		float *c_int, *c_ext, *c_lor;
+		unsigned int count;
+		bool lorentz;
+		std::vector<unsigned int> flat;
+		FDTD_FLOAT **c_int, **c_ext, **c_lor;
 	};
-
-	void Setup(std::vector<Order>& orders, unsigned int count, unsigned int** pos, bool voltage,
-	           bool lorentz, FDTD_FLOAT** c_int, FDTD_FLOAT** c_ext, FDTD_FLOAT** c_lor);
+	void Build(std::vector<ADEGroup>& groups, const std::vector<HostOrder>& orders, bool voltage);
 	float* Coefficients(unsigned int count, FDTD_FLOAT** c);
-	void Pre(Order& o, float* field)
+	void Pre(ADEGroup& g, float* field)
 	{
-		CUDA_Launch(d, "lorentz_pre", lorentz_pre, o.param.count, 1, 1, (const float*)field, o.ade, o.lor,
-		            (const float*)o.c_int, (const float*)o.c_ext, (const float*)o.c_lor, (const unsigned int*)o.pos, o.param);
+		CUDA_Launch(d, "lorentz_pre_group", lorentz_pre_group, g.count, 1, 1, (const float*)field, g);
 	}
-	void Apply(Order& o, float* field)
+	void Apply(ADEGroup& g, float* field)
 	{
-		CUDA_Launch(d, "dispersive_apply", dispersive_apply, o.param.count, 1, 1, field, (const float*)o.ade, (const unsigned int*)o.pos, o.param);
+		CUDA_Launch(d, "dispersive_apply_group", dispersive_apply_group, g.count, 1, 1, field, g);
 	}
 
 	GPU_Backend_CUDA::Impl* d;
-	std::vector<Order> m_Volt;
-	std::vector<Order> m_Curr;
+	std::vector<ADEGroup> m_VoltGroups;
+	std::vector<ADEGroup> m_CurrGroups;
 };
 
 CUDA_Ext_LorentzMaterial::CUDA_Ext_LorentzMaterial(GPU_Backend_CUDA::Impl* impl, Operator_Ext_LorentzMaterial* op_ext)
 {
 	d = impl;
+	std::vector<HostOrder> volt, curr;
 	for (int o=0; o<op_ext->m_Order; ++o)
 	{
 		const unsigned int count = op_ext->m_LM_Count.at(o);
+		if (count==0)
+			continue;
+		std::vector<unsigned int> flat(count);
+		unsigned int** pos = op_ext->m_LM_pos[o];
+		for (unsigned int i=0; i<count; ++i)
+			flat[i] = (pos[0][i]*d->dim.ny + pos[1][i])*d->dim.nz + pos[2][i];
 		if (op_ext->m_volt_ADE_On[o])
-			Setup(m_Volt, count, op_ext->m_LM_pos[o], true, op_ext->m_volt_Lor_ADE_On[o],
-			      op_ext->v_int_ADE[o], op_ext->v_ext_ADE[o], op_ext->m_volt_Lor_ADE_On[o] ? op_ext->v_Lor_ADE[o] : NULL);
+			volt.push_back({count, op_ext->m_volt_Lor_ADE_On[o], flat, op_ext->v_int_ADE[o], op_ext->v_ext_ADE[o],
+			                op_ext->m_volt_Lor_ADE_On[o] ? op_ext->v_Lor_ADE[o] : NULL});
 		if (op_ext->m_curr_ADE_On[o])
-			Setup(m_Curr, count, op_ext->m_LM_pos[o], false, op_ext->m_curr_Lor_ADE_On[o],
-			      op_ext->i_int_ADE[o], op_ext->i_ext_ADE[o], op_ext->m_curr_Lor_ADE_On[o] ? op_ext->i_Lor_ADE[o] : NULL);
+			curr.push_back({count, op_ext->m_curr_Lor_ADE_On[o], flat, op_ext->i_int_ADE[o], op_ext->i_ext_ADE[o],
+			                op_ext->m_curr_Lor_ADE_On[o] ? op_ext->i_Lor_ADE[o] : NULL});
 	}
+	Build(m_VoltGroups, volt, true);
+	Build(m_CurrGroups, curr, false);
 }
 
 float* CUDA_Ext_LorentzMaterial::Coefficients(unsigned int count, FDTD_FLOAT** c)
@@ -127,32 +159,51 @@ float* CUDA_Ext_LorentzMaterial::Coefficients(unsigned int count, FDTD_FLOAT** c
 	return d->Alloc<float>(data.size(), data.data());
 }
 
-void CUDA_Ext_LorentzMaterial::Setup(std::vector<Order>& orders, unsigned int count, unsigned int** pos, bool voltage,
-                                     bool lorentz, FDTD_FLOAT** c_int, FDTD_FLOAT** c_ext, FDTD_FLOAT** c_lor)
+void CUDA_Ext_LorentzMaterial::Build(std::vector<ADEGroup>& groups, const std::vector<HostOrder>& orders, bool voltage)
 {
-	if (count==0)
-		return;
-	Order ord;
-	ord.param.count = count;
-	ord.param.lorentz = lorentz;
-	ord.param.sn = d->numCells;
-
-	std::vector<unsigned int> flat(count);
-	for (unsigned int i=0; i<count; ++i)
-		flat[i] = (pos[0][i]*d->dim.ny + pos[1][i])*d->dim.nz + pos[2][i];
-	d->volt_modified_from.push_back(std::make_pair(d->volt_modified.size(), "lorentz/conducting-sheet ADE"));
-	if (voltage)
-		for (unsigned int n=0; n<3; ++n)
-			for (unsigned int i=0; i<count; ++i)
-				d->volt_modified.push_back(n*d->numCells + flat[i]);
-	ord.pos = d->Alloc<unsigned int>(count, flat.data());
-
-	ord.ade = d->Alloc<float>(3*(size_t)count);
-	ord.lor = d->Alloc<float>(3*(size_t)count);
-	ord.c_int = Coefficients(count, c_int);
-	ord.c_ext = Coefficients(count, c_ext);
-	ord.c_lor = Coefficients(count, c_lor);
-	orders.push_back(ord);
+	for (size_t first=0; first<orders.size(); )
+	{
+		// consecutive orders at identical positions with the same kind share a launch
+		size_t last = first+1;
+		while ((last<orders.size()) && (last-first<ADE_GROUP_MAX) && (orders[last].flat==orders[first].flat)
+		       && (orders[last].lorentz==orders[first].lorentz))
+			++last;
+		const unsigned int count = orders[first].count;
+		ADEGroup g;
+		g.count = count;
+		g.orders = last-first;
+		g.lorentz = orders[first].lorentz;
+		g.sn = d->numCells;
+		std::vector<unsigned char> mask(count, 0);
+		for (size_t o=first; o<last; ++o)
+			for (int n=0; n<3; ++n)
+				for (unsigned int i=0; i<count; ++i)
+					if (orders[o].c_ext[n][i]!=0)
+						mask[i] |= (unsigned char)(1<<n);
+		for (size_t o=first; o<last; ++o)
+		{
+			const size_t k = o-first;
+			g.ade[k] = d->Alloc<float>(3*(size_t)count);
+			g.lor[k] = d->Alloc<float>(3*(size_t)count);
+			g.c_int[k] = Coefficients(count, orders[o].c_int);
+			g.c_ext[k] = Coefficients(count, orders[o].c_ext);
+			g.c_lor[k] = Coefficients(count, orders[o].c_lor);
+		}
+		// fused step: the currents next to the voltages this group changes are recomputed
+		// (only the components it changes: an inactive component keeps its field)
+		if (voltage)
+		{
+			d->volt_modified_from.push_back(std::make_pair(d->volt_modified.size(), "lorentz/conducting-sheet ADE"));
+			for (unsigned int n=0; n<3; ++n)
+				for (unsigned int i=0; i<count; ++i)
+					if ((mask[i]>>n)&1)
+						d->volt_modified.push_back(n*d->numCells + orders[first].flat[i]);
+		}
+		g.pos = d->Alloc<unsigned int>(count, orders[first].flat.data());
+		g.mask = d->Alloc<unsigned char>(count, mask.data());
+		groups.push_back(g);
+		first = last;
+	}
 }
 
 GPU_Extension* CUDA_CreateExt_LorentzMaterial(GPU_Backend_CUDA::Impl* d, Engine_Extension* eng_ext, Engine* eng)
