@@ -306,6 +306,13 @@ protected:
 	  */
 	virtual double GetRawDiscDelta(int ny, const int pos) const;
 
+	//! The value of material property \a MatType of \a prop (background if prop is not a material)
+	double MaterialValue(CSProperties* prop, int ny, const double* coords, int MatType) const;
+
+	//! Two properties of the material at one coordinate, from a single priority lookup
+	void GetMaterialPair(int ny, const double* coords, int typeA, int typeB,
+		const std::vector<CSPrimitives*>& vPrims, double& a, double& b) const;
+
 	//! Get the material at a given coordinate, direction and type from CSX (internal use only)
 	virtual double GetMaterial(
 		int ny,

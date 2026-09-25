@@ -1364,16 +1364,8 @@ CSProperties* Operator::PropertyByPriority(const double* coord, const std::vecto
 	return NULL;
 }
 
-double Operator::GetMaterial(
-	int ny,
-	const double* coords,
-	int MatType,
-	const std::vector<CSPrimitives*>& vPrims,
-	bool markAsUsed
-) const
+double Operator::MaterialValue(CSProperties* prop, int ny, const double* coords, int MatType) const
 {
-	CSProperties* prop = PropertyByPriority(coords,vPrims,markAsUsed);
-
 	CSPropMaterial* mat = dynamic_cast<CSPropMaterial*>(prop);
 	if (mat)
 	{
@@ -1413,6 +1405,26 @@ double Operator::GetMaterial(
 	}
 }
 
+double Operator::GetMaterial(
+	int ny,
+	const double* coords,
+	int MatType,
+	const std::vector<CSPrimitives*>& vPrims,
+	bool markAsUsed
+) const
+{
+	return MaterialValue(PropertyByPriority(coords,vPrims,markAsUsed), ny, coords, MatType);
+}
+
+void Operator::GetMaterialPair(int ny, const double* coords, int typeA, int typeB,
+	const std::vector<CSPrimitives*>& vPrims, double& a, double& b) const
+{
+	// one priority lookup for two properties of the same material point
+	CSProperties* prop = PropertyByPriority(coords,vPrims,true);
+	a = MaterialValue(prop, ny, coords, typeA);
+	b = MaterialValue(prop, ny, coords, typeB);
+}
+
 bool Operator::AverageMatCellCenter(
 	int ny,
 	const unsigned int* pos,
@@ -1420,6 +1432,7 @@ bool Operator::AverageMatCellCenter(
 	const std::vector<CSPrimitives*>& vPrims
 ) const
 {
+	double matA, matB;
 	int n=ny;
 	double coord[3];
 	int nP = (n+1)%3;
@@ -1438,8 +1451,9 @@ bool Operator::AverageMatCellCenter(
 	if (GetCellCenterMaterialAvgCoord(loc_pos,coord))
 	{
 		A_n = GetNodeArea(ny,loc_pos,true);
-		EffMat[0] += GetMaterial(n, coord, 0, vPrims)*A_n;
-		EffMat[1] += GetMaterial(n, coord, 1, vPrims)*A_n;
+		GetMaterialPair(n, coord, 0, 1, vPrims, matA, matB);
+		EffMat[0] += matA*A_n;
+		EffMat[1] += matB*A_n;
 		area+=A_n;
 	}
 
@@ -1448,8 +1462,9 @@ bool Operator::AverageMatCellCenter(
 	if (GetCellCenterMaterialAvgCoord(loc_pos,coord))
 	{
 		A_n = GetNodeArea(ny,loc_pos,true);
-		EffMat[0] += GetMaterial(n, coord, 0, vPrims)*A_n;
-		EffMat[1] += GetMaterial(n, coord, 1, vPrims)*A_n;
+		GetMaterialPair(n, coord, 0, 1, vPrims, matA, matB);
+		EffMat[0] += matA*A_n;
+		EffMat[1] += matB*A_n;
 		area+=A_n;
 	}
 
@@ -1459,8 +1474,9 @@ bool Operator::AverageMatCellCenter(
 	if (GetCellCenterMaterialAvgCoord(loc_pos,coord))
 	{
 		A_n = GetNodeArea(ny,loc_pos,true);
-		EffMat[0] += GetMaterial(n, coord, 0, vPrims)*A_n;
-		EffMat[1] += GetMaterial(n, coord, 1, vPrims)*A_n;
+		GetMaterialPair(n, coord, 0, 1, vPrims, matA, matB);
+		EffMat[0] += matA*A_n;
+		EffMat[1] += matB*A_n;
 		area+=A_n;
 	}
 
@@ -1469,8 +1485,9 @@ bool Operator::AverageMatCellCenter(
 	if (GetCellCenterMaterialAvgCoord(loc_pos,coord))
 	{
 		A_n = GetNodeArea(ny,loc_pos,true);
-		EffMat[0] += GetMaterial(n, coord, 0, vPrims)*A_n;
-		EffMat[1] += GetMaterial(n, coord, 1, vPrims)*A_n;
+		GetMaterialPair(n, coord, 0, 1, vPrims, matA, matB);
+		EffMat[0] += matA*A_n;
+		EffMat[1] += matB*A_n;
 		area+=A_n;
 	}
 
@@ -1488,8 +1505,9 @@ bool Operator::AverageMatCellCenter(
 	if (GetCellCenterMaterialAvgCoord(loc_pos,coord))
 	{
 		delta_ny = GetNodeWidth(n,loc_pos,true);
-		EffMat[2] += delta_ny / GetMaterial(n, coord, 2, vPrims);
-		sigma = GetMaterial(n, coord, 3, vPrims);
+		GetMaterialPair(n, coord, 2, 3, vPrims, matA, matB);
+		EffMat[2] += delta_ny / matA;
+		sigma = matB;
 		if (sigma)
 			EffMat[3] += delta_ny / sigma;
 		else
@@ -1502,8 +1520,9 @@ bool Operator::AverageMatCellCenter(
 	if (GetCellCenterMaterialAvgCoord(loc_pos,coord))
 	{
 		delta_ny = GetNodeWidth(n,loc_pos,true);
-		EffMat[2] += delta_ny / GetMaterial(n, coord, 2, vPrims);
-		sigma = GetMaterial(n, coord, 3, vPrims);
+		GetMaterialPair(n, coord, 2, 3, vPrims, matA, matB);
+		EffMat[2] += delta_ny / matA;
+		sigma = matB;
 		if (sigma)
 			EffMat[3] += delta_ny / sigma;
 		else
@@ -1531,6 +1550,7 @@ bool Operator::AverageMatQuarterCell(
 	const std::vector<CSPrimitives*>& vPrims
 ) const
 {
+	double matA, matB;
 	int n=ny;
 	double coord[3];
 	double shiftCoord[3];
@@ -1556,8 +1576,9 @@ bool Operator::AverageMatQuarterCell(
 	shiftCoord[nP] = coord[nP]+deltaP*0.25;
 	shiftCoord[nPP] = coord[nPP]+deltaPP*0.25;
 	A_n = GetNodeArea(ny,loc_pos,true);
-	EffMat[0] = GetMaterial(n, shiftCoord, 0, vPrims)*A_n;
-	EffMat[1] = GetMaterial(n, shiftCoord, 1, vPrims)*A_n;
+	GetMaterialPair(n, shiftCoord, 0, 1, vPrims, matA, matB);
+	EffMat[0] = matA*A_n;
+	EffMat[1] = matB*A_n;
 	area+=A_n;
 
 	//shift up-left
@@ -1567,8 +1588,9 @@ bool Operator::AverageMatQuarterCell(
 
 	--loc_pos[nP];
 	A_n = GetNodeArea(ny,loc_pos,true);
-	EffMat[0] += GetMaterial(n, shiftCoord, 0, vPrims)*A_n;
-	EffMat[1] += GetMaterial(n, shiftCoord, 1, vPrims)*A_n;
+	GetMaterialPair(n, shiftCoord, 0, 1, vPrims, matA, matB);
+	EffMat[0] += matA*A_n;
+	EffMat[1] += matB*A_n;
 	area+=A_n;
 
 	//shift down-right
@@ -1578,8 +1600,9 @@ bool Operator::AverageMatQuarterCell(
 	++loc_pos[nP];
 	--loc_pos[nPP];
 	A_n = GetNodeArea(ny,loc_pos,true);
-	EffMat[0] += GetMaterial(n, shiftCoord, 0, vPrims)*A_n;
-	EffMat[1] += GetMaterial(n, shiftCoord, 1, vPrims)*A_n;
+	GetMaterialPair(n, shiftCoord, 0, 1, vPrims, matA, matB);
+	EffMat[0] += matA*A_n;
+	EffMat[1] += matB*A_n;
 	area+=A_n;
 
 	//shift down-left
@@ -1588,8 +1611,9 @@ bool Operator::AverageMatQuarterCell(
 	shiftCoord[nPP] = coord[nPP]-deltaPP_M*0.25;
 	--loc_pos[nP];
 	A_n = GetNodeArea(ny,loc_pos,true);
-	EffMat[0] += GetMaterial(n, shiftCoord, 0, vPrims)*A_n;
-	EffMat[1] += GetMaterial(n, shiftCoord, 1, vPrims)*A_n;
+	GetMaterialPair(n, shiftCoord, 0, 1, vPrims, matA, matB);
+	EffMat[0] += matA*A_n;
+	EffMat[1] += matB*A_n;
 	area+=A_n;
 
 	EffMat[0]*=EPS0/area;
@@ -1607,8 +1631,9 @@ bool Operator::AverageMatQuarterCell(
 	shiftCoord[nPP] = coord[nPP]+deltaPP*0.5;
 	--loc_pos[n];
 	double delta_ny = GetNodeWidth(n,loc_pos,true);
-	EffMat[2] = delta_ny / GetMaterial(n, shiftCoord, 2, vPrims);
-	double sigma = GetMaterial(n, shiftCoord, 3, vPrims);
+	GetMaterialPair(n, shiftCoord, 2, 3, vPrims, matA, matB);
+	EffMat[2] = delta_ny / matA;
+	double sigma = matB;
 	if (sigma)
 		EffMat[3] = delta_ny / sigma;
 	else
@@ -1621,8 +1646,9 @@ bool Operator::AverageMatQuarterCell(
 	shiftCoord[nPP] = coord[nPP]+deltaPP*0.5;
 	++loc_pos[n];
 	delta_ny = GetNodeWidth(n,loc_pos,true);
-	EffMat[2] += delta_ny / GetMaterial(n, shiftCoord, 2, vPrims);
-	sigma = GetMaterial(n, shiftCoord, 3, vPrims);
+	GetMaterialPair(n, shiftCoord, 2, 3, vPrims, matA, matB);
+	EffMat[2] += delta_ny / matA;
+	sigma = matB;
 	if (sigma)
 		EffMat[3] += delta_ny / sigma;
 	else
