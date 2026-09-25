@@ -87,6 +87,73 @@ layout forced (full arrays, 16 bit and 32 bit indices). All physics tests in
   - `Calc_EC` scales poorly beyond ~10 threads on this machine: 1.7 s with 10
     threads, 4.9 s with 80.
 
+## Antenna models (2026-09 speedups campaign)
+
+A second round driven by two antenna models from antenna-foundry (TFP-1 and
+Pagoda-3: 19 to 44 million cells, UPML, conducting sheets with a 4-order ADE,
+coax ports), on an RTX 4060 (8 GB, sm_89) and a Colab A100 (40 GB, sm_80).
+The campaign record (plan, per-experiment ledger, report) is in antenna-foundry
+`docs/autoresearch/speedups-2026-09/`. Stepping time per case, fork before the
+campaign (e337998) and after (this branch), same inputs:
+
+| Case | RTX 4060 before | after | A100 before | after |
+|---|---:|---:|---:|---:|
+| Pagoda fast (19 M cells) | 157 s | 109 s | 36.2 s | 33.4 s |
+| TFP-1 fast (44 M cells) | 683 s | 364 s | 150 s | 117 s |
+
+(The "after" runs also use a wider excitation pulse chosen in antenna-foundry,
+which cuts the TFP-1 step count by 5.8%.)
+
+Setup and correctness:
+
+- The conducting-sheet scan read sheet shapes that another thread was
+  rewriting (`CSPrimBox::GetBoundBox`), so parallel setups occasionally built a
+  different operator. Shapes are now captured before the threads start.
+- `OPENEMS_OPERATOR_CHECKSUM=1` covers the excitation, Mur, TF/SF and lumped
+  RLC extensions as well as the main operator.
+- Material lookups: candidate primitive lists by const reference, one priority
+  lookup per sample point for paired properties, and an exact polygon inside
+  test from a y-indexed edge list (`OPENEMS_POLYGON_INDEX=0` disables it,
+  `OPENEMS_POLYGON_INDEX_VERIFY=1` checks it against the old test).
+- Excitation rows without candidates are skipped; coefficient sets are found
+  in parallel.
+- The PEC dump (`DumpPEC2File`) includes conducting-sheet edges (a `sheet` cell
+  array), is collected per plane in parallel, written uncompressed, and appears
+  atomically (written to a temporary name, then renamed).
+- `ConductingSheetMaxFreq` sets the sheet model's fit band independently of the
+  excitation.
+
+Runs:
+
+- The engine is released after `RunFDTD`; `OPENEMS_DEVICE_LOCK=PATH` serializes
+  the device between processes (flock) while another process builds its
+  operator.
+- `RunReuse` accepts a changed soft excitation amplitude (another driven port):
+  the amplitudes are not part of the operator identity and the excitation is
+  rebuilt.
+
+CUDA:
+
+- `OPENEMS_CUDA_FUSION_REPORT=1` explains why UPML regions stay out of the
+  fused kernel. The current fix-up pass keeps the regions in the kernel when its
+  nodes lie in them (double-buffered current flux).
+- Dispersive (ADE) orders at shared positions run in one launch; inactive
+  components are skipped.
+- The fused step falls back to separate E and H updates when it would not fit in
+  device memory with a reserve (`OPENEMS_CUDA_MEMORY_RESERVE_MB`, default 512).
+- The fused kernel with UPML regions is specialized on the coefficient mode.
+- One conducting-sheet voltage ADE group can be corrected inside the fused
+  kernel instead of a separate launch plus a current fix-up. Both give identical
+  fields. It is a template parameter: an untaken runtime check alone made the
+  A100 18% slower. In the kernel, TFP-1 fast steps 5% faster on the RTX 4060 and
+  17% slower on the A100, so it is on by default only for compute capability 8.9
+  (`OPENEMS_CUDA_FUSED_ADE=1/0` forces it).
+
+Measured and not pursued: CUDA graphs and batched probe gathers (host gaps are
+at most 3%), other fused tile widths (within 1%), a CUDA NF2FF (the separable
+CPU far field takes 3 to 5 s), temporal blocking (the steps between half-steps
+carry the excitation, sheet ADE and fix-ups).
+
 ## Known limits (not performance, but related)
 
 - Float precision only.
