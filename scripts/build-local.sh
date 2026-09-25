@@ -63,4 +63,5 @@ assert Path(openEMS.__file__).resolve().is_relative_to(repo), openEMS.__file__
 assert len(libs) == 1 and libs.pop().resolve().is_relative_to(repo / 'build/install/lib'), libs
 print(f'openEMS from {repo}')
 EOF
-strings "$PREFIX/lib/libopenEMS.so.0" | grep -m1 -E '^v[0-9]+\.[0-9]+\.[0-9]+'
+# grep -m1 closes the pipe early; with pipefail that would fail the script.
+strings "$PREFIX/lib/libopenEMS.so.0" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true
