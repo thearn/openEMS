@@ -94,6 +94,10 @@ public:
 			d->fregions.volt[m_Side].flux = m_VoltFlux;
 			d->fregions.volt[m_Side].flux_out = m_VoltFlux2;
 			std::swap(m_VoltFlux, m_VoltFlux2);
+			// the current flux too: the fix-up after the voltage extensions reads the old one
+			d->fregions.curr[m_Side].flux = m_CurrFlux;
+			d->fregions.curr[m_Side].flux_out = m_CurrFlux2;
+			std::swap(m_CurrFlux, m_CurrFlux2);
 		}
 		else if (d->fused_step>0)
 			FuseVolt(d->volt_next);
@@ -164,6 +168,7 @@ protected:
 	bool m_InMain;   //!< fused: updated by the main kernels (see CUDA_ZSlabs)
 	int m_Side;      //!< fused step with the regions in the kernel: the side of the region (see CUDA_FusedRegions)
 	float* m_VoltFlux2;   //!< ... and the second buffer of the voltage flux, written by the block that owns the node
+	float* m_CurrFlux2;   //!< ... and of the current flux
 
 	float *m_VoltFlux, *m_CurrFlux;
 	float *m_VV, *m_VVFO, *m_VVFN;
@@ -182,6 +187,7 @@ CUDA_Ext_UPML::CUDA_Ext_UPML(GPU_Backend_CUDA::Impl* impl, Operator_Ext_UPML* op
 	m_InMain = false;
 	m_Side = -1;
 	m_VoltFlux2 = NULL;
+	m_CurrFlux2 = NULL;
 	// the UPML extensions of a grid decide together whether they fuse (see CanFuse())
 	d->upml.push_back(this);
 	m_Region.sx = op_ext->m_StartPos[0];
@@ -320,6 +326,8 @@ bool CUDA_Ext_UPML::CanFuse()
 			const size_t n = 3*(size_t)u->m_Region.lx*u->m_Region.ly*u->m_Region.lz;
 			u->m_VoltFlux2 = d->Alloc<float>(n);
 			CUDA_Check(cudaMemcpyAsync(u->m_VoltFlux2, u->m_VoltFlux, n*sizeof(float), cudaMemcpyDeviceToDevice, d->Stream()), "UPML flux");
+			u->m_CurrFlux2 = d->Alloc<float>(n);
+			CUDA_Check(cudaMemcpyAsync(u->m_CurrFlux2, u->m_CurrFlux, n*sizeof(float), cudaMemcpyDeviceToDevice, d->Stream()), "UPML flux");
 		}
 	if (d->DecideFusedStep())
 		return true;
