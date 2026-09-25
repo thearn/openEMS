@@ -653,8 +653,19 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 	// Voltage ADE groups: one group whose nodes are all main nodes (not in a UPML region, not
 	// changed by another extension) is applied in the kernel, which needs no fix-up for it; the
 	// other groups register their changed voltages for the fix-up.
+	// Both schedules give identical fields; which is faster depends on the GPU. Measured with
+	// antenna models: in the kernel TFP-1 fast steps 5% faster on an RTX 4060 (compute capability
+	// 8.9) and 17% slower on an A100 (8.0). Default: in the kernel on 8.9 only;
+	// OPENEMS_CUDA_FUSED_ADE=1 or 0 forces it on or off.
 	{
-		const bool fold_env = !getenv("OPENEMS_CUDA_FUSED_ADE") || atoi(getenv("OPENEMS_CUDA_FUSED_ADE"))!=0;
+		int cc_major = 0, cc_minor = 0;
+		cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, ctx->device);
+		cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, ctx->device);
+		const char* fold_var = getenv("OPENEMS_CUDA_FUSED_ADE");
+		const bool fold_env = fold_var ? atoi(fold_var)!=0 : (cc_major==8 && cc_minor==9);
+		if (!fold_env && !ade_candidates.empty())
+			std::cout << "GPU_Backend_CUDA: ADE correction after the fused kernel (compute capability " << cc_major << "."
+			          << cc_minor << (fold_var ? ", OPENEMS_CUDA_FUSED_ADE" : "") << ")" << std::endl;
 		std::set<unsigned int> others(volt_modified.begin(), volt_modified.end());
 		bool folded_one = false;
 		for (size_t g=0; g<ade_candidates.size(); ++g)
