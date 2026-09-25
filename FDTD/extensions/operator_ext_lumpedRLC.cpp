@@ -526,3 +526,18 @@ bool Operator_Ext_LumpedRLC::IsLElumpedRLC(const CSPropLumpedElement* const p_pr
 	return isParallelRLC || isSeriesRLC;
 }
 
+void Operator_Ext_LumpedRLC::HashState(uint64_t& h) const
+{
+	OperatorHash(h, &RLC_count, sizeof(RLC_count));
+	if (RLC_count==0)
+		return;
+	const FDTD_FLOAT* coeffs[] = {v_RLC_ilv, v_RLC_i2v, v_RLC_vv2, v_RLC_vj1, v_RLC_vj2, v_RLC_vvd, v_RLC_ib0, v_RLC_b1, v_RLC_b2};
+	for (const FDTD_FLOAT* c : coeffs)
+		if (c)
+			OperatorHash(h, c, sizeof(FDTD_FLOAT)*RLC_count);
+	if (v_RLC_dir)
+		OperatorHash(h, v_RLC_dir, sizeof(int)*RLC_count);
+	if (v_RLC_pos)
+		for (int n=0; n<3; ++n)
+			OperatorHash(h, v_RLC_pos[n], sizeof(unsigned int)*RLC_count);
+}

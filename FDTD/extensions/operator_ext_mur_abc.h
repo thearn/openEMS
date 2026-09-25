@@ -56,6 +56,8 @@ public:
 	virtual bool IsCylinderCoordsSave(bool closedAlpha, bool R0_included) const;
 	virtual bool IsGPUSave() const {return true;}
 	virtual bool IsCylindricalMultiGridSave(bool child) const;
+	//! Fold every coefficient this extension built into h, for OPENEMS_OPERATOR_CHECKSUM.
+	virtual void HashState(uint64_t& h) const;
 
 	virtual std::string GetExtensionName() const
 	{
