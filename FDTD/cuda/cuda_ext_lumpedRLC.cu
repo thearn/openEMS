@@ -121,6 +121,7 @@ CUDA_Ext_LumpedRLC::CUDA_Ext_LumpedRLC(GPU_Backend_CUDA::Impl* impl, Operator_Ex
 	}
 	// fused step (see update_fused): Apply2Voltages() changes these voltages after the voltage
 	// update, the currents next to them are recomputed
+	d->volt_modified_from.push_back(std::make_pair(d->volt_modified.size(), "lumped RLC"));
 	d->volt_modified.insert(d->volt_modified.end(), index.begin(), index.end());
 	m_Data.index = d->Alloc<unsigned int>(count, index.data());
 	m_Data.il = d->Alloc<float>(count);

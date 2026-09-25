@@ -121,6 +121,7 @@ struct GPU_Backend_CUDA::Impl
 	int fused_blockers;                      //!< extensions or grids that do not allow it
 	float *volt_next, *curr_next;
 	std::vector<unsigned int> volt_modified; //!< flat indices of the voltages the extensions register as changed between the half-steps (excitation, lumped RLC)
+	std::vector<std::pair<size_t,const char*>> volt_modified_from; //!< (first index, extension) of each registration, for the fusion report
 	std::vector<CUDA_Ext_Mur_ABC*> mur_extensions;
 	CUDA_FusedRegions fregions;              //!< the UPML regions in the kernel (see CUDA_Ext_UPML::CanFuse())
 	CUDA_FixupEntry* fixup;                  //!< main nodes/components recomputed after the voltage extensions

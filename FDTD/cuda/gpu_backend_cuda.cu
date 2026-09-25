@@ -577,6 +577,9 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 	// again. With the UPML regions in the kernel, region nodes cannot (the current flux is
 	// updated in place): then the region kernels update the regions.
 	const bool folded = fregions.count>0;
+	const bool report = getenv("OPENEMS_CUDA_FUSION_REPORT") && atoi(getenv("OPENEMS_CUDA_FUSION_REPORT"));
+	std::vector<std::string> in_region;
+	const char* source = "unknown";
 	std::map<unsigned int, unsigned int> nodes;
 	const bool component_fixups = !getenv("OPENEMS_CUDA_FIXUP_COMPONENTS") || (atoi(getenv("OPENEMS_CUDA_FIXUP_COMPONENTS"))!=0);
 	auto add_node = [&](const unsigned int p[3], int lower_axis, unsigned int mask)
@@ -597,11 +600,19 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 		if (!ok)
 			return;
 		if (folded && (fused_region_of(fregions, c[0], c[1], c[2])>=0))
+		{
+			if (report && (in_region.size()<24))
+				in_region.push_back(std::string(source) + " voltage fixes node (" + std::to_string(c[0]) + "," +
+					std::to_string(c[1]) + "," + std::to_string(c[2]) + ") in UPML region " + std::to_string(fused_region_of(fregions, c[0], c[1], c[2])));
 			fregions.count = 0;
+		}
 		nodes[(c[0]*dim.ny + c[1])*dim.nz + c[2]] |= mask;
 	};
 	for (size_t k=0; k<volt_modified.size(); ++k)
 	{
+		for (size_t m=0; m<volt_modified_from.size(); ++m)
+			if (volt_modified_from[m].first<=k)
+				source = volt_modified_from[m].second;
 		const unsigned int node = volt_modified[k] % numCells;
 		const unsigned int p[3] = {node/(dim.ny*dim.nz), (node/dim.nz)%dim.ny, node%dim.nz};
 		if (!component_fixups)
@@ -618,6 +629,13 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 				add_node(p, -1, mask);
 				add_node(p, 3-current_component-voltage_component, mask);
 			}
+	}
+	if (report)
+	{
+		std::cout << "GPU_Backend_CUDA fusion report: " << (folded ? "UPML regions folded into the main kernel" : "UPML regions not folded")
+		          << "; " << volt_modified.size() << " modified voltages; " << (folded && !fregions.count ? "folding dropped:" : "kept") << std::endl;
+		for (size_t n=0; n<in_region.size(); ++n)
+			std::cout << "  " << in_region[n] << std::endl;
 	}
 	std::vector<CUDA_FixupEntry> list;
 	for (std::map<unsigned int, unsigned int>::const_iterator it=nodes.begin(); it!=nodes.end(); ++it)

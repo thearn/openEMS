@@ -96,6 +96,7 @@ CUDA_Ext_Excitation::CUDA_Ext_Excitation(GPU_Backend_CUDA::Impl* impl, Operator_
 
 	// fused step (see update_fused): the currents next to the excited voltages are recomputed;
 	// excited currents on the last mesh lines (never updated) would differ between its buffers
+	d->volt_modified_from.push_back(std::make_pair(d->volt_modified.size(), "excitation"));
 	for (unsigned int n=0; n<op_ext->Volt_Count; ++n)
 		d->volt_modified.push_back(((op_ext->Volt_dir[n]*d->dim.nx + op_ext->Volt_index[0][n])*d->dim.ny + op_ext->Volt_index[1][n])*d->dim.nz + op_ext->Volt_index[2][n]);
 	for (unsigned int n=0; n<op_ext->Curr_Count; ++n)
