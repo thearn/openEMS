@@ -16,6 +16,7 @@
 */
 
 #include <fstream>
+#include <cstdio>
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -35,6 +36,8 @@
 #include "vtkCellArray.h"
 #include "vtkPoints.h"
 #include "vtkXMLPolyDataWriter.h"
+#include "vtkUnsignedCharArray.h"
+#include "vtkCellData.h"
 #include "CSPrimBox.h"
 #include "CSTransform.h"
 #include "CSPrimCurve.h"
@@ -674,6 +677,15 @@ void Operator::DumpPEC2File(std::string filename , unsigned int *range)
 	vtkPolyData* polydata = vtkPolyData::New();
 	vtkCellArray *poly = vtkCellArray::New();
 	vtkPoints *points = vtkPoints::New();
+	// Edges that extensions model as conductors (conducting sheets) are dumped as
+	// well, flagged 1 in the "sheet" cell array, so the dump shows the conductor
+	// topology of the operator that is actually stepped.
+	std::vector<uint8_t> conductorMask((size_t)numLines[0]*numLines[1]*numLines[2], 0);
+	for (size_t n=0; n<m_Op_exts.size(); ++n)
+		m_Op_exts.at(n)->MarkConductorEdges(conductorMask);
+	vtkUnsignedCharArray* sheetFlag = vtkUnsignedCharArray::New();
+	sheetFlag->SetName("sheet");
+	unsigned int sheetEdges = 0;
 
 	int* pointIdx[2];
 	pointIdx[0] = new int[numLines[0]*numLines[1]];
@@ -703,8 +715,12 @@ void Operator::DumpPEC2File(std::string filename , unsigned int *range)
 				{
 					nP = (n+1)%3;
 					nPP = (n+2)%3;
-					if ((GetVV(n,pos) == 0) && (GetVI(n,pos) == 0) && (pos[nP]>0) && (pos[nPP]>0))
+					const bool pec = (GetVV(n,pos) == 0) && (GetVI(n,pos) == 0);
+					const bool sheet = !pec && ((conductorMask[pos[0] + (size_t)numLines[0]*(pos[1] + (size_t)numLines[1]*pos[2])]>>n)&1);
+					if ((pec || sheet) && (pos[nP]>0) && (pos[nPP]>0))
 					{
+						sheetFlag->InsertNextValue(sheet ? 1 : 0);
+						sheetEdges += sheet;
 						rpos[0]=pos[0];
 						rpos[1]=pos[1];
 						rpos[2]=pos[2];
@@ -746,10 +762,14 @@ void Operator::DumpPEC2File(std::string filename , unsigned int *range)
 	points->Delete();
 	polydata->SetLines(poly);
 	poly->Delete();
+	polydata->GetCellData()->AddArray(sheetFlag);
+	sheetFlag->Delete();
 
 	vtkXMLPolyDataWriter* writer  = vtkXMLPolyDataWriter::New();
 	filename += ".vtp";
-	writer->SetFileName(filename.c_str());
+	// written under a temporary name and renamed, so a reader never sees a partial file
+	const std::string partial = filename + ".partial";
+	writer->SetFileName(partial.c_str());
 
 #if VTK_MAJOR_VERSION>=6
 	writer->SetInputData(polydata);
@@ -760,7 +780,9 @@ void Operator::DumpPEC2File(std::string filename , unsigned int *range)
 
 	writer->Delete();
 	polydata->Delete();
-	cout << " done." << endl;
+	if (std::rename(partial.c_str(), filename.c_str())!=0)
+		cerr << "Operator::DumpPEC2File: cannot rename " << partial << " to " << filename << endl;
+	cout << " done (" << sheetEdges << " conducting-sheet edges)." << endl;
 }
 
 void Operator::DumpMaterial2File(std::string filename)
