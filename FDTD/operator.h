@@ -26,7 +26,10 @@
 #include "tools/arraylib/array_nijk.h"
 
 #include <array>
+#include <vector>
 #include <unordered_map>
+
+class CSTransform;
 
 class Operator_Extension;
 class Operator_Ext_Excitation;
@@ -254,6 +257,26 @@ protected:
 	void CellBoundBox(const int pos[3], double box[6]) const;
 	bool PrimitiveMayTouch(const CSPrimitives* prim, const double box[6]) const;
 	std::unordered_map<const CSPrimitives*, std::array<double,6>> m_PrimBoxes;
+
+	//! Exact replacement of CSPrimPolygon/CSPrimLinPoly::IsInside for untransformed-coordinate
+	//! Cartesian polygons: edges are indexed by the y range they span, so a query visits only
+	//! edges that can change the winding number (see InitPolygonIndex).
+	struct PolygonIndex
+	{
+		struct Edge { double x1, y1, x2, y2; };
+		int nP, nPP;
+		double box[6];
+		const CSTransform* transform;
+		std::vector<double> levels;           //!< sorted distinct vertex y values
+		std::vector<unsigned int> atOffset;   //!< CSR offsets: edges whose y range contains levels[k]
+		std::vector<Edge> atEdges;
+		std::vector<unsigned int> inOffset;   //!< CSR offsets: edges spanning (levels[k-1], levels[k])
+		std::vector<Edge> inEdges;
+		bool IsInside(const double* coord) const;
+	};
+	void InitPolygonIndex();
+	std::unordered_map<const CSPrimitives*, PolygonIndex> m_PolyIndex;
+	bool m_PolyIndexVerify = false;
 
 	//! use New() for creating a new Operator
 	Operator();

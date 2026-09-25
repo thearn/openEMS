@@ -36,6 +36,7 @@
 #include "vtkPoints.h"
 #include "vtkXMLPolyDataWriter.h"
 #include "CSPrimBox.h"
+#include "CSPrimPolygon.h"
 #include "CSTransform.h"
 #include "CSPrimCurve.h"
 
@@ -1044,6 +1045,7 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 {
 	SetupPhaseTimer setup_timer;
 	InitPrimitiveBoxes();
+	InitPolygonIndex();
 	Init_EC();
 	InitDataStorage();
 	setup_timer.Mark("allocate");
@@ -1353,7 +1355,22 @@ CSProperties* Operator::PropertyByPriority(const double* coord, const std::vecto
 {
 	// the candidate list is priority sorted, so the first primitive containing coord wins
 	for (CSPrimitives* prim : prims)
-		if (prim->IsInside(coord))
+	{
+		bool inside;
+		auto indexed = m_PolyIndex.find(prim);
+		if (indexed==m_PolyIndex.end())
+			inside = prim->IsInside(coord);
+		else
+		{
+			inside = indexed->second.IsInside(coord);
+			if (m_PolyIndexVerify && inside!=prim->IsInside(coord))
+			{
+				cerr << "Operator::PropertyByPriority: polygon index disagrees with IsInside of primitive " << prim->GetID()
+					 << " at " << coord[0] << "," << coord[1] << "," << coord[2] << endl;
+				throw std::runtime_error("polygon index mismatch");
+			}
+		}
+		if (inside)
 		{
 			if (found)
 				*found = prim;
@@ -1361,7 +1378,129 @@ CSProperties* Operator::PropertyByPriority(const double* coord, const std::vecto
 				prim->SetPrimitiveUsed(true);
 			return prim->GetProperty();
 		}
+	}
 	return NULL;
+}
+
+bool Operator::PolygonIndex::IsInside(const double* coord) const
+{
+	// CSPrimPolygon::IsInside: inverse transform, bounding box, then the winding number with
+	// early acceptance on axis-parallel edges. Only edges whose y range contains y can
+	// contribute or accept, so the result equals the full loop over all edges.
+	double c[3] = {coord[0], coord[1], coord[2]};
+	if (transform)
+		transform->InvertTransform(c,c);
+	for (int n=0;n<3;++n)
+		if ((box[2*n]>c[n]) || (box[2*n+1]<c[n]))
+			return false;
+	const double x = c[nP];
+	const double y = c[nPP];
+	auto it = std::lower_bound(levels.begin(), levels.end(), y);
+	const Edge* first;
+	const Edge* last;
+	if ((it!=levels.end()) && (*it==y))
+	{
+		size_t k = it-levels.begin();
+		first = atEdges.data()+atOffset[k];
+		last = atEdges.data()+atOffset[k+1];
+	}
+	else
+	{
+		if ((it==levels.begin()) || (it==levels.end()))
+			return false;
+		size_t k = it-levels.begin();
+		first = inEdges.data()+inOffset[k];
+		last = inEdges.data()+inOffset[k+1];
+	}
+	int wn = 0;
+	for (const Edge* e=first; e!=last; ++e)
+	{
+		const double x1=e->x1, y1=e->y1, x2=e->x2, y2=e->y2;
+		if ((x2==x1) && (x1==x) && ( ((y<y1) && (y>y2)) || ((y>y1) && (y<y2)) ))
+			return true;
+		if ((y2==y1) && (y1==y) && ( ((x<x1) && (x>x2)) || ((x>x1) && (x<x2)) ))
+			return true;
+		const bool startover = y1 >= y;
+		const bool endover = y2 >= y;
+		if (startover != endover)
+		{
+			if ((y2 - y)*(x2 - x1) <= (y2 - y1)*(x2 - x))
+			{
+				if (endover) wn ++;
+			}
+			else
+			{
+				if (!endover) wn --;
+			}
+		}
+	}
+	return wn != 0;
+}
+
+void Operator::InitPolygonIndex()
+{
+	m_PolyIndex.clear();
+	const char* verify = getenv("OPENEMS_POLYGON_INDEX_VERIFY");
+	m_PolyIndexVerify = verify && atoi(verify);
+	const char* env = getenv("OPENEMS_POLYGON_INDEX");
+	if ((env && atoi(env)==0) || (m_MeshType!=CARTESIAN) || (CSX==NULL))
+		return;
+	size_t edges = 0;
+	for (CSPrimitives* prim : CSX->GetAllPrimitives(false, CSProperties::ANY))
+	{
+		int type = prim->GetType();
+		if ((type!=CSPrimitives::POLYGON) && (type!=CSPrimitives::LINPOLY))
+			continue;
+		// IsInside converts from the primitive's mesh type; only the Cartesian case is indexed
+		if (prim->GetCoordInputType()!=CARTESIAN)
+			continue;
+		CSPrimPolygon* poly = dynamic_cast<CSPrimPolygon*>(prim);
+		if ((poly==NULL) || (poly->GetQtyCoords()<1))
+			continue;
+		PolygonIndex index;
+		index.nP = (poly->GetNormDir()+1)%3;
+		index.nPP = (poly->GetNormDir()+2)%3;
+		// the box IsInside tests (m_BoundBox) is the one Update() computed with GetBoundBox
+		prim->GetBoundBox(index.box);
+		index.transform = prim->HasTransform() ? prim->GetTransform() : NULL;
+		size_t np = poly->GetQtyCoords();
+		std::vector<PolygonIndex::Edge> all(np);
+		for (size_t i=0;i<np;++i)
+		{
+			size_t prev = (i==0) ? np-1 : i-1;
+			all[i] = {poly->GetCoord(2*prev), poly->GetCoord(2*prev+1), poly->GetCoord(2*i), poly->GetCoord(2*i+1)};
+			index.levels.push_back(all[i].y2);
+		}
+		std::sort(index.levels.begin(), index.levels.end());
+		index.levels.erase(std::unique(index.levels.begin(), index.levels.end()), index.levels.end());
+		const size_t m = index.levels.size();
+		std::vector<std::vector<unsigned int>> at(m), in(m);
+		for (size_t i=0;i<np;++i)
+		{
+			double lo = std::min(all[i].y1, all[i].y2);
+			double hi = std::max(all[i].y1, all[i].y2);
+			size_t a = std::lower_bound(index.levels.begin(), index.levels.end(), lo)-index.levels.begin();
+			size_t b = std::lower_bound(index.levels.begin(), index.levels.end(), hi)-index.levels.begin();
+			for (size_t k=a;k<=b;++k)
+				at[k].push_back(i);
+			for (size_t k=a+1;k<=b;++k)
+				in[k].push_back(i);   // spans (levels[k-1], levels[k])
+		}
+		index.atOffset.assign(1,0);
+		index.inOffset.assign(1,0);
+		for (size_t k=0;k<m;++k)
+		{
+			for (unsigned int i : at[k]) index.atEdges.push_back(all[i]);
+			for (unsigned int i : in[k]) index.inEdges.push_back(all[i]);
+			index.atOffset.push_back(index.atEdges.size());
+			index.inOffset.push_back(index.inEdges.size());
+		}
+		edges += index.atEdges.size()+index.inEdges.size();
+		m_PolyIndex.emplace(prim, std::move(index));
+	}
+	if (!m_PolyIndex.empty())
+		cout << "Operator::InitPolygonIndex: " << m_PolyIndex.size() << " polygons indexed (" << edges << " edge entries)"
+			 << (m_PolyIndexVerify ? ", every query verified against IsInside" : "") << endl;
 }
 
 double Operator::MaterialValue(CSProperties* prop, int ny, const double* coords, int MatType) const
