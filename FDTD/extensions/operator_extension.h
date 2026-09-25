@@ -19,6 +19,7 @@
 #define OPERATOR_EXTENSION_H
 
 #include <string>
+#include <vector>
 
 #include <iostream>
 
@@ -84,6 +85,10 @@ public:
 
 	//! Fold every coefficient this extension built into h, for OPENEMS_OPERATOR_CHECKSUM.
 	virtual void HashState(uint64_t& h) const {UNUSED(h);}
+
+	//! Set bit n of mask[x + Nx*(y + Ny*z)] for every edge this extension models as a
+	//! conductor (e.g. a conducting sheet), so the PEC dump can include it.
+	virtual void MarkConductorEdges(std::vector<uint8_t>& mask) const {UNUSED(mask);}
 	virtual void Reset() {}
 
 protected:
