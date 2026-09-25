@@ -76,6 +76,8 @@ public:
 	void SetTimeStep(double val) {m_TS=val;}
 	void SetTimeStepFactor(double val) {m_TS_fac=val;}
 	void SetMaxTime(double val) {m_maxTime=val;}
+	//! Upper frequency the conducting-sheet model is fitted for (0: the excitation's maximum frequency)
+	void SetConductingSheetMaxFreq(double val) {m_SheetMaxFreq=val;}
 
 	// used by Python binding when running as a shared library
 	void SetLibraryArguments(std::vector<std::string> allOptions);
@@ -155,6 +157,7 @@ protected:
 
 	double endCrit;
 	int m_OverSampling;
+	double m_SheetMaxFreq;
 	bool m_CellConstantMaterial;
 	Operator* FDTD_Op;
 	Engine* FDTD_Eng;

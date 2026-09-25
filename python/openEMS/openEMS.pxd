@@ -41,6 +41,7 @@ cdef extern from "openEMS/openems.h":
         void SetTimeStepMethod(int val)
         void SetTimeStep(double val)
         void SetTimeStepFactor(double val)
+        void SetConductingSheetMaxFreq(double val)
         void SetMaxTime(double val)
 
         void SetLibraryArguments(vector[string] allOptions) except +
