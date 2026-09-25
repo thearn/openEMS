@@ -235,7 +235,9 @@ __device__ __forceinline__ void fused_ade(const CUDA_FusedADE& A, const CUDA_Gri
 // With the UPML regions in the kernel (F.count>0, [B, E) is the whole grid), the region nodes
 // are computed like the main nodes, from the current flux (the new voltage flux goes to a
 // second buffer, written by the node's own block; the current flux in place).
-template<unsigned int MODE, bool HAS_REGIONS>
+// HAS_ADE: a voltage ADE group is corrected in the kernel (A.count>0). A compile-time parameter:
+// the unused check alone made the kernel about 18% slower on an A100 (sm_80).
+template<unsigned int MODE, bool HAS_REGIONS, bool HAS_ADE>
 __global__ void __launch_bounds__(FUSED_TZ*FUSED_TY) update_fused(
 	const float* __restrict__ volt_in, const float* __restrict__ curr_in, float* volt_out, float* __restrict__ curr_out,
 	const void* index, const float* va, const float* vb, const float* ia, const float* ib, unsigned int mode,
@@ -262,7 +264,7 @@ __global__ void __launch_bounds__(FUSED_TZ*FUSED_TY) update_fused(
 			if (r<0)
 			{
 				fused_volt(volt_in, curr_in, index, va, vb, coeff_mode, N, x, y, z, v);
-				if (A.count)
+				if (HAS_ADE)
 					fused_ade(A, N, x, y, z, v);
 			}
 			else
@@ -330,13 +332,13 @@ __global__ void __launch_bounds__(FUSED_TZ*FUSED_TY) update_fused(
 	}
 }
 
-template<unsigned int MODE, bool HAS_REGIONS>
+template<unsigned int MODE, bool HAS_REGIONS, bool HAS_ADE>
 static void launch_update_fused(dim3 grid, dim3 block, cudaStream_t stream,
 	const float* volt_in, const float* curr_in, float* volt_out, float* curr_out,
 	const void* index, const float* va, const float* vb, const float* ia, const float* ib,
 	unsigned int mode, CUDA_GridDim N, CUDA_GridDim B, CUDA_GridDim E, CUDA_FusedRegions F, CUDA_FusedADE A, unsigned int xc)
 {
-	update_fused<MODE, HAS_REGIONS><<<grid, block, 0, stream>>>(
+	update_fused<MODE, HAS_REGIONS, HAS_ADE><<<grid, block, 0, stream>>>(
 		volt_in, curr_in, volt_out, curr_out, index, va, vb, ia, ib, mode, N, B, E, F, A, xc);
 }
 
@@ -651,8 +653,19 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 	// Voltage ADE groups: one group whose nodes are all main nodes (not in a UPML region, not
 	// changed by another extension) is applied in the kernel, which needs no fix-up for it; the
 	// other groups register their changed voltages for the fix-up.
+	// Both schedules give identical fields; which is faster depends on the GPU. Measured with
+	// antenna models: in the kernel TFP-1 fast steps 5% faster on an RTX 4060 (compute capability
+	// 8.9) and 17% slower on an A100 (8.0). Default: in the kernel on 8.9 only;
+	// OPENEMS_CUDA_FUSED_ADE=1 or 0 forces it on or off.
 	{
-		const bool fold_env = !getenv("OPENEMS_CUDA_FUSED_ADE") || atoi(getenv("OPENEMS_CUDA_FUSED_ADE"))!=0;
+		int cc_major = 0, cc_minor = 0;
+		cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, ctx->device);
+		cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, ctx->device);
+		const char* fold_var = getenv("OPENEMS_CUDA_FUSED_ADE");
+		const bool fold_env = fold_var ? atoi(fold_var)!=0 : (cc_major==8 && cc_minor==9);
+		if (!fold_env && !ade_candidates.empty())
+			std::cout << "GPU_Backend_CUDA: ADE correction after the fused kernel (compute capability " << cc_major << "."
+			          << cc_minor << (fold_var ? ", OPENEMS_CUDA_FUSED_ADE" : "") << ")" << std::endl;
 		std::set<unsigned int> others(volt_modified.begin(), volt_modified.end());
 		bool folded_one = false;
 		for (size_t g=0; g<ade_candidates.size(); ++g)
@@ -996,28 +1009,27 @@ void GPU_Backend_CUDA::UpdateVoltages()
 		const float* ia = (const float*)(c ? d->coeff : d->ii);
 		const float* ib = (const float*)(c ? d->coeff : d->iv);
 		const bool specialize = !(getenv("OPENEMS_CUDA_FUSED_SPECIALIZE") && atoi(getenv("OPENEMS_CUDA_FUSED_SPECIALIZE"))==0);
+		const bool ade = d->fade.count>0;
+#define FUSED_ARGS grid, block, d->Stream(), (const float*)d->volt, (const float*)d->curr, d->volt_next, d->curr_next, \
+		(const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, d->fade, xc
+#define FUSED_LAUNCH(M, R) (ade ? launch_update_fused<M, R, true>(FUSED_ARGS) : launch_update_fused<M, R, false>(FUSED_ARGS))
 		if (!specialize)
-			launch_update_fused<3, true>(grid, block, d->Stream(), (const float*)d->volt, (const float*)d->curr,
-				d->volt_next, d->curr_next, (const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, d->fade, xc);
+			FUSED_LAUNCH(3, true);
 		// with the UPML regions in the kernel: specialized on the coefficient mode as well
 		else if (d->fregions.count && (d->coeff_mode==0))
-			launch_update_fused<0, true>(grid, block, d->Stream(), (const float*)d->volt, (const float*)d->curr,
-				d->volt_next, d->curr_next, (const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, d->fade, xc);
+			FUSED_LAUNCH(0, true);
 		else if (d->fregions.count && (d->coeff_mode==1))
-			launch_update_fused<1, true>(grid, block, d->Stream(), (const float*)d->volt, (const float*)d->curr,
-				d->volt_next, d->curr_next, (const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, d->fade, xc);
+			FUSED_LAUNCH(1, true);
 		else if (d->fregions.count)
-			launch_update_fused<2, true>(grid, block, d->Stream(), (const float*)d->volt, (const float*)d->curr,
-				d->volt_next, d->curr_next, (const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, d->fade, xc);
+			FUSED_LAUNCH(2, true);
 		else if (d->coeff_mode==0)
-			launch_update_fused<0, false>(grid, block, d->Stream(), (const float*)d->volt, (const float*)d->curr,
-				d->volt_next, d->curr_next, (const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, d->fade, xc);
+			FUSED_LAUNCH(0, false);
 		else if (d->coeff_mode==1)
-			launch_update_fused<1, false>(grid, block, d->Stream(), (const float*)d->volt, (const float*)d->curr,
-				d->volt_next, d->curr_next, (const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, d->fade, xc);
+			FUSED_LAUNCH(1, false);
 		else
-			launch_update_fused<2, false>(grid, block, d->Stream(), (const float*)d->volt, (const float*)d->curr,
-				d->volt_next, d->curr_next, (const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, d->fade, xc);
+			FUSED_LAUNCH(2, false);
+#undef FUSED_LAUNCH
+#undef FUSED_ARGS
 		d->CheckLaunch("update_fused");
 		if (timed)
 			CUDA_KernelTimes::End(d->Stream(), "update_fused");
