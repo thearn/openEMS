@@ -162,6 +162,13 @@ protected:
 	ProcessingArray* PA;
 	std::string m_OperatorIdentity;
 
+	//! OPENEMS_DEVICE_LOCK=<file>: an exclusive lock on the file is held from engine creation until the
+	//! engine is released after the run, so that concurrent processes build their operators in parallel
+	//! but use the device one at a time
+	int m_DeviceLockFD;
+	void AcquireDeviceLock();
+	void ReleaseDeviceLock();
+
 	Excitation* m_Exc;
 
 	bool m_Abort;
