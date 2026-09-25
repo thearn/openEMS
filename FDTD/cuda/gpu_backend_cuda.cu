@@ -573,6 +573,26 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 	if ((fused_blockers>0) || (env && (atoi(env)==0)))
 		return false;
 
+	// The fused step needs a second set of fields (24 bytes per cell). An allocation that
+	// oversubscribes the device can succeed (e.g. WDDM paging to host memory under WSL) and then
+	// run far slower than the separate E and H updates, so it is refused unless the free device
+	// memory keeps a reserve (OPENEMS_CUDA_MEMORY_RESERVE_MB, default 512) afterwards; unless
+	// OPENEMS_CUDA_FUSED_STEP=1 forces the fused step.
+	{
+		size_t free_bytes = 0, total_bytes = 0;
+		const size_t need = 2*3*(size_t)numCells*sizeof(float);
+		const char* reserve_env = getenv("OPENEMS_CUDA_MEMORY_RESERVE_MB");
+		const size_t reserve = (size_t)(reserve_env ? atof(reserve_env) : 512.0)*1024*1024;
+		const bool forced = env && (atoi(env)==1);
+		if (!forced && (cudaMemGetInfo(&free_bytes, &total_bytes)==cudaSuccess) && (free_bytes < need+reserve))
+		{
+			std::cout << "GPU_Backend_CUDA: separate E and H updates: the fused step needs " << need/1048576
+			          << " MiB and a " << reserve/1048576 << " MiB reserve, " << free_bytes/1048576 << " MiB of "
+			          << total_bytes/1048576 << " MiB are free" << std::endl;
+			return false;
+		}
+	}
+
 	// The currents of the nodes that read a voltage changed between the half-steps are computed
 	// again. With the UPML regions in the kernel, region nodes cannot (the current flux is
 	// updated in place): then the region kernels update the regions.
