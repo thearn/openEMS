@@ -720,6 +720,8 @@ cdef class openEMS:
             return EC
         with nogil:
             self.thisptr.RunFDTD()
+        if self.thisptr.Diverged():
+            raise RuntimeError('openEMS: the simulation diverged (non-finite field energy)')
 
     def RunReuse(self, sim_path, cleanup=False, keep_operator=True, **kw):
         """Rerun using the operator built by the preceding :meth:`Run`
@@ -748,6 +750,8 @@ cdef class openEMS:
             return EC
         with nogil:
             self.thisptr.RunFDTD()
+        if self.thisptr.Diverged():
+            raise RuntimeError('openEMS: the simulation diverged (non-finite field energy)')
 
     def GetOperatorIdentity(self):
         """Return the versioned serialized identity of the reusable operator."""
