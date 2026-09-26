@@ -37,6 +37,8 @@ ProcessFieldsFD::ProcessFieldsFD(Engine_Interface_Base* eng_if) : ProcessFields(
 ProcessFieldsFD::~ProcessFieldsFD()
 {
 	FinishAsync();
+	delete m_CP_File;
+	m_CP_File = NULL;
 	for (size_t n = 0; n<m_FD_Fields.size(); ++n)
 	{
 		delete m_FD_Fields.at(n);
@@ -67,6 +69,19 @@ void ProcessFieldsFD::InitProcess()
 	{
 		m_HDF5_Dump_File->SetCurrentGroup("/FieldData/FD");
 		m_HDF5_Dump_File->WriteAttribute("/FieldData/FD","frequency",m_FD_Samples);
+		const char* every = getenv("OPENEMS_FD_CHECKPOINT_EVERY");
+		const char* start = getenv("OPENEMS_FD_CHECKPOINT_START_S");
+		if (every && atoi(every)>0)
+		{
+			m_CP_Every = atoi(every);
+			m_CP_Start = start ? atof(start) : 0;
+			delete m_CP_File;
+			m_CP_File = new HDF5_File_Writer(m_filename+"_cp.h5");
+			m_CP_File->SetCurrentGroup("/FD_Checkpoints");
+			m_CP_File->WriteAttribute("/FD_Checkpoints","frequency",m_FD_Samples);
+			m_CP_File->WriteAttribute("/FD_Checkpoints","sample_interval_timesteps",(float)m_FD_Interval);
+			m_CP_File->WriteAttribute("/FD_Checkpoints","timestep_s",(float)Op->GetTimestep());
+		}
 	}
 
 	//create data structures...
@@ -111,6 +126,7 @@ int ProcessFieldsFD::Process()
 	if (m_FieldDFT>=0)
 	{
 		m_Eng_Interface->AccumulateFieldDFT(m_FieldDFT, weights);
+		if (m_CP_File) Checkpoint(T);
 		return GetNextInterval();
 	}
 
@@ -138,7 +154,34 @@ int ProcessFieldsFD::Process()
 	if (!CalcField(tmp_field_td))
 		return -1;
 	AddSample(tmp_field_td, weights);
+	if (m_CP_File) Checkpoint(T);
 	return GetNextInterval();
+}
+
+void ProcessFieldsFD::Checkpoint(double T)
+{
+	if (T < m_CP_Start)
+		return;
+	++m_CP_Samples;
+	if (m_CP_Samples % m_CP_Every != 0)
+		return;
+	FinishAsync();
+	if ((m_FieldDFT>=0) && !m_Eng_Interface->ReadFieldDFT(m_FieldDFT, m_FD_Fields))
+	{
+		cerr << "ProcessFieldsFD::Checkpoint: can't read the frequency domain fields of the engine!" << endl;
+		return;
+	}
+	for (size_t n = 0; n<m_FD_Samples.size(); ++n)
+	{
+		stringstream ss;
+		ss << "cp" << m_CP_Count << "_f" << n;
+		if (!m_CP_File->WriteVectorField<std::complex<float>>(ss.str(), *m_FD_Fields.at(n)))
+			cerr << "ProcessFieldsFD::Checkpoint: can't write " << ss.str() << endl;
+		m_CP_File->WriteAttribute("/FD_Checkpoints/"+ss.str(), "time", (double)T);
+		m_CP_File->WriteAttribute("/FD_Checkpoints/"+ss.str(), "timestep", (float)m_Eng_Interface->GetNumberOfTimesteps());
+		m_CP_File->WriteAttribute("/FD_Checkpoints/"+ss.str(), "samples", (float)m_FD_SampleCount);
+	}
+	++m_CP_Count;
 }
 
 void ProcessFieldsFD::AddSample(const ArrayLib::ArrayNIJK<FDTD_FLOAT>& field, const std::vector<std::complex<float>>& weights)
