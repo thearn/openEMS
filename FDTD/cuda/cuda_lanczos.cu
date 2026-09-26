@@ -10,10 +10,13 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <chrono>
+#include <iostream>
+#include <cstdlib>
 
 namespace {
 
-struct Grid { unsigned N0, N1, N2; size_t i0, sx, sy, sz, total; };
+struct Grid { unsigned N0, N1, N2; size_t i0, sx, sy, sz, total; int ax[3]; };
 
 __device__ __forceinline__ size_t gidx(const Grid& g, unsigned x, unsigned y, unsigned z)
 { return g.i0 + x*g.sx + y*g.sy + z*g.sz; }
@@ -38,7 +41,13 @@ __global__ void apply_kernel(Grid g, const float* SC, const float* IL, const flo
 	size_t cell = blockIdx.x*(size_t)blockDim.x + threadIdx.x;
 	size_t cells = (size_t)g.N0*g.N1*g.N2;
 	if (cell>=cells) return;
-	unsigned z = cell % g.N2; unsigned y = (cell/g.N2) % g.N1; unsigned x = cell/((size_t)g.N2*g.N1);
+	// decode with the smallest-stride axis fastest (coalesced loads for any AdrOp layout)
+	unsigned Nn[3] = {g.N0, g.N1, g.N2}, c[3];
+	unsigned rem = (unsigned)cell;
+	c[g.ax[0]] = rem % Nn[g.ax[0]]; rem /= Nn[g.ax[0]];
+	c[g.ax[1]] = rem % Nn[g.ax[1]]; rem /= Nn[g.ax[1]];
+	c[g.ax[2]] = rem;
+	unsigned x = c[0], y = c[1], z = c[2];
 	size_t i = gidx(g,x,y,z);
 	float t0 = tval(g,SC,IL,in,0,x,y,z), t1 = tval(g,SC,IL,in,1,x,y,z), t2 = tval(g,SC,IL,in,2,x,y,z);
 	float d2y = y>0 ? t2 - tval(g,SC,IL,in,2,x,y-1,z) : 0.f;
@@ -63,16 +72,16 @@ __global__ void dot_kernel(const float* a, const float* b, size_t n, double* res
 	if (threadIdx.x==0) atomicAdd(result, buf[0]);
 }
 
-__global__ void lanczos_update(float* w, const float* q, const float* qp, double a, double b, size_t n)
+__global__ void lanczos_update(float* w, const float* q, const float* qp, float a, float b, size_t n)
 {
 	for (size_t i = blockIdx.x*(size_t)blockDim.x + threadIdx.x; i<n; i += (size_t)gridDim.x*blockDim.x)
-		w[i] = (float)(w[i] - a*q[i] - b*qp[i]);
+		w[i] = w[i] - a*q[i] - b*qp[i];
 }
 
-__global__ void scale_copy(float* dst, const float* src, double s, size_t n)
+__global__ void scale_copy(float* dst, const float* src, float s, size_t n)
 {
 	for (size_t i = blockIdx.x*(size_t)blockDim.x + threadIdx.x; i<n; i += (size_t)gridDim.x*blockDim.x)
-		dst[i] = (float)(src[i]*s);
+		dst[i] = src[i]*s;
 }
 
 __global__ void random_fill(float* v, size_t n)
@@ -105,10 +114,19 @@ double tridiag_max(const std::vector<double>& a, const std::vector<double>& b)
 double CUDA_LanczosMaxEig(const float* SC_h, const float* IL_h, unsigned N0, unsigned N1, unsigned N2,
                           size_t i0, size_t sx, size_t sy, size_t sz, int iterations)
 {
-	Grid g{N0,N1,N2,i0,sx,sy,sz,(size_t)N0*N1*N2};
+	Grid g{N0,N1,N2,i0,sx,sy,sz,(size_t)N0*N1*N2,{0,1,2}};
+	{
+		size_t st[3] = {sx,sy,sz};
+		std::sort(g.ax, g.ax+3, [&](int a, int b){return st[a]<st[b];});
+	}
 	const size_t n = 3*g.total;
+	auto T0 = std::chrono::steady_clock::now();
+	auto since = [&]() {return std::chrono::duration<double>(std::chrono::steady_clock::now()-T0).count();};
+	const bool timing = getenv("OPENEMS_SETUP_TIMES") && atoi(getenv("OPENEMS_SETUP_TIMES"));
 	int dev=0;
 	if (cudaGetDeviceCount(&dev)!=cudaSuccess || dev==0) { cudaGetLastError(); return -1; }
+	cudaFree(0);
+	if (timing) std::cout << "OPENEMS_SETUP_TIME lanczos_cuda_context " << since() << " s (strides " << sx << "," << sy << "," << sz << ")" << std::endl;
 	size_t free_b=0, total_b=0;
 	if (cudaMemGetInfo(&free_b,&total_b)!=cudaSuccess) { cudaGetLastError(); return -1; }
 	if (free_b < 5*n*sizeof(float) + (256u<<20)) return -1;
@@ -120,29 +138,38 @@ double CUDA_LanczosMaxEig(const float* SC_h, const float* IL_h, unsigned N0, uns
 	{
 		cudaMemcpy(SC,SC_h,n*4,cudaMemcpyHostToDevice); cudaMemcpy(IL,IL_h,n*4,cudaMemcpyHostToDevice);
 		cudaMemset(qp,0,n*4);
+		cudaDeviceSynchronize();
+		if (timing) std::cout << "OPENEMS_SETUP_TIME lanczos_upload " << since() << " s" << std::endl;
 		const int T=256; const int B=std::min<size_t>((n+T-1)/T, 65535*8);
 		const size_t cells=g.total; const unsigned AB=(unsigned)((cells+T-1)/T);
-		auto dot=[&](const float* a,const float* b){ double r=0; cudaMemset(red,0,sizeof(double)); dot_kernel<<<B,T>>>(a,b,n,red); cudaMemcpy(&r,red,sizeof(double),cudaMemcpyDeviceToHost); return r; };
+		auto dot=[&](const float* a,const float* b){ double r=0; cudaMemset(red,0,sizeof(double)); dot_kernel<<<1024,T>>>(a,b,n,red); cudaMemcpy(&r,red,sizeof(double),cudaMemcpyDeviceToHost); return r; };
 		random_fill<<<B,T>>>(q,n);
 		// the start vector must vanish where SC = 0 (no degree of freedom); scaling by SC handles it in A
 		double nrm = sqrt(dot(q,q));
-		scale_copy<<<B,T>>>(q,q,1.0/nrm,n);
+		scale_copy<<<B,T>>>(q,q,(float)(1.0/nrm),n);
 		std::vector<double> al, be; double bprev=0;
+		cudaEvent_t e0,e1; cudaEventCreate(&e0); cudaEventCreate(&e1); float t_apply=0, t_rest=0;
 		for (int k=0;k<iterations;++k)
 		{
+			cudaEventRecord(e0);
 			apply_kernel<<<AB,T>>>(g,SC,IL,q,w);
+			cudaEventRecord(e1); cudaEventSynchronize(e1); { float ms; cudaEventElapsedTime(&ms,e0,e1); t_apply+=ms; }
+			cudaEventRecord(e0);
 			double a = dot(q,w);
-			lanczos_update<<<B,T>>>(w,q,qp,a,bprev,n);
+			lanczos_update<<<B,T>>>(w,q,qp,(float)a,(float)bprev,n);
 			double b = sqrt(dot(w,w));
 			al.push_back(a);
 			lambda = tridiag_max(al,be);
 			if (!(b>0)) break;
 			be.push_back(b);
 			std::swap(q,qp);
-			scale_copy<<<B,T>>>(q,w,1.0/b,n);
+			scale_copy<<<B,T>>>(q,w,(float)(1.0/b),n);
 			bprev=b;
+			cudaEventRecord(e1); cudaEventSynchronize(e1); { float ms; cudaEventElapsedTime(&ms,e0,e1); t_rest+=ms; }
 		}
+		if (timing) std::cout << "OPENEMS_SETUP_TIME lanczos_apply_ms " << t_apply << " rest_ms " << t_rest << std::endl;
 		if (cudaDeviceSynchronize()!=cudaSuccess) lambda=-1;
+		if (timing) std::cout << "OPENEMS_SETUP_TIME lanczos_iterations " << since() << " s" << std::endl;
 	}
 	cudaFree(SC); cudaFree(IL); cudaFree(q); cudaFree(qp); cudaFree(w); cudaFree(red);
 	cudaGetLastError();

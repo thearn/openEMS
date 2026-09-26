@@ -2614,7 +2614,9 @@ static double TridiagMaxEig(const std::vector<double>& a, const std::vector<doub
 // is never below Rennings_2 (solvers-2026-09 S1.6: bracketed against the full engine).
 double Operator::CalcTimestep_Var4()
 {
+	SetupPhaseTimer var4_timer;
 	CalcTimestep_Var3();
+	var4_timer.Mark("timestep_var3");
 	const double dT_R = dT;
 	m_Used_TS_Name = std::string("Exact_Lanczos");
 	const size_t N0=numLines[0], N1=numLines[1], N2=numLines[2];
@@ -2627,22 +2629,24 @@ double Operator::CalcTimestep_Var4()
 	const size_t total = N0*N1*N2;
 	auto I = [&](size_t x, size_t y, size_t z) {return i0 + x*sx + y*sy + z*sz;};
 	std::vector<float> SC(3*total), IL(3*total);
-	unsigned int nThreads = SetupThreads(N0);
-	ParallelLines(N0, nThreads, [&](unsigned int x, unsigned int)
+	unsigned int nThreads = SetupThreads(N2);
+	ParallelLines(N2, nThreads, [&](unsigned int z, unsigned int)
 	{
 		for (int n=0;n<3;++n)
 			for (size_t y=0; y<N1; ++y)
-				for (size_t z=0; z<N2; ++z)
+				for (size_t x=0; x<N0; ++x)
 				{
 					size_t i=I(x,y,z); double c=EC_C[n][i], l=EC_L[n][i];
 					SC[n*total+i] = c>0 ? (float)sqrt(1.0/c) : 0.f;
 					IL[n*total+i] = l>0 ? (float)(1.0/l) : 0.f;
 				}
 	});
+	var4_timer.Mark("timestep_coefficients");
 #ifdef OPENEMS_WITH_CUDA
 	{
 		const char* cpu = getenv("OPENEMS_LANCZOS_CPU");
 		double lam = (cpu && atoi(cpu)) ? -1 : CUDA_LanczosMaxEig(SC.data(), IL.data(), N0, N1, N2, i0, sx, sy, sz, 40);
+		var4_timer.Mark("timestep_gpu_lanczos");
 		if (lam>0)
 		{
 			const double dT_exact = 2/sqrt(lam);
@@ -2660,10 +2664,10 @@ double Operator::CalcTimestep_Var4()
 	auto apply = [&](const std::vector<float>& in, std::vector<float>& out)
 	{
 		// t = L^-1 Ci^T (sc*in): the negative of the engine's current-update curl
-		ParallelLines(N0-1, nThreads, [&](unsigned int x, unsigned int)
+		ParallelLines(N2-1, nThreads, [&](unsigned int z, unsigned int)
 		{
 			for (size_t y=0; y+1<N1; ++y)
-				for (size_t z=0; z+1<N2; ++z)
+				for (size_t x=0; x+1<N0; ++x)
 				{
 					const size_t i=I(x,y,z), iy=I(x,y+1,z), iz=I(x,y,z+1), ix=I(x+1,y,z);
 					auto u = [&](int n, size_t j) {return sc(n,j)*in[n*total+j];};
@@ -2673,10 +2677,10 @@ double Operator::CalcTimestep_Var4()
 				}
 		});
 		// out = sc * Ci t (engine voltage-update curl)
-		ParallelLines(N0, nThreads, [&](unsigned int x, unsigned int)
+		ParallelLines(N2, nThreads, [&](unsigned int z, unsigned int)
 		{
 			for (size_t y=0; y<N1; ++y)
-				for (size_t z=0; z<N2; ++z)
+				for (size_t x=0; x<N0; ++x)
 				{
 					const size_t i=I(x,y,z);
 					auto bd = [&](int n, int ax) -> float {
@@ -2693,12 +2697,12 @@ double Operator::CalcTimestep_Var4()
 	auto dot = [&](const std::vector<float>& a, const std::vector<float>& b) -> double
 	{
 		std::fill(partial.begin(), partial.end(), 0.0);
-		ParallelLines(N0, nThreads, [&](unsigned int x, unsigned int thread)
+		ParallelLines(N2, nThreads, [&](unsigned int z, unsigned int thread)
 		{
 			double s=0;
 			for (int n=0;n<3;++n)
 				for (size_t y=0; y<N1; ++y)
-					for (size_t z=0; z<N2; ++z)
+					for (size_t x=0; x<N0; ++x)
 					{ size_t i=n*total+I(x,y,z); s += (double)a[i]*b[i]; }
 			partial[thread] += s;
 		});
@@ -2720,10 +2724,10 @@ double Operator::CalcTimestep_Var4()
 	{
 		apply(q, w);
 		double a = dot(q, w);
-		ParallelLines(3*N0, nThreads, [&](unsigned int line, unsigned int)
+		ParallelLines(3*N2, nThreads, [&](unsigned int line, unsigned int)
 		{
-			size_t n=line/N0, x=line%N0;
-			for (size_t y=0; y<N1; ++y) for (size_t z=0; z<N2; ++z)
+			size_t n=line/N2, z=line%N2;
+			for (size_t y=0; y<N1; ++y) for (size_t x=0; x<N0; ++x)
 			{ size_t i=n*total+I(x,y,z); w[i] = (float)(w[i] - a*q[i] - b_prev*qp[i]); }
 		});
 		double b = sqrt(dot(w,w));
@@ -2732,10 +2736,10 @@ double Operator::CalcTimestep_Var4()
 		if (b<=0) break;
 		beta.push_back(b);
 		std::swap(qp, q);
-		ParallelLines(3*N0, nThreads, [&](unsigned int line, unsigned int)
+		ParallelLines(3*N2, nThreads, [&](unsigned int line, unsigned int)
 		{
-			size_t n=line/N0, x=line%N0;
-			for (size_t y=0; y<N1; ++y) for (size_t z=0; z<N2; ++z)
+			size_t n=line/N2, z=line%N2;
+			for (size_t y=0; y<N1; ++y) for (size_t x=0; x<N0; ++x)
 			{ size_t i=n*total+I(x,y,z); q[i] = (float)(w[i]/b); }
 		});
 		b_prev = b;
