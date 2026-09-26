@@ -1,3 +1,4 @@
+#include <unordered_set>
 /*
 *	Copyright (C) 2010 Thorsten Liebig (Thorsten.Liebig@gmx.de)
 *
@@ -173,6 +174,8 @@ public:
 
 	//! Get the coordinates for a given node index and component, according to the yee-algorithm. Returns true if inside the FDTD domain.
 	virtual bool GetYeeCoords(int ny, unsigned int pos[3], double* coords, bool dualMesh) const;
+	//! True if a conformal sheet treatment made this in-plane edge a free (partially covered) edge
+	bool IsConformalFreeEdge(int n, const unsigned int pos[3]) const;
 
 	virtual bool GetNodeCoords(const unsigned int pos[3], double* coords, bool dualMesh=false, CoordinateSystem c_system=UNDEFINED_CS) const;
 
@@ -314,6 +317,10 @@ protected:
 	double CalcTimestep_Var1();
 	double CalcTimestep_Var3();
 	double CalcTimestep_Var4();
+	//! Conformal thin conducting sheets (OPENEMS_CONFORMAL_SHEETS=1)
+	void ApplyConformalSheets();
+	std::unordered_set<size_t> m_ConformalFree;
+	size_t m_ConfStride[4] = {0,0,0,0};
 
 	//! Calculate the FDTD equivalent circuit parameter for the given position and direction ny. \sa Calc_EffMat_Pos
 	virtual bool Calc_ECPos(

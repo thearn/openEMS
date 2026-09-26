@@ -1,3 +1,6 @@
+#include <unordered_set>
+#include <map>
+#include <mutex>
 /*
 *	Copyright (C) 2010 Thorsten Liebig (Thorsten.Liebig@gmx.de)
 *
@@ -23,6 +26,7 @@
 #include <stdexcept>
 #include <cmath>
 #include "operator.h"
+#include "CSPropConductingSheet.h"
 #include "engine.h"
 #include "extensions/operator_extension.h"
 #include "extensions/operator_ext_excitation.h"
@@ -1091,6 +1095,8 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 	if (Calc_EC()==0)
 		return -1;
 	setup_timer.Mark("geometry");
+	ApplyConformalSheets();
+	setup_timer.Mark("conformal_sheets");
 
 	m_InvaildTimestep = false;
 	opt_dT = 0;
@@ -2425,6 +2431,147 @@ double Operator::CalcTimestep_Var3()
 		cout << "Operator::CalcTimestep_Var3: Smallest timestep (" << dT << "s) found at position: " <<  smallest_n << " : " << smallest_pos[0] << ";" <<  smallest_pos[1] << ";" <<  smallest_pos[2] << endl;
 	}
 	return 0;
+}
+
+// Conformal thin conducting sheets (Dey-Mittra for zero-thickness conductors; solvers-2026-09).
+// In each sheet plane, an in-plane edge partially covered by the sheet carries the field of its
+// free part: its voltage is E*l_free, so C and G scale by l/l_free, and the sheet model is not
+// applied to it. A face of the plane partially covered carries the normal H over its free area:
+// L and R scale by A_free/A. Faces with a free fraction below OPENEMS_CONFORMAL_AMIN (default 0.3)
+// keep their L, which bounds the local frequency rise. Enabled by OPENEMS_CONFORMAL_SHEETS=1.
+void Operator::ApplyConformalSheets()
+{
+	const char* env = getenv("OPENEMS_CONFORMAL_SHEETS");
+	if (!env || atoi(env)==0)
+		return;
+	const char* envA = getenv("OPENEMS_CONFORMAL_AMIN");
+	const double amin = envA ? atof(envA) : 0.3;
+	const char* envU = getenv("OPENEMS_CONFORMAL_UMIN");
+	const double umin = envU ? atof(envU) : 0.05;
+	m_ConformalFree.clear();
+	MainOp->ResetShift();
+	{
+		const size_t i0 = MainOp->SetPos(0,0,0);
+		m_ConfStride[0] = i0; m_ConfStride[1] = MainOp->SetPos(1,0,0)-i0;
+		m_ConfStride[2] = MainOp->SetPos(0,1,0)-i0; m_ConfStride[3] = MainOp->SetPos(0,0,1)-i0;
+		MainOp->ResetShift();
+	}
+	auto IDX = [&](const unsigned int* q) -> size_t {return m_ConfStride[0]+q[0]*m_ConfStride[1]+q[1]*m_ConfStride[2]+q[2]*m_ConfStride[3];};
+	// sheet primitives grouped by (normal axis, plane line)
+	std::map<std::pair<int,unsigned int>, std::vector<CSPrimitives*>> planes;
+	std::map<std::pair<int,unsigned int>, std::vector<double>> planeBox;
+	for (CSPrimitives* prim : GetGeometryCSX()->GetAllPrimitives(false, CSProperties::ANY))
+	{
+		if (dynamic_cast<CSPropConductingSheet*>(prim->GetProperty())==NULL)
+			continue;
+		double box[6];
+		prim->GetBoundBox(box);
+		int nn = -1;
+		for (int n=0;n<3;++n)
+			if (box[2*n]==box[2*n+1]) nn = n;
+		if (nn<0)
+			continue;
+		// plane line index
+		unsigned int k = 0; double best = 1e300;
+		for (unsigned int i=0;i<numLines[nn];++i)
+		{
+			double d = fabs(GetDiscLine(nn,i)-box[2*nn]);
+			if (d<best) {best=d; k=i;}
+		}
+		auto key = std::make_pair(nn,k);
+		planes[key].push_back(prim);
+		auto& b = planeBox[key];
+		if (b.empty()) b.assign(box, box+6);
+		for (int n=0;n<3;++n) { b[2*n]=std::min(b[2*n],std::min(box[2*n],box[2*n+1])); b[2*n+1]=std::max(b[2*n+1],std::max(box[2*n],box[2*n+1])); }
+	}
+	size_t nPartialEdges=0, nPartialFaces=0, nKeptFaces=0;
+	for (auto& pl : planes)
+	{
+		const int nn = pl.first.first; const unsigned int k = pl.first.second;
+		const int a = (nn+1)%3, b = (nn+2)%3;
+		std::vector<CSPrimitives*>& prims = pl.second;
+		std::sort(prims.begin(), prims.end(), [](CSPrimitives* x, CSPrimitives* y){return x->GetPriority()>y->GetPriority();});
+		const std::vector<double>& box = planeBox[pl.first];
+		auto range = [&](int ax, unsigned int& lo, unsigned int& hi)
+		{
+			lo = 0; hi = numLines[ax]-1;
+			while (lo+1<numLines[ax] && GetDiscLine(ax,lo+1)<=box[2*ax]) ++lo;
+			while (hi>0 && GetDiscLine(ax,hi-1)>=box[2*ax+1]) --hi;
+		};
+		unsigned int a0,a1,b0,b1; range(a,a0,a1); range(b,b0,b1);
+		const double zc = GetDiscLine(nn,k);
+		auto covered = [&](double ca, double cb) -> bool
+		{
+			double c[3]; c[nn]=zc; c[a]=ca; c[b]=cb;
+			return PropertyByPriority(c, prims, false, NULL)!=NULL;
+		};
+		const int Ns = 16, Nf = 8;
+		std::mutex lock;
+		ParallelLines(a1-a0+1, SetupThreads(a1-a0+1), [&](unsigned int li, unsigned int)
+		{
+			unsigned int i = a0+li;
+			size_t pe=0, pf=0, kf=0;
+			std::vector<size_t> freeEdges;
+			for (unsigned int j=b0; j<=b1; ++j)
+			{
+				unsigned int pos[3]; pos[nn]=k; pos[a]=i; pos[b]=j;
+				// edge along a from line i to i+1 at b-line j
+				for (int dir=0; dir<2; ++dir)
+				{
+					int n = dir==0 ? a : b;
+					int m = dir==0 ? b : a;
+					if (pos[n]+1>=numLines[n]) continue;
+					double lo = GetDiscLine(n,pos[n]), hi = GetDiscLine(n,pos[n]+1), fixed = GetDiscLine(m,pos[m]);
+					int cnt=0;
+					for (int s=0;s<Ns;++s)
+					{
+						double t = lo + (s+0.5)/Ns*(hi-lo);
+						cnt += (n==a) ? covered(t, fixed) : covered(fixed, t);
+					}
+					if (cnt>0 && cnt<Ns)
+					{
+						double u = std::max(1.0-(double)cnt/Ns, umin);
+						size_t ipos = IDX(pos);
+						EC_C[n][ipos] /= u; EC_G[n][ipos] /= u;
+						freeEdges.push_back(n*(size_t)numLines[0]*numLines[1]*numLines[2] + ipos);
+						++pe;
+					}
+				}
+				// face [i,i+1] x [j,j+1] in the plane: current component nn at pos
+				if (i+1<numLines[a] && j+1<numLines[b])
+				{
+					double la0=GetDiscLine(a,i), la1=GetDiscLine(a,i+1), lb0=GetDiscLine(b,j), lb1=GetDiscLine(b,j+1);
+					int cnt=0;
+					for (int s=0;s<Nf;++s) for (int t=0;t<Nf;++t)
+						cnt += covered(la0+(s+0.5)/Nf*(la1-la0), lb0+(t+0.5)/Nf*(lb1-lb0));
+					if (cnt>0 && cnt<Nf*Nf)
+					{
+						double af = 1.0-(double)cnt/(Nf*Nf);
+						if (af>=amin)
+						{
+							size_t ipos = IDX(pos);
+							EC_L[nn][ipos] *= af; EC_R[nn][ipos] *= af;
+							++pf;
+						}
+						else ++kf;
+					}
+				}
+			}
+			std::lock_guard<std::mutex> guard(lock);
+			m_ConformalFree.insert(freeEdges.begin(), freeEdges.end());
+			nPartialEdges+=pe; nPartialFaces+=pf; nKeptFaces+=kf;
+		});
+	}
+	cout << "Operator::ApplyConformalSheets: " << planes.size() << " sheet planes, " << nPartialEdges << " partial edges, "
+	     << nPartialFaces << " partial faces (" << nKeptFaces << " below the free-area minimum " << amin << " kept)" << endl;
+}
+
+bool Operator::IsConformalFreeEdge(int n, const unsigned int pos[3]) const
+{
+	if (m_ConformalFree.empty())
+		return false;
+	size_t ipos = m_ConfStride[0]+pos[0]*m_ConfStride[1]+pos[1]*m_ConfStride[2]+pos[2]*m_ConfStride[3];
+	return m_ConformalFree.count(n*(size_t)numLines[0]*numLines[1]*numLines[2] + ipos)>0;
 }
 
 // Largest eigenvalue of a symmetric tridiagonal matrix (Sturm bisection).
