@@ -2245,7 +2245,9 @@ void Operator::Calc_EC_Range(unsigned int xStart, unsigned int xStop)
 
 void Operator::SetTimestepFactor(double factor)
 {
-	if ((factor<=0) || (factor>1))
+	// Factors above 1 are for timesteps checked against the exact stability limit of the
+	// discrete operator (Rennings_2 is a local, conservative bound); 2 caps accidents.
+	if ((factor<=0) || (factor>2))
 	{
 		cerr << "Operator::SetTimestepFactor: Warning, invalid timestep factor, skipping!" << endl;
 		return;
