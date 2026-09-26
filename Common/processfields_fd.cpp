@@ -76,7 +76,16 @@ void ProcessFieldsFD::InitProcess()
 			m_CP_Every = atoi(every);
 			m_CP_Start = start ? atof(start) : 0;
 			delete m_CP_File;
-			m_CP_File = new HDF5_File_Writer(m_filename+"_cp.h5");
+			// OPENEMS_FD_CHECKPOINT_DIR places the checkpoints elsewhere (e.g. a RAM disk)
+			const char* dir = getenv("OPENEMS_FD_CHECKPOINT_DIR");
+			std::string name = m_filename;
+			if (dir && *dir)
+			{
+				size_t slash = m_filename.find_last_of('/');
+				name = std::string(dir) + "/" + (slash==std::string::npos ? m_filename : m_filename.substr(slash+1));
+			}
+			m_CP_File = new HDF5_File_Writer(name+"_cp.h5");
+			m_CP_File->SetKeepOpen(true);
 			m_CP_File->SetCurrentGroup("/FD_Checkpoints");
 			m_CP_File->WriteAttribute("/FD_Checkpoints","frequency",m_FD_Samples);
 			m_CP_File->WriteAttribute("/FD_Checkpoints","sample_interval_timesteps",(float)m_FD_Interval);
@@ -212,6 +221,8 @@ void ProcessFieldsFD::FinishAsync()
 void ProcessFieldsFD::PostProcess()
 {
 	FinishAsync();
+	if (m_CP_File)
+		m_CP_File->Close();
 	if ((m_FieldDFT>=0) && !m_Eng_Interface->ReadFieldDFT(m_FieldDFT, m_FD_Fields))
 		cerr << "ProcessFieldsFD::PostProcess: can't read the frequency domain fields of the engine!" << endl;
 	DumpFDData();
