@@ -142,7 +142,7 @@ public:
 	virtual void SetTimestepFactor(double factor);
 	bool GetTimestepValid() const {return !m_InvaildTimestep;}
 
-	//! Choose a time step method (0=auto, 1=CFL, 3=Rennings)
+	//! Choose a time step method (0=auto, 1=CFL, 3=Rennings, 4=exact limit of the discrete operator)
 	void SetTimeStepMethod(int var) {m_TimeStepVar=var;}
 
 	//! Set the material averaging method /sa MatAverageMethods
@@ -313,6 +313,7 @@ protected:
 
 	double CalcTimestep_Var1();
 	double CalcTimestep_Var3();
+	double CalcTimestep_Var4();
 
 	//! Calculate the FDTD equivalent circuit parameter for the given position and direction ny. \sa Calc_EffMat_Pos
 	virtual bool Calc_ECPos(

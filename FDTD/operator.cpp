@@ -2259,6 +2259,8 @@ void Operator::SetTimestepFactor(double factor)
 
 double Operator::CalcTimestep()
 {
+	if (m_TimeStepVar==4)
+		return CalcTimestep_Var4(); //exact limit of the discrete operator (Lanczos)
 	if (m_TimeStepVar==3)
 		return CalcTimestep_Var3(); //the biggest one for cartesian meshes
 
@@ -2422,6 +2424,159 @@ double Operator::CalcTimestep_Var3()
 	{
 		cout << "Operator::CalcTimestep_Var3: Smallest timestep (" << dT << "s) found at position: " <<  smallest_n << " : " << smallest_pos[0] << ";" <<  smallest_pos[1] << ";" <<  smallest_pos[2] << endl;
 	}
+	return 0;
+}
+
+// Largest eigenvalue of a symmetric tridiagonal matrix (Sturm bisection).
+static double TridiagMaxEig(const std::vector<double>& a, const std::vector<double>& b)
+{
+	const size_t k = a.size();
+	double lo=1e300, hi=-1e300;
+	for (size_t i=0; i<k; ++i)
+	{
+		double r = (i>0 ? fabs(b[i-1]) : 0) + (i+1<k ? fabs(b[i]) : 0);
+		lo = std::min(lo, a[i]-r); hi = std::max(hi, a[i]+r);
+	}
+	for (int it=0; it<200; ++it)
+	{
+		double mid = 0.5*(lo+hi);
+		// number of eigenvalues greater than mid
+		int count = 0; double d = 1;
+		for (size_t i=0; i<k; ++i)
+		{
+			d = a[i]-mid - (i>0 ? b[i-1]*b[i-1]/d : 0);
+			if (d==0) d = 1e-300;
+			if (d<0) ++count;
+		}
+		if (count<(int)k) lo = mid; else hi = mid;  // count<k: some eigenvalue above mid
+		if (hi-lo <= 1e-12*fabs(hi)) break;
+	}
+	return hi;
+}
+
+// Exact leapfrog limit of the main grid: dT <= 2/sqrt(lambda_max(C^-1 Ci L^-1 Ci^T)), with the
+// engine's own curl stencils (volt: backward differences cancelling at index 0; curr: forward,
+// updated on [0,N-1)^3). PEC edges, conducting sheets and boundary conditions are applied later
+// and can only lower lambda_max, so the unmasked operator gives a safe bound. Extensions (UPML,
+// dispersive/sheet ADE) are not in the operator; a safety factor of 0.98 is applied and the result
+// is never below Rennings_2 (solvers-2026-09 S1.6: bracketed against the full engine).
+double Operator::CalcTimestep_Var4()
+{
+	CalcTimestep_Var3();
+	const double dT_R = dT;
+	m_Used_TS_Name = std::string("Exact_Lanczos");
+	const size_t N0=numLines[0], N1=numLines[1], N2=numLines[2];
+	if (N0<2 || N1<2 || N2<2)
+		return 0;
+	MainOp->ResetShift();
+	const size_t i0 = MainOp->SetPos(0,0,0);
+	const size_t sx = MainOp->SetPos(1,0,0)-i0, sy = MainOp->SetPos(0,1,0)-i0, sz = MainOp->SetPos(0,0,1)-i0;
+	MainOp->ResetShift();
+	const size_t total = N0*N1*N2;
+	auto I = [&](size_t x, size_t y, size_t z) {return i0 + x*sx + y*sy + z*sz;};
+	std::vector<float> q(3*total), qp(3*total,0.f), w(3*total), t(3*total, 0.f), SC(3*total), IL(3*total);
+	unsigned int nThreads = SetupThreads(N0);
+	ParallelLines(N0, nThreads, [&](unsigned int x, unsigned int)
+	{
+		for (int n=0;n<3;++n)
+			for (size_t y=0; y<N1; ++y)
+				for (size_t z=0; z<N2; ++z)
+				{
+					size_t i=I(x,y,z); double c=EC_C[n][i], l=EC_L[n][i];
+					SC[n*total+i] = c>0 ? (float)sqrt(1.0/c) : 0.f;
+					IL[n*total+i] = l>0 ? (float)(1.0/l) : 0.f;
+				}
+	});
+	auto sc = [&](int n, size_t i) -> float {return SC[n*total+i];};
+	auto il = [&](int n, size_t i) -> float {return IL[n*total+i];};
+	std::vector<double> partial(nThreads);
+	auto apply = [&](const std::vector<float>& in, std::vector<float>& out)
+	{
+		// t = L^-1 Ci^T (sc*in): the negative of the engine's current-update curl
+		ParallelLines(N0-1, nThreads, [&](unsigned int x, unsigned int)
+		{
+			for (size_t y=0; y+1<N1; ++y)
+				for (size_t z=0; z+1<N2; ++z)
+				{
+					const size_t i=I(x,y,z), iy=I(x,y+1,z), iz=I(x,y,z+1), ix=I(x+1,y,z);
+					auto u = [&](int n, size_t j) {return sc(n,j)*in[n*total+j];};
+					t[0*total+i] = -il(0,i)*(u(2,i)-u(2,iy)-u(1,i)+u(1,iz));
+					t[1*total+i] = -il(1,i)*(u(0,i)-u(0,iz)-u(2,i)+u(2,ix));
+					t[2*total+i] = -il(2,i)*(u(1,i)-u(1,ix)-u(0,i)+u(0,iy));
+				}
+		});
+		// out = sc * Ci t (engine voltage-update curl)
+		ParallelLines(N0, nThreads, [&](unsigned int x, unsigned int)
+		{
+			for (size_t y=0; y<N1; ++y)
+				for (size_t z=0; z<N2; ++z)
+				{
+					const size_t i=I(x,y,z);
+					auto bd = [&](int n, int ax) -> float {
+						size_t c = ax==0 ? x : (ax==1 ? y : z);
+						if (c==0) return 0.f;
+						size_t j = ax==0 ? I(x-1,y,z) : (ax==1 ? I(x,y-1,z) : I(x,y,z-1));
+						return t[n*total+i]-t[n*total+j];};
+					out[0*total+i] = sc(0,i)*(bd(2,1)-bd(1,2));
+					out[1*total+i] = sc(1,i)*(bd(0,2)-bd(2,0));
+					out[2*total+i] = sc(2,i)*(bd(1,0)-bd(0,1));
+				}
+		});
+	};
+	auto dot = [&](const std::vector<float>& a, const std::vector<float>& b) -> double
+	{
+		std::fill(partial.begin(), partial.end(), 0.0);
+		ParallelLines(N0, nThreads, [&](unsigned int x, unsigned int thread)
+		{
+			double s=0;
+			for (int n=0;n<3;++n)
+				for (size_t y=0; y<N1; ++y)
+					for (size_t z=0; z<N2; ++z)
+					{ size_t i=n*total+I(x,y,z); s += (double)a[i]*b[i]; }
+			partial[thread] += s;
+		});
+		double s=0; for (double v : partial) s+=v; return s;
+	};
+	// deterministic start vector
+	unsigned long long state = 88172645463325252ULL;
+	for (size_t i=0; i<3*total; ++i)
+	{
+		state ^= state<<13; state ^= state>>7; state ^= state<<17;
+		q[i] = (float)((state>>11)*(1.0/9007199254740992.0) - 0.5);
+	}
+	double nrm = sqrt(dot(q,q));
+	for (auto& v : q) v = (float)(v/nrm);
+	std::vector<double> alpha, beta;
+	double b_prev = 0, lambda = 0;
+	const int iterations = 40;
+	for (int k=0; k<iterations; ++k)
+	{
+		apply(q, w);
+		double a = dot(q, w);
+		ParallelLines(3*N0, nThreads, [&](unsigned int line, unsigned int)
+		{
+			size_t n=line/N0, x=line%N0;
+			for (size_t y=0; y<N1; ++y) for (size_t z=0; z<N2; ++z)
+			{ size_t i=n*total+I(x,y,z); w[i] = (float)(w[i] - a*q[i] - b_prev*qp[i]); }
+		});
+		double b = sqrt(dot(w,w));
+		alpha.push_back(a);
+		lambda = TridiagMaxEig(alpha, beta);
+		if (b<=0) break;
+		beta.push_back(b);
+		std::swap(qp, q);
+		ParallelLines(3*N0, nThreads, [&](unsigned int line, unsigned int)
+		{
+			size_t n=line/N0, x=line%N0;
+			for (size_t y=0; y<N1; ++y) for (size_t z=0; z<N2; ++z)
+			{ size_t i=n*total+I(x,y,z); q[i] = (float)(w[i]/b); }
+		});
+		b_prev = b;
+	}
+	const double dT_exact = 2/sqrt(lambda);
+	dT = std::max(dT_R, 0.98*dT_exact);
+	cout << "Operator::CalcTimestep_Var4: exact limit " << dT_exact << " s (" << dT_exact/dT_R << " x Rennings_2 " << dT_R
+	     << " s, Lanczos " << alpha.size() << " iterations); timestep " << dT << " s" << endl;
 	return 0;
 }
 
