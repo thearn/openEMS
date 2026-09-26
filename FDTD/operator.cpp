@@ -2574,6 +2574,11 @@ bool Operator::IsConformalFreeEdge(int n, const unsigned int pos[3]) const
 	return m_ConformalFree.count(n*(size_t)numLines[0]*numLines[1]*numLines[2] + ipos)>0;
 }
 
+#ifdef OPENEMS_WITH_CUDA
+double CUDA_LanczosMaxEig(const float* SC_h, const float* IL_h, unsigned N0, unsigned N1, unsigned N2,
+                          size_t i0, size_t sx, size_t sy, size_t sz, int iterations);
+#endif
+
 // Largest eigenvalue of a symmetric tridiagonal matrix (Sturm bisection).
 static double TridiagMaxEig(const std::vector<double>& a, const std::vector<double>& b)
 {
@@ -2621,7 +2626,7 @@ double Operator::CalcTimestep_Var4()
 	MainOp->ResetShift();
 	const size_t total = N0*N1*N2;
 	auto I = [&](size_t x, size_t y, size_t z) {return i0 + x*sx + y*sy + z*sz;};
-	std::vector<float> q(3*total), qp(3*total,0.f), w(3*total), t(3*total, 0.f), SC(3*total), IL(3*total);
+	std::vector<float> SC(3*total), IL(3*total);
 	unsigned int nThreads = SetupThreads(N0);
 	ParallelLines(N0, nThreads, [&](unsigned int x, unsigned int)
 	{
@@ -2634,6 +2639,21 @@ double Operator::CalcTimestep_Var4()
 					IL[n*total+i] = l>0 ? (float)(1.0/l) : 0.f;
 				}
 	});
+#ifdef OPENEMS_WITH_CUDA
+	{
+		const char* cpu = getenv("OPENEMS_LANCZOS_CPU");
+		double lam = (cpu && atoi(cpu)) ? -1 : CUDA_LanczosMaxEig(SC.data(), IL.data(), N0, N1, N2, i0, sx, sy, sz, 40);
+		if (lam>0)
+		{
+			const double dT_exact = 2/sqrt(lam);
+			dT = std::max(dT_R, 0.98*dT_exact);
+			cout << "Operator::CalcTimestep_Var4: exact limit " << dT_exact << " s (" << dT_exact/dT_R << " x Rennings_2 " << dT_R
+			     << " s, GPU Lanczos 40 iterations); timestep " << dT << " s" << endl;
+			return 0;
+		}
+	}
+#endif
+	std::vector<float> q(3*total), qp(3*total,0.f), w(3*total), t(3*total, 0.f);
 	auto sc = [&](int n, size_t i) -> float {return SC[n*total+i];};
 	auto il = [&](int n, size_t i) -> float {return IL[n*total+i];};
 	std::vector<double> partial(nThreads);
