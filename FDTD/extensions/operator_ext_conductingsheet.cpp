@@ -129,6 +129,9 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 
 						if (m_Op->GetYeeCoords(n,pos,coord,false)==false)
 							continue;
+						// partially covered in-plane edge of a conformal sheet: a free edge
+						if (m_Op->IsConformalFreeEdge(n,pos))
+							continue;
 
 						// Ez at r==0 not supported --> set to PEC
 						if (m_CC_R0_included && (n==2) && (pos[0]==0))
