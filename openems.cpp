@@ -16,6 +16,7 @@
 */
 
 #include "openems.h"
+#include <cmath>
 #include <iomanip>
 #include <iostream>
 #include <fstream>
@@ -127,6 +128,7 @@ void openEMS::Reset()
 	m_CC_MultiGrid.clear();
 	m_CellConstantMaterial=false;
 	endCrit = 1e-6;
+	m_Diverged = false;
 	m_OverSampling = 4;
 
 	m_TS_method=3;
@@ -1661,6 +1663,7 @@ void openEMS::WriteDryRun()
 
 void openEMS::RunFDTD()
 {
+	m_Diverged = false;
 	if (m_dry_run)
 	{
 		WriteDryRun();
@@ -1716,6 +1719,14 @@ void openEMS::RunFDTD()
 		else if (ProcField->CheckTimestep())
 		{
 			currE = ProcField->CalcTotalEnergyEstimate();
+			if (!std::isfinite(currE))
+			{
+				// A NaN energy would otherwise end the loop as if the end criteria were met.
+				cerr << "RunFDTD: Error: non-finite field energy at timestep " << FDTD_Eng->GetNumberOfTimesteps()
+				     << ": the simulation diverged (numerical instability)" << endl;
+				m_Diverged = true;
+				break;
+			}
 			if (currE>maxE)
 				maxE=currE;
 			if (maxE)

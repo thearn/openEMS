@@ -59,6 +59,8 @@ public:
 	virtual int SetupFDTD();
 	virtual int RestartFDTD();
 	virtual void RunFDTD();
+	//! True if the last RunFDTD stopped on a non-finite field energy
+	bool Diverged() const {return m_Diverged;}
 
 	void Reset();
 
@@ -144,6 +146,7 @@ protected:
 	int m_TS_method;
 	double m_TS;
 	double m_TS_fac;
+	bool m_Diverged;
 	double m_maxTime;
 
 	// some command line flags

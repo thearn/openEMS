@@ -63,6 +63,7 @@ cdef extern from "openEMS/openems.h":
         int SetupFDTD() nogil
         int RestartFDTD() nogil
         void RunFDTD()  nogil
+        bool Diverged()
 
         bool Write2XML(string file)
         string GetOperatorIdentity()
