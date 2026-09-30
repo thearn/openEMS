@@ -147,6 +147,7 @@ struct GPU_Backend_CUDA::Impl
 	//! current fields (volt, curr) into the next buffers (volt_next, curr_next), swapped afterwards.
 	int fused_step;                          //!< -1: not decided yet, 0: off, 1: on
 	int fused_blockers;                      //!< extensions or grids that do not allow it
+	size_t fused_step_extra_bytes;           //!< extension buffers allocated only after the fused step is accepted
 	float *volt_next, *curr_next;
 	std::vector<unsigned int> volt_modified; //!< flat indices of the voltages the extensions register as changed between the half-steps (excitation, lumped RLC)
 	std::vector<std::pair<size_t,const char*>> volt_modified_from; //!< (first index, extension) of each registration, for the fusion report

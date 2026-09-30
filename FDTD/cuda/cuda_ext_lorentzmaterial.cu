@@ -190,10 +190,10 @@ void CUDA_Ext_LorentzMaterial::Build(std::vector<ADEGroup>& groups, const std::v
 		{
 			const size_t k = o-first;
 			g.ade[k] = d->Alloc<float>(3*(size_t)count);
-			g.lor[k] = d->Alloc<float>(3*(size_t)count);
+			g.lor[k] = g.lorentz ? d->Alloc<float>(3*(size_t)count) : NULL;
 			g.c_int[k] = Coefficients(count, orders[o].c_int);
 			g.c_ext[k] = Coefficients(count, orders[o].c_ext);
-			g.c_lor[k] = Coefficients(count, orders[o].c_lor);
+			g.c_lor[k] = g.lorentz ? Coefficients(count, orders[o].c_lor) : NULL;
 		}
 		g.pos = d->Alloc<unsigned int>(count, orders[first].flat.data());
 		g.mask = d->Alloc<unsigned char>(count, mask.data());

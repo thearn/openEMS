@@ -319,7 +319,19 @@ bool CUDA_Ext_UPML::CanFuse()
 	}
 	if (!sides_ok)
 		F.count = 0;
+	// A fused step needs a second input/output flux buffer for every region. Account for
+	// those buffers in its reserve check, but do not retain them when memory selects the
+	// separate E/H path.
+	d->fused_step_extra_bytes = 0;
 	if (F.count)
+		for (size_t r=0; r<d->upml.size(); ++r)
+		{
+			const CUDA_Ext_UPML* u = static_cast<const CUDA_Ext_UPML*>(d->upml[r]);
+			const size_t n = 3*(size_t)u->m_Region.lx*u->m_Region.ly*u->m_Region.lz;
+			d->fused_step_extra_bytes += 2*n*sizeof(float);
+		}
+	if (d->DecideFusedStep())
+	{
 		for (size_t r=0; r<d->upml.size(); ++r)
 		{
 			CUDA_Ext_UPML* u = static_cast<CUDA_Ext_UPML*>(d->upml[r]);
@@ -329,8 +341,8 @@ bool CUDA_Ext_UPML::CanFuse()
 			u->m_CurrFlux2 = d->Alloc<float>(n);
 			CUDA_Check(cudaMemcpyAsync(u->m_CurrFlux2, u->m_CurrFlux, n*sizeof(float), cudaMemcpyDeviceToDevice, d->Stream()), "UPML flux");
 		}
-	if (d->DecideFusedStep())
 		return true;
+	}
 	F.count = 0;
 
 	// The regions along z (which cover the x/y range of the main updates) are updated by the

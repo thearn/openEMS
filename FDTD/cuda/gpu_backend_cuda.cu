@@ -581,6 +581,7 @@ GPU_Backend_CUDA::Impl::Impl()
 	energy_count = 0;
 	fused_step = -1;
 	fused_blockers = 0;
+	fused_step_extra_bytes = 0;
 	fregions.count = 0;
 	volt_next = curr_next = NULL;
 	fixup = NULL;
@@ -630,14 +631,17 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 	// OPENEMS_CUDA_FUSED_STEP=1 forces the fused step.
 	{
 		size_t free_bytes = 0, total_bytes = 0;
-		const size_t need = 2*3*(size_t)numCells*sizeof(float);
+		const size_t field_bytes = 2*3*(size_t)numCells*sizeof(float);
+		const size_t need = field_bytes + fused_step_extra_bytes;
 		const char* reserve_env = getenv("OPENEMS_CUDA_MEMORY_RESERVE_MB");
 		const size_t reserve = (size_t)(reserve_env ? atof(reserve_env) : 512.0)*1024*1024;
 		const bool forced = env && (atoi(env)==1);
 		if (!forced && (cudaMemGetInfo(&free_bytes, &total_bytes)==cudaSuccess) && (free_bytes < need+reserve))
 		{
 			std::cout << "GPU_Backend_CUDA: separate E and H updates: the fused step needs " << need/1048576
-			          << " MiB and a " << reserve/1048576 << " MiB reserve, " << free_bytes/1048576 << " MiB of "
+			          << " MiB (" << field_bytes/1048576 << " MiB fields, " << fused_step_extra_bytes/1048576
+			          << " MiB extension buffers)"
+			          << " and a " << reserve/1048576 << " MiB reserve, " << free_bytes/1048576 << " MiB of "
 			          << total_bytes/1048576 << " MiB are free" << std::endl;
 			return false;
 		}
