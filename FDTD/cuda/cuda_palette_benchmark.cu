@@ -159,6 +159,7 @@ void CUDA_RunPaletteBenchmark(const CUDA_PaletteBenchmarkInput& in)
 			logical_lookups+=current;local_index_reads+=current*width;
 		}
 	}
+	const std::chrono::steady_clock::time_point encoding_end=std::chrono::steady_clock::now();
 	// Exhaustive host decode, including every clipped halo entry.
 	for(size_t tile=0;tile<metas.size();++tile)
 	{
@@ -173,7 +174,10 @@ void CUDA_RunPaletteBenchmark(const CUDA_PaletteBenchmarkInput& in)
 				throw std::runtime_error("CUDA palette benchmark host decode mismatch");
 		}
 	}
-	const double build_s=std::chrono::duration<double>(std::chrono::steady_clock::now()-build_start).count();
+	const std::chrono::steady_clock::time_point verification_end=std::chrono::steady_clock::now();
+	const double encoding_s=std::chrono::duration<double>(encoding_end-build_start).count();
+	const double verification_s=std::chrono::duration<double>(verification_end-encoding_end).count();
+	const double construction_and_verification_s=std::chrono::duration<double>(verification_end-build_start).count();
 	DeviceBuffers dev;const std::chrono::steady_clock::time_point upload_start=std::chrono::steady_clock::now();
 	TileMeta* dmeta=dev.copy(metas,in.stream);unsigned char* dindex=dev.copy(indices,in.stream);float* dtable=dev.copy(table,in.stream);
 	const size_t outputs=tiles*256;uint32_t* dout=dev.alloc<uint32_t>(outputs);
@@ -231,7 +235,8 @@ void CUDA_RunPaletteBenchmark(const CUDA_PaletteBenchmarkInput& in)
 	std::ofstream out(in.path.c_str(),std::ios::out|std::ios::trunc);if(!out)throw std::runtime_error("cannot write CUDA palette report");
 	out<<std::setprecision(10)<<"{\n  \"schema\":1,\n  \"dimensions\":{\"x\":"<<in.nx<<",\"y\":"<<in.ny<<",\"z\":"<<in.nz<<"},\n"
 	   <<"  \"tiles\":"<<tiles<<",\"one_byte_tiles\":"<<one_tiles<<",\"two_byte_tiles\":"<<two_tiles<<",\"shared_dictionaries\":"<<dictionaries.size()<<",\n"
-	   <<"  \"logical_lookups_per_launch\":"<<logical_lookups<<",\"construction_s\":"<<build_s<<",\"upload_s\":"<<upload_s<<",\n"
+	   <<"  \"logical_lookups_per_launch\":"<<logical_lookups<<",\"encoding_construction_s\":"<<encoding_s<<",\"host_verification_s\":"<<verification_s
+	   <<",\"construction_and_verification_s\":"<<construction_and_verification_s<<",\"upload_s\":"<<upload_s<<",\n"
 	   <<"  \"global\":{\"index_bytes\":"<<global_index_bytes<<",\"table_bytes\":"<<global_table_bytes<<",\"total_bytes\":"<<global_index_bytes+global_table_bytes<<"},\n"
 	   <<"  \"local\":{\"index_bytes\":"<<indices.size()<<",\"index_padding_bytes\":"<<index_padding<<",\"table_bytes\":"<<table.size()*sizeof(float)<<",\"metadata_bytes\":"<<metas.size()*sizeof(TileMeta)<<",\"total_bytes\":"<<local_bytes<<"},\n"
 	   <<"  \"calculated_bytes_per_launch\":{\"coefficient_values\":"<<logical_lookups*48<<",\"global_indices\":"<<logical_lookups*(in.coefficients.mode==1?2:4)<<",\"local_indices\":"<<local_index_reads<<",\"local_metadata_requests\":"<<tiles*256*sizeof(TileMeta)<<"},\n"
