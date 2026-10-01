@@ -207,6 +207,7 @@ void CUDA_Ext_LorentzMaterial::Build(std::vector<ADEGroup>& groups, const std::v
 			CUDA_ADECandidate C;
 			C.count = count;
 			C.orders = g.orders;
+			C.lorentz = g.lorentz;
 			C.flat = orders[first].flat;
 			C.mask = mask;
 			for (unsigned int o=0; o<g.orders; ++o)

@@ -629,20 +629,25 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 	// run far slower than the separate E and H updates, so it is refused unless the free device
 	// memory keeps a reserve (OPENEMS_CUDA_MEMORY_RESERVE_MB, default 512) afterwards; unless
 	// OPENEMS_CUDA_FUSED_STEP=1 forces the fused step.
+	size_t decision_free_bytes = 0, decision_total_bytes = 0;
+	const size_t decision_field_bytes = 2*3*(size_t)numCells*sizeof(float);
+	const size_t decision_need = decision_field_bytes + fused_step_extra_bytes;
+	const char* reserve_env = getenv("OPENEMS_CUDA_MEMORY_RESERVE_MB");
+	const size_t decision_reserve = (size_t)(reserve_env ? atof(reserve_env) : 512.0)*1024*1024;
 	{
-		size_t free_bytes = 0, total_bytes = 0;
-		const size_t field_bytes = 2*3*(size_t)numCells*sizeof(float);
-		const size_t need = field_bytes + fused_step_extra_bytes;
-		const char* reserve_env = getenv("OPENEMS_CUDA_MEMORY_RESERVE_MB");
-		const size_t reserve = (size_t)(reserve_env ? atof(reserve_env) : 512.0)*1024*1024;
 		const bool forced = env && (atoi(env)==1);
-		if (!forced && (cudaMemGetInfo(&free_bytes, &total_bytes)==cudaSuccess) && (free_bytes < need+reserve))
+		cudaError_t memory_info = cudaSuccess;
+		if (!forced || !opportunity_report.empty())
+			memory_info = cudaMemGetInfo(&decision_free_bytes, &decision_total_bytes);
+		if (memory_info!=cudaSuccess)
+			cudaGetLastError();
+		if (!forced && (memory_info==cudaSuccess) && (decision_free_bytes < decision_need+decision_reserve))
 		{
-			std::cout << "GPU_Backend_CUDA: separate E and H updates: the fused step needs " << need/1048576
-			          << " MiB (" << field_bytes/1048576 << " MiB fields, " << fused_step_extra_bytes/1048576
+			std::cout << "GPU_Backend_CUDA: separate E and H updates: the fused step needs " << decision_need/1048576
+			          << " MiB (" << decision_field_bytes/1048576 << " MiB fields, " << fused_step_extra_bytes/1048576
 			          << " MiB extension buffers)"
-			          << " and a " << reserve/1048576 << " MiB reserve, " << free_bytes/1048576 << " MiB of "
-			          << total_bytes/1048576 << " MiB are free" << std::endl;
+			          << " and a " << decision_reserve/1048576 << " MiB reserve, " << decision_free_bytes/1048576 << " MiB of "
+			          << decision_total_bytes/1048576 << " MiB are free" << std::endl;
 			return false;
 		}
 	}
@@ -654,6 +659,7 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 	const bool report = getenv("OPENEMS_CUDA_FUSION_REPORT") && atoi(getenv("OPENEMS_CUDA_FUSION_REPORT"));
 	std::vector<std::string> in_region;
 	const char* source = "unknown";
+	int folded_group = -1;
 	// Voltage ADE groups: one group whose nodes are all main nodes (not in a UPML region, not
 	// changed by another extension) is applied in the kernel, which needs no fix-up for it; the
 	// other groups register their changed voltages for the fix-up.
@@ -710,6 +716,7 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 					fade.ade[o] = C.ade[o];
 				C.fold();
 				folded_one = true;
+				folded_group = (int)g;
 				std::cout << "GPU_Backend_CUDA: ADE correction of " << C.count << " nodes (" << C.orders << " orders) in the fused kernel" << std::endl;
 				continue;
 			}
@@ -784,6 +791,79 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 	}
 	fixup_count = list.size();
 	fixup = Alloc<CUDA_FixupEntry>(fixup_count, list.data());
+
+	if (!opportunity_report.empty())
+	{
+		GPU_OpportunityInput census;
+		census.path = opportunity_report;
+		census.dim = {dim.nx, dim.ny, dim.nz};
+		census.begin = {main_start.nx, main_start.ny, main_start.nz};
+		census.end = {main_stop.nx, main_stop.ny, main_stop.nz};
+		if (fregions.count)
+		{
+			census.begin = {0, 0, 0};
+			census.end = census.dim;
+		}
+		census.xc = getenv("OPENEMS_CUDA_FUSED_XC") ? std::max(1, atoi(getenv("OPENEMS_CUDA_FUSED_XC"))) : FUSED_XC;
+		census.useful_y = FUSED_TY-1;
+		census.useful_z = FUSED_TZ-1;
+		for (unsigned int r=0; r<fregions.count; ++r)
+		{
+			const UPMLRegion& R = fregions.R[r];
+			census.upml.push_back({{R.sx,R.sy,R.sz},{R.lx,R.ly,R.lz}});
+		}
+		for (size_t g=0; g<ade_candidates.size(); ++g)
+		{
+			GPU_OpportunityADE A;
+			A.orders = ade_candidates[g].orders;
+			A.lorentz = ade_candidates[g].lorentz;
+			A.flat = ade_candidates[g].flat;
+			A.mask = ade_candidates[g].mask;
+			census.ade.push_back(A);
+		}
+		census.folded_ade = folded_group;
+		std::map<std::string,size_t> source_index;
+		const char* registered_source = "unknown";
+		for (size_t k=0; k<volt_modified.size(); ++k)
+		{
+			for (size_t m=0; m<volt_modified_from.size(); ++m)
+				if (volt_modified_from[m].first<=k)
+					registered_source = volt_modified_from[m].second;
+			std::map<std::string,size_t>::iterator found = source_index.find(registered_source);
+			if (found==source_index.end())
+			{
+				const size_t s = census.modified.size();
+				source_index[registered_source] = s;
+				census.modified.push_back({registered_source,{}});
+				found = source_index.find(registered_source);
+			}
+			census.modified[found->second].flat.push_back(volt_modified[k] % numCells);
+		}
+		for (size_t s=0; s<census.modified.size(); ++s)
+		{
+			std::sort(census.modified[s].flat.begin(),census.modified[s].flat.end());
+			census.modified[s].flat.erase(std::unique(census.modified[s].flat.begin(),census.modified[s].flat.end()),census.modified[s].flat.end());
+		}
+		for (size_t k=0; k<list.size(); ++k)
+			census.fixup.push_back({list[k].node,list[k].mask});
+		std::swap(census.coefficients,opportunity_coefficients);
+		cudaDeviceProp prop;
+		CUDA_Check(cudaGetDeviceProperties(&prop,ctx->device),"opportunity report device properties");
+		int l2=0;
+		if (cudaDeviceGetAttribute(&l2,cudaDevAttrL2CacheSize,ctx->device)!=cudaSuccess) cudaGetLastError();
+		census.device.name = prop.name;
+		census.device.compute_major = prop.major;
+		census.device.compute_minor = prop.minor;
+		census.device.l2_bytes = std::max(0,l2);
+		census.device.persisting_l2_max_bytes = prop.persistingL2CacheMaxSize;
+		census.device.free_bytes = decision_free_bytes;
+		census.device.total_bytes = decision_total_bytes;
+		census.device.fused_field_bytes = decision_field_bytes;
+		census.device.fused_extension_bytes = fused_step_extra_bytes;
+		census.device.reserve_bytes = decision_reserve;
+		GPU_WriteOpportunityReport(census);
+		std::cout << "GPU_Backend_CUDA: wrote opportunity report " << opportunity_report << std::endl;
+	}
 
 	// both buffers start with the current fields
 	volt_next = Alloc<float>(3*numCells);
@@ -922,6 +1002,9 @@ std::string GPU_Backend_CUDA::GetName() const
 
 bool GPU_Backend_CUDA::Init(const Operator* op)
 {
+	const char* opportunity_report = getenv("OPENEMS_CUDA_OPPORTUNITY_REPORT");
+	if (opportunity_report && *opportunity_report)
+		d->opportunity_report = opportunity_report;
 	unsigned int numLines[3];
 	for (int n=0; n<3; ++n)
 		numLines[n] = op->GetNumberOfLines(n, true);
@@ -978,6 +1061,8 @@ bool GPU_Backend_CUDA::Init(const Operator* op)
 		d->coeff = d->Alloc<float>(sets.table.size(), sets.table.data());
 		std::cout << "GPU_Backend_CUDA: " << sets.count << " distinct coefficient sets, compressed update coefficients ("
 		          << (sets.mode==1 ? 16 : 32) << " bit index)" << std::endl;
+		if (!d->opportunity_report.empty())
+			std::swap(d->opportunity_coefficients,sets);
 		return true;
 	}
 
