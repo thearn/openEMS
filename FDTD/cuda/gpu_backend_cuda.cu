@@ -929,6 +929,16 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 		FreeAllocation(index);index=NULL;
 		FreeAllocation(coeff);coeff=NULL;
 		local_palette_active=true;
+		// The fused UPML arguments were captured before the fused-step decision. Replace their
+		// now-retired main coefficient pointers with the production palette before the first launch.
+		for(unsigned int r=0;r<fregions.count;++r)
+		{
+			fregions.volt[r].palette=local_palette;fregions.volt[r].local_palette=true;
+			fregions.curr[r].palette=local_palette;fregions.curr[r].local_palette=true;
+			fregions.volt[r].index=fregions.curr[r].index=NULL;
+			fregions.volt[r].ca=fregions.volt[r].cb=NULL;
+			fregions.curr[r].ca=fregions.curr[r].cb=NULL;
+		}
 		std::cout<<"GPU_Backend_CUDA: production local coefficient palette ("
 		         <<local_bytes/1048576.0<<" MiB, retired "<<local_palette_global_bytes/1048576.0<<" MiB global)"<<std::endl;
 		if(!local_palette_report.empty())

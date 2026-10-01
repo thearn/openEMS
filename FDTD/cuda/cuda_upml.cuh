@@ -38,7 +38,15 @@ struct UPMLFusedArgs
 	const float* c_old; const float* c_fo; const float* c_fn;   //!< full UPML coefficient arrays (mode 0)
 	const void* u_index; const float* u_sets; unsigned int u_mode;
 	const void* index; const float* ca; const float* cb; unsigned int mode;   //!< main coefficients, see main_coeff()
+	CUDA_LocalPaletteView palette; bool local_palette;
 };
+
+__device__ __forceinline__ CUDA_MainCoeff upml_main_coeff(const UPMLFusedArgs& A,
+	const CUDA_GridDim& N, unsigned int i, unsigned int x, unsigned int y, unsigned int z, unsigned int set_offset)
+{
+	return A.local_palette ? palette_coeff_xyz(A.palette,x,y,z,set_offset) :
+		main_coeff(A.index,A.ca,A.cb,A.mode,N.nx*N.ny*N.nz,i,set_offset);
+}
 
 //! UPML coefficients of the region cell l0: old[n*s], fo[n*s] and fn[n*s] are vv/vvfo/vvfn (set_offset 0)
 //! or ii/iifo/iifn (set_offset 9) of direction n. Mode 0: the full arrays, else a 16/32 bit set index and the sets of 18.
@@ -70,7 +78,7 @@ __device__ __forceinline__ void upml_fused_volt_node(float* volt_out, const floa
 	const unsigned int xm = (gx>0) ? N.ny*N.nz : 0;
 	const unsigned int ym = (gy>0) ? N.nz : 0;
 	const unsigned int zm = (gz>0) ? 1 : 0;
-	const CUDA_MainCoeff C = main_coeff(A.index, A.ca, A.cb, A.mode, sn, i, 0);
+	const CUDA_MainCoeff C = upml_main_coeff(A,N,i,gx,gy,gz,0);
 	const unsigned int cells = R.lx*R.ly*R.lz;
 	const UPMLCoeff U = upml_coeff(A, (x*R.ly + y)*R.lz + z, cells, 0);
 	float curl[3];
@@ -107,7 +115,7 @@ __device__ __forceinline__ void upml_fused_curr_node(float* curr_out, const floa
 	{
 		const unsigned int xp = N.ny*N.nz;
 		const unsigned int yp = N.nz;
-		C = main_coeff(A.index, A.ca, A.cb, A.mode, sn, i, 6);
+		C = upml_main_coeff(A,N,i,gx,gy,gz,6);
 		curl[0] = (volt[2*sn+i] - volt[2*sn+i+yp] - volt[sn+i] + volt[sn+i+1]);
 		curl[1] = (volt[i] - volt[i+1] - volt[2*sn+i] + volt[2*sn+i+xp]);
 		curl[2] = (volt[sn+i] - volt[sn+i+xp] - volt[i] + volt[i+yp]);
@@ -141,7 +149,7 @@ __device__ __forceinline__ void upml_volt_value(const float* volt, const float* 
 	const unsigned int xm = (gx>0) ? N.ny*N.nz : 0;
 	const unsigned int ym = (gy>0) ? N.nz : 0;
 	const unsigned int zm = (gz>0) ? 1 : 0;
-	const CUDA_MainCoeff C = main_coeff(A.index, A.ca, A.cb, A.mode, sn, i, 0);
+	const CUDA_MainCoeff C = upml_main_coeff(A,N,i,gx,gy,gz,0);
 	const unsigned int cells = R.lx*R.ly*R.lz;
 	const UPMLCoeff U = upml_coeff(A, (x*R.ly + y)*R.lz + z, cells, 0);
 	float curl[3];
@@ -178,7 +186,7 @@ __device__ __forceinline__ void upml_curr_value(const float* curr_in, float* cur
 	const UPMLCoeff U = upml_coeff(A, (x*R.ly + y)*R.lz + z, cells, 9);
 	CUDA_MainCoeff C = {A.ca, A.cb, 0};
 	if (update)
-		C = main_coeff(A.index, A.ca, A.cb, A.mode, sn, i, 6);
+		C = upml_main_coeff(A,N,i,gx,gy,gz,6);
 	for (unsigned int n=0; n<3; ++n)
 	{
 		if (!((mask>>n)&1))
