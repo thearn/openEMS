@@ -16,6 +16,7 @@
 */
 
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -237,17 +238,26 @@ __device__ __forceinline__ void fused_ade(const CUDA_FusedADE& A, const CUDA_Gri
 // second buffer, written by the node's own block; the current flux in place).
 // HAS_ADE: a voltage ADE group is corrected in the kernel (A.count>0). A compile-time parameter:
 // the unused check alone made the kernel about 18% slower on an A100 (sm_80).
-template<unsigned int MODE, bool HAS_REGIONS, bool HAS_ADE>
+template<unsigned int MODE, bool HAS_REGIONS, bool HAS_ADE, bool TILE_LIST>
 __global__ void __launch_bounds__(FUSED_TZ*FUSED_TY) update_fused(
 	const float* __restrict__ volt_in, const float* __restrict__ curr_in, float* volt_out, float* __restrict__ curr_out,
 	const void* index, const float* va, const float* vb, const float* ia, const float* ib, unsigned int mode,
-	CUDA_GridDim N, CUDA_GridDim B, CUDA_GridDim E, CUDA_FusedRegions F, CUDA_FusedADE A, unsigned int xc)
+	CUDA_GridDim N, CUDA_GridDim B, CUDA_GridDim E, CUDA_FusedRegions F, CUDA_FusedADE A, unsigned int xc,
+	const unsigned int* tile_list, unsigned int tile_gy, unsigned int tile_gz)
 {
 	__shared__ float sV[3][FUSED_TY][FUSED_TZ];
+	unsigned int bx=blockIdx.z, by=blockIdx.y, bz=blockIdx.x;
+	if (TILE_LIST)
+	{
+		const unsigned int tile=tile_list[blockIdx.x];
+		bz=tile%tile_gz;
+		by=(tile/tile_gz)%tile_gy;
+		bx=tile/(tile_gz*tile_gy);
+	}
 	const unsigned int tz = threadIdx.x, ty = threadIdx.y;
-	const unsigned int z = B.nz + blockIdx.x*(FUSED_TZ-1) + tz;
-	const unsigned int y = B.ny + blockIdx.y*(FUSED_TY-1) + ty;
-	const unsigned int xs = B.nx + blockIdx.z*xc;
+	const unsigned int z = B.nz + bz*(FUSED_TZ-1) + tz;
+	const unsigned int y = B.ny + by*(FUSED_TY-1) + ty;
+	const unsigned int xs = B.nx + bx*xc;
 	const unsigned int xe = min(xs+xc, E.nx);
 	const bool main_yz = (z<E.nz) && (y<E.ny);                          // a main node line
 	const bool owner = main_yz && (tz<FUSED_TZ-1) && (ty<FUSED_TY-1);  // written by this block
@@ -332,14 +342,16 @@ __global__ void __launch_bounds__(FUSED_TZ*FUSED_TY) update_fused(
 	}
 }
 
-template<unsigned int MODE, bool HAS_REGIONS, bool HAS_ADE>
+template<unsigned int MODE, bool HAS_REGIONS, bool HAS_ADE, bool TILE_LIST>
 static void launch_update_fused(dim3 grid, dim3 block, cudaStream_t stream,
 	const float* volt_in, const float* curr_in, float* volt_out, float* curr_out,
 	const void* index, const float* va, const float* vb, const float* ia, const float* ib,
-	unsigned int mode, CUDA_GridDim N, CUDA_GridDim B, CUDA_GridDim E, CUDA_FusedRegions F, CUDA_FusedADE A, unsigned int xc)
+	unsigned int mode, CUDA_GridDim N, CUDA_GridDim B, CUDA_GridDim E, CUDA_FusedRegions F, CUDA_FusedADE A, unsigned int xc,
+	const unsigned int* tile_list=NULL, unsigned int tile_gy=0, unsigned int tile_gz=0)
 {
-	update_fused<MODE, HAS_REGIONS, HAS_ADE><<<grid, block, 0, stream>>>(
-		volt_in, curr_in, volt_out, curr_out, index, va, vb, ia, ib, mode, N, B, E, F, A, xc);
+	update_fused<MODE, HAS_REGIONS, HAS_ADE, TILE_LIST><<<grid, block, 0, stream>>>(
+		volt_in, curr_in, volt_out, curr_out, index, va, vb, ia, ib, mode, N, B, E, F, A, xc,
+		tile_list, tile_gy, tile_gz);
 }
 
 // the dumped values of a snapshot: entries [0, nv) from the voltages, [nv, n) from the currents
@@ -588,6 +600,9 @@ GPU_Backend_CUDA::Impl::Impl()
 	fixup_count = 0;
 	fade.count = 0;
 	fade.orders = 0;
+	fused_branch_tiles = fused_exception_tiles = NULL;
+	fused_branch_count = fused_exception_count = 0;
+	fused_partition_gy = fused_partition_gz = 0;
 	snap_entries = NULL;
 	snap_nv = snap_n = 0;
 	snap_dev = NULL;
@@ -631,7 +646,12 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 	// OPENEMS_CUDA_FUSED_STEP=1 forces the fused step.
 	size_t decision_free_bytes = 0, decision_total_bytes = 0;
 	const size_t decision_field_bytes = 2*3*(size_t)numCells*sizeof(float);
-	const size_t decision_need = decision_field_bytes + fused_step_extra_bytes;
+	const unsigned int partition_xc = getenv("OPENEMS_CUDA_FUSED_XC") ? std::max(1, atoi(getenv("OPENEMS_CUDA_FUSED_XC"))) : FUSED_XC;
+	const bool partition_requested = fregions.count && !(getenv("OPENEMS_CUDA_FUSED_PARTITION") && atoi(getenv("OPENEMS_CUDA_FUSED_PARTITION"))==0);
+	const size_t partition_tiles = partition_requested ?
+		(size_t)((dim.nx+partition_xc-1)/partition_xc)*((dim.ny+FUSED_TY-2)/(FUSED_TY-1))*((dim.nz+FUSED_TZ-2)/(FUSED_TZ-1)) : 0;
+	const size_t decision_partition_bytes = partition_tiles*sizeof(unsigned int);
+	const size_t decision_need = decision_field_bytes + fused_step_extra_bytes + decision_partition_bytes;
 	const char* reserve_env = getenv("OPENEMS_CUDA_MEMORY_RESERVE_MB");
 	const size_t decision_reserve = (size_t)(reserve_env ? atof(reserve_env) : 512.0)*1024*1024;
 	{
@@ -645,7 +665,7 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 		{
 			std::cout << "GPU_Backend_CUDA: separate E and H updates: the fused step needs " << decision_need/1048576
 			          << " MiB (" << decision_field_bytes/1048576 << " MiB fields, " << fused_step_extra_bytes/1048576
-			          << " MiB extension buffers)"
+			          << " MiB extension buffers, " << decision_partition_bytes/1048576.0 << " MiB partition)"
 			          << " and a " << decision_reserve/1048576 << " MiB reserve, " << decision_free_bytes/1048576 << " MiB of "
 			          << decision_total_bytes/1048576 << " MiB are free" << std::endl;
 			return false;
@@ -863,6 +883,44 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 		census.device.reserve_bytes = decision_reserve;
 		GPU_WriteOpportunityReport(census);
 		std::cout << "GPU_Backend_CUDA: wrote opportunity report " << opportunity_report << std::endl;
+	}
+
+	// Partition the direct launch grid only when no ADE correction is folded into the kernel.
+	// Test the positive dependency footprint against the actual region boxes, exactly as the census.
+	if (partition_requested && !fade.count)
+	{
+		const std::chrono::steady_clock::time_point started=std::chrono::steady_clock::now();
+		const unsigned int gx=(dim.nx+partition_xc-1)/partition_xc;
+		const unsigned int gy=(dim.ny+FUSED_TY-2)/(FUSED_TY-1);
+		const unsigned int gz=(dim.nz+FUSED_TZ-2)/(FUSED_TZ-1);
+		std::vector<unsigned int> branch, exception;
+		branch.reserve(partition_tiles); exception.reserve(partition_tiles);
+		for (unsigned int bx=0; bx<gx; ++bx)
+			for (unsigned int by=0; by<gy; ++by)
+				for (unsigned int bz=0; bz<gz; ++bz)
+				{
+					const unsigned int x0=bx*partition_xc, x1=std::min(x0+partition_xc+1,dim.nx);
+					const unsigned int y0=by*(FUSED_TY-1), y1=std::min(y0+FUSED_TY,dim.ny);
+					const unsigned int z0=bz*(FUSED_TZ-1), z1=std::min(z0+FUSED_TZ,dim.nz);
+					bool free=true;
+					for (unsigned int r=0; free && r<fregions.count; ++r)
+					{
+						const UPMLRegion& R=fregions.R[r];
+						free = !(x0<R.sx+R.lx && R.sx<x1 && y0<R.sy+R.ly && R.sy<y1 && z0<R.sz+R.lz && R.sz<z1);
+					}
+					(free?branch:exception).push_back((bx*gy+by)*gz+bz);
+				}
+		if (!branch.empty() && !exception.empty() && branch.size()+exception.size()==partition_tiles)
+		{
+			fused_branch_count=branch.size(); fused_exception_count=exception.size();
+			fused_partition_gy=gy; fused_partition_gz=gz;
+			fused_branch_tiles=Alloc<unsigned int>(branch.size(),branch.data());
+			fused_exception_tiles=Alloc<unsigned int>(exception.size(),exception.data());
+			const double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
+			std::cout << "GPU_Backend_CUDA: partitioned fused launch: " << fused_branch_count << " branch-free + "
+			          << fused_exception_count << " exceptional tiles, " << decision_partition_bytes
+			          << " bytes, " << seconds << " s construction/upload" << std::endl;
+		}
 	}
 
 	// both buffers start with the current fields
@@ -1091,37 +1149,49 @@ void GPU_Backend_CUDA::UpdateVoltages()
 		const dim3 block(FUSED_TZ, FUSED_TY, 1);
 		const dim3 grid((E.nz-B.nz+FUSED_TZ-2)/(FUSED_TZ-1), (E.ny-B.ny+FUSED_TY-2)/(FUSED_TY-1), (E.nx-B.nx+xc-1)/xc);
 		const bool timed = CUDA_KernelTimes::Enabled();
-		if (timed)
-			CUDA_KernelTimes::Begin(d->Stream());
 		const float* va = (const float*)(c ? d->coeff : d->vv);
 		const float* vb = (const float*)(c ? d->coeff : d->vi);
 		const float* ia = (const float*)(c ? d->coeff : d->ii);
 		const float* ib = (const float*)(c ? d->coeff : d->iv);
 		const bool specialize = !(getenv("OPENEMS_CUDA_FUSED_SPECIALIZE") && atoi(getenv("OPENEMS_CUDA_FUSED_SPECIALIZE"))==0);
 		const bool ade = d->fade.count>0;
-#define FUSED_ARGS grid, block, d->Stream(), (const float*)d->volt, (const float*)d->curr, d->volt_next, d->curr_next, \
+#define FUSED_ARGS(G) G, block, d->Stream(), (const float*)d->volt, (const float*)d->curr, d->volt_next, d->curr_next, \
 		(const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, d->fade, xc
-#define FUSED_LAUNCH(M, R) (ade ? launch_update_fused<M, R, true>(FUSED_ARGS) : launch_update_fused<M, R, false>(FUSED_ARGS))
-		if (!specialize)
-			FUSED_LAUNCH(3, true);
-		// with the UPML regions in the kernel: specialized on the coefficient mode as well
-		else if (d->fregions.count && (d->coeff_mode==0))
-			FUSED_LAUNCH(0, true);
-		else if (d->fregions.count && (d->coeff_mode==1))
-			FUSED_LAUNCH(1, true);
-		else if (d->fregions.count)
-			FUSED_LAUNCH(2, true);
-		else if (d->coeff_mode==0)
-			FUSED_LAUNCH(0, false);
-		else if (d->coeff_mode==1)
-			FUSED_LAUNCH(1, false);
+#define FUSED_DIRECT(M, R) (ade ? launch_update_fused<M, R, true, false>(FUSED_ARGS(grid)) : launch_update_fused<M, R, false, false>(FUSED_ARGS(grid)))
+#define FUSED_LIST(M, R, G, L) launch_update_fused<M, R, false, true>(FUSED_ARGS(G), L, d->fused_partition_gy, d->fused_partition_gz)
+		const bool partition=d->fused_branch_count && d->fused_exception_count && !ade;
+		if (partition)
+		{
+			const dim3 branch_grid(d->fused_branch_count,1,1), exception_grid(d->fused_exception_count,1,1);
+			if (timed) CUDA_KernelTimes::Begin(d->Stream());
+			if (d->coeff_mode==0) FUSED_LIST(0,false,branch_grid,d->fused_branch_tiles);
+			else if (d->coeff_mode==1) FUSED_LIST(1,false,branch_grid,d->fused_branch_tiles);
+			else FUSED_LIST(2,false,branch_grid,d->fused_branch_tiles);
+			if (timed) CUDA_KernelTimes::End(d->Stream(),"update_fused_branch_free");
+			if (timed) CUDA_KernelTimes::Begin(d->Stream());
+			if (d->coeff_mode==0) FUSED_LIST(0,true,exception_grid,d->fused_exception_tiles);
+			else if (d->coeff_mode==1) FUSED_LIST(1,true,exception_grid,d->fused_exception_tiles);
+			else FUSED_LIST(2,true,exception_grid,d->fused_exception_tiles);
+			if (timed) CUDA_KernelTimes::End(d->Stream(),"update_fused_exceptional");
+		}
 		else
-			FUSED_LAUNCH(2, false);
-#undef FUSED_LAUNCH
+		{
+			if (timed) CUDA_KernelTimes::Begin(d->Stream());
+			if (!specialize)
+				FUSED_DIRECT(3, true);
+		// with the UPML regions in the kernel: specialized on the coefficient mode as well
+			else if (d->fregions.count && (d->coeff_mode==0)) FUSED_DIRECT(0, true);
+			else if (d->fregions.count && (d->coeff_mode==1)) FUSED_DIRECT(1, true);
+			else if (d->fregions.count) FUSED_DIRECT(2, true);
+			else if (d->coeff_mode==0) FUSED_DIRECT(0, false);
+			else if (d->coeff_mode==1) FUSED_DIRECT(1, false);
+			else FUSED_DIRECT(2, false);
+			if (timed) CUDA_KernelTimes::End(d->Stream(), "update_fused");
+		}
+#undef FUSED_LIST
+#undef FUSED_DIRECT
 #undef FUSED_ARGS
 		d->CheckLaunch("update_fused");
-		if (timed)
-			CUDA_KernelTimes::End(d->Stream(), "update_fused");
 		// only the voltages: UpdateCurrents swaps the currents, once the fix-up has read the old ones
 		std::swap(d->volt, d->volt_next);
 		return;

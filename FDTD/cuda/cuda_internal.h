@@ -159,6 +159,9 @@ struct GPU_Backend_CUDA::Impl
 	CUDA_FusedRegions fregions;              //!< the UPML regions in the kernel (see CUDA_Ext_UPML::CanFuse())
 	std::vector<CUDA_ADECandidate> ade_candidates; //!< voltage ADE groups (see CUDA_ADECandidate)
 	CUDA_FusedADE fade;                      //!< the group applied in the fused kernel (count 0: none)
+	unsigned int *fused_branch_tiles, *fused_exception_tiles; //!< ordered launch-tile IDs for the partitioned fused step
+	unsigned int fused_branch_count, fused_exception_count;
+	unsigned int fused_partition_gy, fused_partition_gz;
 	CUDA_FixupEntry* fixup;                  //!< main nodes/components recomputed after the voltage extensions
 	unsigned int fixup_count;
 	//! Decide once whether the fused step is used, and prepare it
