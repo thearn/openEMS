@@ -16,11 +16,9 @@
 */
 
 #include <algorithm>
-#include <chrono>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
-#include <fstream>
 #include <map>
 #include <set>
 #include <iostream>
@@ -579,14 +577,6 @@ GPU_Backend_CUDA::Impl::Impl()
 	coeff_mode = 0;
 	index = NULL;
 	coeff = NULL;
-	coeff_table_bytes = 0;
-	coeff_policy_active = false;
-	coeff_policy_previous_limit = 0;
-	coeff_policy_limit_bytes = 0;
-	coeff_policy_window_bytes = 0;
-	coeff_policy_max_bytes = 0;
-	coeff_policy_max_window_bytes = 0;
-	coeff_policy_setup_s = 0;
 	energy = NULL;
 	energy_count = 0;
 	fused_step = -1;
@@ -615,7 +605,6 @@ GPU_Backend_CUDA::Impl::~Impl()
 		cudaStreamSynchronize(ctx->stream);
 		cudaStreamSynchronize(ctx->copy_stream);
 	}
-	DisableCoefficientPolicy();
 	FreeSnapshots();
 	cudaEventDestroy(snap_evaluated);
 	cudaEventDestroy(snap_done[0]);
@@ -624,90 +613,6 @@ GPU_Backend_CUDA::Impl::~Impl()
 		cudaFree(m_Allocations.at(n));
 	for (std::set<void*>::iterator it=m_Pinned.begin(); it!=m_Pinned.end(); ++it)
 		cudaHostUnregister(*it);
-}
-
-void GPU_Backend_CUDA::Impl::WriteCoefficientPolicyReport(const char* reset_status) const
-{
-	if (coeff_policy_report.empty())
-		return;
-	std::ofstream out(coeff_policy_report.c_str(), std::ios::out|std::ios::trunc);
-	if (!out)
-		return;
-	out << "{\n"
-	    << "  \"schema\": \"openems-cuda-persist-coefficients-v1\",\n"
-	    << "  \"selected\": " << (coeff_policy_active ? "true" : "false") << ",\n"
-	    << "  \"table_base\": \"" << static_cast<const void*>(coeff) << "\",\n"
-	    << "  \"requested_table_bytes\": " << coeff_table_bytes << ",\n"
-	    << "  \"applied_window_bytes\": " << coeff_policy_window_bytes << ",\n"
-	    << "  \"applied_limit_bytes\": " << coeff_policy_limit_bytes << ",\n"
-	    << "  \"previous_limit_bytes\": " << coeff_policy_previous_limit << ",\n"
-	    << "  \"persisting_l2_max_bytes\": " << coeff_policy_max_bytes << ",\n"
-	    << "  \"access_policy_max_window_bytes\": " << coeff_policy_max_window_bytes << ",\n"
-	    << "  \"setup_s\": " << coeff_policy_setup_s << ",\n"
-	    << "  \"reset_status\": \"" << reset_status << "\"\n"
-	    << "}\n";
-}
-
-void GPU_Backend_CUDA::Impl::EnableCoefficientPolicy()
-{
-	const char* enabled = getenv("OPENEMS_CUDA_PERSIST_COEFFICIENTS");
-	const char* report = getenv("OPENEMS_CUDA_PERSIST_COEFFICIENTS_REPORT");
-	if (report && *report)
-		coeff_policy_report = report;
-	if (!enabled || atoi(enabled)==0)
-		return;
-	if (!coeff || !coeff_table_bytes || coeff_mode==0)
-		throw std::runtime_error("GPU_Backend_CUDA: persisting-L2 policy requires compressed coefficients");
-	const std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
-	CUDA_Check(cudaDeviceGetAttribute(&coeff_policy_max_bytes, cudaDevAttrMaxPersistingL2CacheSize, ctx->device),
-	           "persisting-L2 maximum query");
-	CUDA_Check(cudaDeviceGetAttribute(&coeff_policy_max_window_bytes, cudaDevAttrMaxAccessPolicyWindowSize, ctx->device),
-	           "access-policy window maximum query");
-	if (coeff_policy_max_bytes<=0 || coeff_policy_max_window_bytes<=0)
-		throw std::runtime_error("GPU_Backend_CUDA: persisting-L2 access policy is unsupported");
-	coeff_policy_window_bytes = coeff_table_bytes;
-	coeff_policy_limit_bytes = (coeff_table_bytes+255u)&~(size_t)255u;
-	if (coeff_policy_limit_bytes > (size_t)coeff_policy_max_bytes*3/4)
-		throw std::runtime_error("GPU_Backend_CUDA: coefficient table exceeds 75% of persisting-L2 allowance");
-	if (coeff_policy_window_bytes > (size_t)coeff_policy_max_window_bytes)
-		throw std::runtime_error("GPU_Backend_CUDA: coefficient table exceeds the maximum access-policy window");
-	CUDA_Check(cudaDeviceGetLimit(&coeff_policy_previous_limit, cudaLimitPersistingL2CacheSize),
-	           "persisting-L2 previous limit query");
-	CUDA_Check(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, coeff_policy_limit_bytes),
-	           "persisting-L2 limit");
-	cudaStreamAttrValue attribute = {};
-	attribute.accessPolicyWindow.base_ptr = coeff;
-	attribute.accessPolicyWindow.num_bytes = coeff_policy_window_bytes;
-	attribute.accessPolicyWindow.hitRatio = 1.0;
-	attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
-	attribute.accessPolicyWindow.missProp = cudaAccessPropertyNormal;
-	const cudaError_t applied = cudaStreamSetAttribute(Stream(), cudaStreamAttributeAccessPolicyWindow, &attribute);
-	if (applied!=cudaSuccess)
-	{
-		cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, coeff_policy_previous_limit);
-		CUDA_Check(applied, "coefficient access-policy window");
-	}
-	coeff_policy_active = true;
-	coeff_policy_setup_s = std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
-	WriteCoefficientPolicyReport("pending");
-	std::cout << "GPU_Backend_CUDA: persisting-L2 coefficient window " << coeff_policy_window_bytes
-	          << " bytes (limit " << coeff_policy_limit_bytes << " bytes)" << std::endl;
-}
-
-void GPU_Backend_CUDA::Impl::DisableCoefficientPolicy()
-{
-	if (!coeff_policy_active)
-		return;
-	cudaStreamAttrValue attribute = {};
-	attribute.accessPolicyWindow.base_ptr = NULL;
-	attribute.accessPolicyWindow.num_bytes = 0;
-	attribute.accessPolicyWindow.hitRatio = 0.0;
-	attribute.accessPolicyWindow.hitProp = cudaAccessPropertyNormal;
-	attribute.accessPolicyWindow.missProp = cudaAccessPropertyNormal;
-	const cudaError_t reset = cudaStreamSetAttribute(Stream(), cudaStreamAttributeAccessPolicyWindow, &attribute);
-	const cudaError_t limit = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, coeff_policy_previous_limit);
-	WriteCoefficientPolicyReport((reset==cudaSuccess && limit==cudaSuccess) ? "reset" : "reset_failed");
-	coeff_policy_active = false;
 }
 
 bool GPU_Backend_CUDA::Impl::DecideFusedStep()
@@ -978,7 +883,6 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 	CUDA_Check(cudaMemcpyAsync(volt_next, volt, 3*numCells*sizeof(float), cudaMemcpyDeviceToDevice, Stream()), "fused step buffers");
 	CUDA_Check(cudaMemcpyAsync(curr_next, curr, 3*numCells*sizeof(float), cudaMemcpyDeviceToDevice, Stream()), "fused step buffers");
 	Flush();
-	EnableCoefficientPolicy();
 	fused_step = 1;
 	std::cout << "GPU_Backend_CUDA: fused voltage and current updates";
 	if (fregions.count)
@@ -1170,7 +1074,6 @@ bool GPU_Backend_CUDA::Init(const Operator* op)
 		d->coeff_mode = sets.mode;
 		d->index = d->AllocIndex(sets);
 		d->coeff = d->Alloc<float>(sets.table.size(), sets.table.data());
-		d->coeff_table_bytes = sets.table.size()*sizeof(float);
 		std::cout << "GPU_Backend_CUDA: " << sets.count << " distinct coefficient sets, compressed update coefficients ("
 		          << (sets.mode==1 ? 16 : 32) << " bit index)" << std::endl;
 		if (!d->opportunity_report.empty() && !d->palette_benchmark.empty())

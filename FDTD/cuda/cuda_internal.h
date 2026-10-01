@@ -136,18 +136,6 @@ struct GPU_Backend_CUDA::Impl
 	float *vv, *vi, *ii, *iv;
 	void* index;
 	float* coeff;
-	size_t coeff_table_bytes;                 //!< compressed coefficient table covered by the optional persisting-L2 window
-	bool coeff_policy_active;
-	size_t coeff_policy_previous_limit;
-	size_t coeff_policy_limit_bytes;
-	size_t coeff_policy_window_bytes;
-	int coeff_policy_max_bytes;
-	int coeff_policy_max_window_bytes;
-	double coeff_policy_setup_s;
-	std::string coeff_policy_report;
-	void EnableCoefficientPolicy();
-	void DisableCoefficientPolicy();
-	void WriteCoefficientPolicyReport(const char* reset_status) const;
 	std::string opportunity_report;          //!< setup-only census path; empty in production
 	GPU_CoeffSets opportunity_coefficients;  //!< exact host metadata retained only for that census
 	std::string palette_benchmark;           //!< setup-only local-palette benchmark path; empty in production
