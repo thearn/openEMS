@@ -864,6 +864,18 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 		GPU_WriteOpportunityReport(census);
 		std::cout << "GPU_Backend_CUDA: wrote opportunity report " << opportunity_report << std::endl;
 	}
+	if (!palette_benchmark.empty())
+	{
+		CUDA_PaletteBenchmarkInput benchmark;
+		benchmark.path=palette_benchmark;
+		benchmark.nx=dim.nx;benchmark.ny=dim.ny;benchmark.nz=dim.nz;
+		benchmark.xc=getenv("OPENEMS_CUDA_FUSED_XC") ? std::max(1,atoi(getenv("OPENEMS_CUDA_FUSED_XC"))) : FUSED_XC;
+		benchmark.global_index=index;benchmark.global_table=coeff;
+		std::swap(benchmark.coefficients,palette_coefficients);
+		benchmark.stream=Stream();
+		CUDA_RunPaletteBenchmark(benchmark);
+		std::cout << "GPU_Backend_CUDA: wrote palette benchmark " << palette_benchmark << std::endl;
+	}
 
 	// both buffers start with the current fields
 	volt_next = Alloc<float>(3*numCells);
@@ -1005,6 +1017,9 @@ bool GPU_Backend_CUDA::Init(const Operator* op)
 	const char* opportunity_report = getenv("OPENEMS_CUDA_OPPORTUNITY_REPORT");
 	if (opportunity_report && *opportunity_report)
 		d->opportunity_report = opportunity_report;
+	const char* palette_benchmark = getenv("OPENEMS_CUDA_PALETTE_BENCHMARK");
+	if (palette_benchmark && *palette_benchmark)
+		d->palette_benchmark = palette_benchmark;
 	unsigned int numLines[3];
 	for (int n=0; n<3; ++n)
 		numLines[n] = op->GetNumberOfLines(n, true);
@@ -1061,8 +1076,15 @@ bool GPU_Backend_CUDA::Init(const Operator* op)
 		d->coeff = d->Alloc<float>(sets.table.size(), sets.table.data());
 		std::cout << "GPU_Backend_CUDA: " << sets.count << " distinct coefficient sets, compressed update coefficients ("
 		          << (sets.mode==1 ? 16 : 32) << " bit index)" << std::endl;
-		if (!d->opportunity_report.empty())
+		if (!d->opportunity_report.empty() && !d->palette_benchmark.empty())
+		{
+			d->opportunity_coefficients=sets;
+			std::swap(d->palette_coefficients,sets);
+		}
+		else if (!d->opportunity_report.empty())
 			std::swap(d->opportunity_coefficients,sets);
+		else if (!d->palette_benchmark.empty())
+			std::swap(d->palette_coefficients,sets);
 		return true;
 	}
 

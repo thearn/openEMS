@@ -32,6 +32,7 @@
 #include "gpu_backend_cuda.h"
 #include "FDTD/gpu_coeff_sets.h"
 #include "cuda_opportunity_report.h"
+#include "cuda_palette_benchmark.h"
 
 //! Grid size (number of mesh lines) as passed to the kernels
 struct CUDA_GridDim
@@ -137,6 +138,8 @@ struct GPU_Backend_CUDA::Impl
 	float* coeff;
 	std::string opportunity_report;          //!< setup-only census path; empty in production
 	GPU_CoeffSets opportunity_coefficients;  //!< exact host metadata retained only for that census
+	std::string palette_benchmark;           //!< setup-only local-palette benchmark path; empty in production
+	GPU_CoeffSets palette_coefficients;      //!< exact host metadata retained only for that benchmark
 
 	//! The main updates cover the nodes in [main_start, main_stop), the fused UPML kernels the others (see cuda_ext_upml.cu)
 	CUDA_GridDim main_start, main_stop;
