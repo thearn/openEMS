@@ -15,8 +15,8 @@
 #include <cstring>
 #include <fstream>
 #include <iomanip>
-#include <map>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 namespace
@@ -107,6 +107,16 @@ uint64_t hash64(const std::vector<uint32_t>& v)
 	for (uint32_t x:v) for (unsigned int k=0;k<4;++k) {h^=(x>>(8*k))&255;h*=1099511628211ull;}
 	return h;
 }
+
+struct VectorHash
+{
+	size_t operator()(const std::vector<uint32_t>& values) const
+	{
+		size_t h=(size_t)1469598103934665603ull;
+		for(uint32_t value:values)h=(h^value)*(size_t)1099511628211ull;
+		return h;
+	}
+};
 }
 
 void CUDA_RunPaletteBenchmark(const CUDA_PaletteBenchmarkInput& in)
@@ -121,21 +131,27 @@ void CUDA_RunPaletteBenchmark(const CUDA_PaletteBenchmarkInput& in)
 	std::vector<TileMeta> metas; metas.reserve(tiles);
 	std::vector<unsigned char> indices;
 	std::vector<float> table;
-	std::map<std::vector<uint32_t>,uint32_t> dictionaries;
+	std::unordered_map<std::vector<uint32_t>,uint32_t,VectorHash> dictionaries;
+	std::vector<uint32_t> marks(in.coefficients.count,0),local_ids(in.coefficients.count),dict;
+	uint32_t generation=0;
 	size_t one_tiles=0,two_tiles=0,logical_lookups=0,local_index_reads=0,index_padding=0,dictionary_id_entries=0;
 	for (unsigned int bx=0;bx<gx;++bx) for (unsigned int by=0;by<gy;++by) for (unsigned int bz=0;bz<gz;++bz)
 	{
 		const unsigned int x0=bx*in.xc,y0=by*TY,z0=bz*TZ;
 		const unsigned int fx=std::min(in.xc+1,in.nx-x0),fy=std::min(TY+1,in.ny-y0),fz=std::min(TZ+1,in.nz-z0);
-		std::vector<uint32_t> dict;
+		if(++generation==0){std::fill(marks.begin(),marks.end(),0);generation=1;}
+		dict.clear();
 		for(unsigned int x=0;x<fx;++x)for(unsigned int y=0;y<fy;++y)for(unsigned int z=0;z<fz;++z)
-			dict.push_back(in.coefficients.index[((size_t)(x0+x)*in.ny+y0+y)*in.nz+z0+z]);
-		std::sort(dict.begin(),dict.end());dict.erase(std::unique(dict.begin(),dict.end()),dict.end());
+		{
+			const uint32_t set=in.coefficients.index[((size_t)(x0+x)*in.ny+y0+y)*in.nz+z0+z];
+			if(marks[set]!=generation){marks[set]=generation;dict.push_back(set);}
+		}
+		std::sort(dict.begin(),dict.end());
 		dictionary_id_entries+=dict.size();
 		const unsigned int width=dict.size()<=256?1:2;
 		if(width==1)++one_tiles;else ++two_tiles;
 		if(width==2 && (indices.size()&1)){indices.push_back(0);++index_padding;}
-		std::map<std::vector<uint32_t>,uint32_t>::iterator found=dictionaries.find(dict);
+		std::unordered_map<std::vector<uint32_t>,uint32_t,VectorHash>::iterator found=dictionaries.find(dict);
 		uint32_t dict_offset;
 		if(found==dictionaries.end())
 		{
@@ -144,10 +160,11 @@ void CUDA_RunPaletteBenchmark(const CUDA_PaletteBenchmarkInput& in)
 		}else dict_offset=found->second;
 		TileMeta m={(uint32_t)indices.size(),dict_offset,(uint16_t)fx,(uint16_t)fy,(uint16_t)fz,(uint8_t)width,0};
 		metas.push_back(m);
+		for(uint32_t local=0;local<dict.size();++local)local_ids[dict[local]]=local;
 		for(unsigned int x=0;x<fx;++x)for(unsigned int y=0;y<fy;++y)for(unsigned int z=0;z<fz;++z)
 		{
 			const uint32_t set=in.coefficients.index[((size_t)(x0+x)*in.ny+y0+y)*in.nz+z0+z];
-			const uint32_t local=std::lower_bound(dict.begin(),dict.end(),set)-dict.begin();
+			const uint32_t local=local_ids[set];
 			if(width==1)indices.push_back((unsigned char)local);
 			else {indices.push_back(local&255);indices.push_back(local>>8);}
 		}
