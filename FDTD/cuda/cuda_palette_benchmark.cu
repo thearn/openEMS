@@ -8,28 +8,19 @@
 */
 
 #include "cuda_palette_benchmark.h"
+#include "cuda_local_palette.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <stdexcept>
-#include <unordered_map>
 #include <vector>
 
 namespace
 {
 const unsigned int TY=7, TZ=31;
-
-struct alignas(16) TileMeta
-{
-	uint32_t index_offset, dictionary_offset;
-	uint16_t nx, ny, nz;
-	uint8_t width, pad;
-};
-static_assert(sizeof(TileMeta)==16,"palette tile metadata must be fully costed");
 
 void check(cudaError_t e, const char* what)
 {
@@ -65,7 +56,7 @@ __device__ __forceinline__ uint32_t mix_coefficients(const float* table, unsigne
 
 template<bool LOCAL>
 __global__ void palette_decode(const void* global_index, const float* global_table, unsigned int global_mode,
-	const unsigned char* local_index, const float* local_table, const TileMeta* meta,
+	const unsigned char* local_index, const float* local_table, const CUDA_PaletteTile* meta,
 	unsigned int nx, unsigned int ny, unsigned int nz, unsigned int xc,
 	unsigned int gy, unsigned int gz, uint32_t* output)
 {
@@ -74,7 +65,7 @@ __global__ void palette_decode(const void* global_index, const float* global_tab
 	const unsigned int x0=bx*xc, y0=by*TY, z0=bz*TZ;
 	const unsigned int owned_x=min(xc,nx-x0), owned_y=min(TY,ny-y0), owned_z=min(TZ,nz-z0);
 	const unsigned int ly=threadIdx.y, lz=threadIdx.x;
-	const TileMeta m=LOCAL?meta[tile]:TileMeta{0,0,(uint16_t)min(owned_x+1,nx-x0),
+	const CUDA_PaletteTile m=LOCAL?meta[tile]:CUDA_PaletteTile{0,0,(uint16_t)min(owned_x+1,nx-x0),
 		(uint16_t)min(owned_y+1,ny-y0),(uint16_t)min(owned_z+1,nz-z0),0,0};
 	uint32_t h=0x811c9dc5u^(tile*257u+ly*32u+lz);
 	auto consume = [&](unsigned int lx)
@@ -108,15 +99,6 @@ uint64_t hash64(const std::vector<uint32_t>& v)
 	return h;
 }
 
-struct VectorHash
-{
-	size_t operator()(const std::vector<uint32_t>& values) const
-	{
-		size_t h=(size_t)1469598103934665603ull;
-		for(uint32_t value:values)h=(h^value)*(size_t)1099511628211ull;
-		return h;
-	}
-};
 }
 
 void CUDA_RunPaletteBenchmark(const CUDA_PaletteBenchmarkInput& in)
@@ -125,78 +107,16 @@ void CUDA_RunPaletteBenchmark(const CUDA_PaletteBenchmarkInput& in)
 	    (in.coefficients.mode!=1 && in.coefficients.mode!=2) ||
 	    in.coefficients.index.size()!=(size_t)in.nx*in.ny*in.nz || in.coefficients.table.size()!=12*in.coefficients.count)
 		throw std::runtime_error("invalid CUDA palette benchmark input");
-	const std::chrono::steady_clock::time_point build_start=std::chrono::steady_clock::now();
-	const unsigned int gx=(in.nx+in.xc-1)/in.xc, gy=(in.ny+TY-1)/TY, gz=(in.nz+TZ-1)/TZ;
-	const size_t tiles=(size_t)gx*gy*gz;
-	std::vector<TileMeta> metas; metas.reserve(tiles);
-	std::vector<unsigned char> indices;
-	std::vector<float> table;
-	std::unordered_map<std::vector<uint32_t>,uint32_t,VectorHash> dictionaries;
-	std::vector<uint32_t> marks(in.coefficients.count,0),local_ids(in.coefficients.count),dict;
-	uint32_t generation=0;
-	size_t one_tiles=0,two_tiles=0,logical_lookups=0,local_index_reads=0,index_padding=0,dictionary_id_entries=0;
-	for (unsigned int bx=0;bx<gx;++bx) for (unsigned int by=0;by<gy;++by) for (unsigned int bz=0;bz<gz;++bz)
-	{
-		const unsigned int x0=bx*in.xc,y0=by*TY,z0=bz*TZ;
-		const unsigned int fx=std::min(in.xc+1,in.nx-x0),fy=std::min(TY+1,in.ny-y0),fz=std::min(TZ+1,in.nz-z0);
-		if(++generation==0){std::fill(marks.begin(),marks.end(),0);generation=1;}
-		dict.clear();
-		for(unsigned int x=0;x<fx;++x)for(unsigned int y=0;y<fy;++y)for(unsigned int z=0;z<fz;++z)
-		{
-			const uint32_t set=in.coefficients.index[((size_t)(x0+x)*in.ny+y0+y)*in.nz+z0+z];
-			if(marks[set]!=generation){marks[set]=generation;dict.push_back(set);}
-		}
-		std::sort(dict.begin(),dict.end());
-		dictionary_id_entries+=dict.size();
-		const unsigned int width=dict.size()<=256?1:2;
-		if(width==1)++one_tiles;else ++two_tiles;
-		if(width==2 && (indices.size()&1)){indices.push_back(0);++index_padding;}
-		std::unordered_map<std::vector<uint32_t>,uint32_t,VectorHash>::iterator found=dictionaries.find(dict);
-		uint32_t dict_offset;
-		if(found==dictionaries.end())
-		{
-			dict_offset=table.size()/12;dictionaries.insert(std::make_pair(dict,dict_offset));
-			for(uint32_t set:dict) table.insert(table.end(),in.coefficients.table.begin()+12*set,in.coefficients.table.begin()+12*(set+1));
-		}else dict_offset=found->second;
-		TileMeta m={(uint32_t)indices.size(),dict_offset,(uint16_t)fx,(uint16_t)fy,(uint16_t)fz,(uint8_t)width,0};
-		metas.push_back(m);
-		for(uint32_t local=0;local<dict.size();++local)local_ids[dict[local]]=local;
-		for(unsigned int x=0;x<fx;++x)for(unsigned int y=0;y<fy;++y)for(unsigned int z=0;z<fz;++z)
-		{
-			const uint32_t set=in.coefficients.index[((size_t)(x0+x)*in.ny+y0+y)*in.nz+z0+z];
-			const uint32_t local=local_ids[set];
-			if(width==1)indices.push_back((unsigned char)local);
-			else {indices.push_back(local&255);indices.push_back(local>>8);}
-		}
-		const unsigned int ox=std::min(in.xc,in.nx-x0),oy=std::min(TY,in.ny-y0),oz=std::min(TZ,in.nz-z0);
-		logical_lookups+=(size_t)fx*fy*fz;local_index_reads+=(size_t)fx*fy*fz*width;
-		for(unsigned int x=0;x<ox && x0+x+1<in.nx;++x)
-		{
-			const size_t current=(size_t)std::min(oy,in.ny-y0-1)*std::min(oz,in.nz-z0-1);
-			logical_lookups+=current;local_index_reads+=current*width;
-		}
-	}
-	const std::chrono::steady_clock::time_point encoding_end=std::chrono::steady_clock::now();
-	// Exhaustive host decode, including every clipped halo entry.
-	for(size_t tile=0;tile<metas.size();++tile)
-	{
-		const TileMeta& m=metas[tile];const unsigned int bz=tile%gz,by=(tile/gz)%gy,bx=tile/(gz*gy);
-		for(unsigned int x=0;x<m.nx;++x)for(unsigned int y=0;y<m.ny;++y)for(unsigned int z=0;z<m.nz;++z)
-		{
-			const size_t local_flat=((size_t)x*m.ny+y)*m.nz+z;
-			const size_t q=m.index_offset+local_flat*m.width;
-			const unsigned int local=m.width==1?indices[q]:(unsigned int)indices[q]|((unsigned int)indices[q+1]<<8);
-			const uint32_t global=in.coefficients.index[((size_t)(bx*in.xc+x)*in.ny+by*TY+y)*in.nz+bz*TZ+z];
-			if(m.dictionary_offset+local>=table.size()/12 || std::memcmp(&table[12*(m.dictionary_offset+local)],&in.coefficients.table[12*global],12*sizeof(float)))
-				throw std::runtime_error("CUDA palette benchmark host decode mismatch");
-		}
-	}
-	const std::chrono::steady_clock::time_point verification_end=std::chrono::steady_clock::now();
-	const double encoding_s=std::chrono::duration<double>(encoding_end-build_start).count();
-	const double verification_s=std::chrono::duration<double>(verification_end-encoding_end).count();
-	const double construction_and_verification_s=std::chrono::duration<double>(verification_end-build_start).count();
+	CUDA_LocalPalette palette=CUDA_BuildLocalPalette(in.coefficients,in.nx,in.ny,in.nz,in.xc);
+	const auto verification_start=std::chrono::steady_clock::now();
+	CUDA_ValidateLocalPalette(palette,in.coefficients);
+	const double verification_s=std::chrono::duration<double>(std::chrono::steady_clock::now()-verification_start).count();
+	const double encoding_s=palette.encoding_s;
+	const double construction_and_verification_s=encoding_s+verification_s;
+	const unsigned int gy=palette.gy,gz=palette.gz;
+	const size_t tiles=palette.meta.size();
 	DeviceBuffers dev;const std::chrono::steady_clock::time_point upload_start=std::chrono::steady_clock::now();
-	TileMeta* dmeta=dev.copy(metas,in.stream);unsigned char* dindex=dev.copy(indices,in.stream);float* dtable=dev.copy(table,in.stream);
+	CUDA_PaletteTile* dmeta=dev.copy(palette.meta,in.stream);unsigned char* dindex=dev.copy(palette.index,in.stream);float* dtable=dev.copy(palette.table,in.stream);
 	const size_t outputs=tiles*256;uint32_t* dout=dev.alloc<uint32_t>(outputs);
 	check(cudaStreamSynchronize(in.stream),"encoding upload");
 	const double upload_s=std::chrono::duration<double>(std::chrono::steady_clock::now()-upload_start).count();
@@ -246,17 +166,17 @@ void CUDA_RunPaletteBenchmark(const CUDA_PaletteBenchmarkInput& in)
 	const float pmad=median(pair_deviation);
 	const uint64_t cells=(uint64_t)in.nx*in.ny*in.nz;
 	const uint64_t global_index_bytes=cells*(in.coefficients.mode==1?2:4),global_table_bytes=in.coefficients.table.size()*sizeof(float);
-	const uint64_t local_bytes=indices.size()+table.size()*sizeof(float)+metas.size()*sizeof(TileMeta);
+	const uint64_t local_bytes=palette.bytes();
 	const uint64_t host_payload_bytes=in.coefficients.index.capacity()*sizeof(uint32_t)+in.coefficients.table.capacity()*sizeof(float)+
-		indices.capacity()+table.capacity()*sizeof(float)+metas.capacity()*sizeof(TileMeta)+dictionary_id_entries*sizeof(uint32_t);
+		palette.index.capacity()+palette.table.capacity()*sizeof(float)+palette.meta.capacity()*sizeof(CUDA_PaletteTile)+palette.dictionary_id_entries*sizeof(uint32_t);
 	std::ofstream out(in.path.c_str(),std::ios::out|std::ios::trunc);if(!out)throw std::runtime_error("cannot write CUDA palette report");
 	out<<std::setprecision(10)<<"{\n  \"schema\":1,\n  \"dimensions\":{\"x\":"<<in.nx<<",\"y\":"<<in.ny<<",\"z\":"<<in.nz<<"},\n"
-	   <<"  \"tiles\":"<<tiles<<",\"one_byte_tiles\":"<<one_tiles<<",\"two_byte_tiles\":"<<two_tiles<<",\"shared_dictionaries\":"<<dictionaries.size()<<",\n"
-	   <<"  \"logical_lookups_per_launch\":"<<logical_lookups<<",\"encoding_construction_s\":"<<encoding_s<<",\"host_verification_s\":"<<verification_s
+	   <<"  \"tiles\":"<<tiles<<",\"one_byte_tiles\":"<<palette.one_byte_tiles<<",\"two_byte_tiles\":"<<palette.two_byte_tiles<<",\"shared_dictionaries\":"<<palette.shared_dictionaries<<",\n"
+	   <<"  \"logical_lookups_per_launch\":"<<palette.logical_lookups<<",\"encoding_construction_s\":"<<encoding_s<<",\"host_verification_s\":"<<verification_s
 	   <<",\"construction_and_verification_s\":"<<construction_and_verification_s<<",\"upload_s\":"<<upload_s<<",\n"
 	   <<"  \"global\":{\"index_bytes\":"<<global_index_bytes<<",\"table_bytes\":"<<global_table_bytes<<",\"total_bytes\":"<<global_index_bytes+global_table_bytes<<"},\n"
-	   <<"  \"local\":{\"index_bytes\":"<<indices.size()<<",\"index_padding_bytes\":"<<index_padding<<",\"table_bytes\":"<<table.size()*sizeof(float)<<",\"metadata_bytes\":"<<metas.size()*sizeof(TileMeta)<<",\"total_bytes\":"<<local_bytes<<"},\n"
-	   <<"  \"calculated_bytes_per_launch\":{\"coefficient_values\":"<<logical_lookups*48<<",\"global_indices\":"<<logical_lookups*(in.coefficients.mode==1?2:4)<<",\"local_indices\":"<<local_index_reads<<",\"local_metadata_requests\":"<<tiles*256*sizeof(TileMeta)<<"},\n"
+	   <<"  \"local\":{\"index_bytes\":"<<palette.index.size()<<",\"index_padding_bytes\":"<<palette.index_padding<<",\"table_bytes\":"<<palette.table.size()*sizeof(float)<<",\"metadata_bytes\":"<<palette.meta.size()*sizeof(CUDA_PaletteTile)<<",\"total_bytes\":"<<local_bytes<<"},\n"
+	   <<"  \"calculated_bytes_per_launch\":{\"coefficient_values\":"<<palette.logical_lookups*48<<",\"global_indices\":"<<palette.logical_lookups*(in.coefficients.mode==1?2:4)<<",\"local_indices\":"<<palette.local_index_reads<<",\"local_metadata_requests\":"<<tiles*256*sizeof(CUDA_PaletteTile)<<"},\n"
 	   <<"  \"temporary_device_bytes\":"<<local_bytes+outputs*sizeof(uint32_t)<<",\"host_payload_bytes\":"<<host_payload_bytes<<",\"output_digest_fnv64\":\""<<std::hex<<hash64(control)<<std::dec<<"\",\n"
 	   <<"  \"benchmark\":{\"interval_target_ms\":250,\"calibration_target_ms\":300,\"repeats\":"<<repeats<<",\"control_probe_ms\":"<<control_probe<<",\"candidate_probe_ms\":"<<candidate_probe
 	   <<",\"control_calibration_ms\":"<<control_calibration<<",\"candidate_calibration_ms\":"<<candidate_calibration<<",\"control_ms\":[";
@@ -265,7 +185,7 @@ void CUDA_RunPaletteBenchmark(const CUDA_PaletteBenchmarkInput& in)
 	for(size_t i=0;i<pair_change.size();++i){if(i)out<<',';out<<pair_change[i];}out<<"],\"control_median_ms\":"<<gm<<",\"candidate_median_ms\":"<<lm
 	   <<",\"change_percent\":"<<100*(lm/gm-1)<<",\"paired_change_range_percent\":["<<*std::min_element(pair_change.begin(),pair_change.end())<<','<<*std::max_element(pair_change.begin(),pair_change.end())
 	   <<"],\"control_mad_ms\":"<<gmad<<",\"candidate_mad_ms\":"<<lmad<<",\"paired_change_mad_percent\":"<<pmad
-	   <<",\"control_effective_lookups_per_s\":"<<(double)logical_lookups*repeats*1000/gm<<",\"candidate_effective_lookups_per_s\":"<<(double)logical_lookups*repeats*1000/lm<<"},\n"
+	   <<",\"control_effective_lookups_per_s\":"<<(double)palette.logical_lookups*repeats*1000/gm<<",\"candidate_effective_lookups_per_s\":"<<(double)palette.logical_lookups*repeats*1000/lm<<"},\n"
 	   <<"  \"checks\":{\"host_decode_exact\":true,\"device_digest_exact\":true}\n}\n";
 	if(!out)throw std::runtime_error("failed writing CUDA palette report");
 }

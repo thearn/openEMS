@@ -33,6 +33,7 @@
 #include "FDTD/gpu_coeff_sets.h"
 #include "cuda_opportunity_report.h"
 #include "cuda_palette_benchmark.h"
+#include "cuda_local_palette.h"
 
 //! Grid size (number of mesh lines) as passed to the kernels
 struct CUDA_GridDim
@@ -52,6 +53,14 @@ __device__ __forceinline__ unsigned int nijk(const CUDA_GridDim& N, unsigned int
 //! of direction n. Mode 0: ca/cb are the full arrays, else ca is the table of sets.
 struct CUDA_MainCoeff { const float* a; const float* b; unsigned int s; };
 
+struct CUDA_LocalPaletteView
+{
+	const unsigned char* index;
+	const float* table;
+	const CUDA_PaletteTile* meta;
+	unsigned int gx, gy, gz, xc;
+};
+
 __device__ __forceinline__ CUDA_MainCoeff main_coeff(const void* index, const float* ca, const float* cb,
                                                      unsigned int mode, unsigned int sn, unsigned int i, unsigned int set_offset)
 {
@@ -64,6 +73,26 @@ __device__ __forceinline__ CUDA_MainCoeff main_coeff(const void* index, const fl
 	const unsigned int set = (mode==1) ? (unsigned int)((const unsigned short*)index)[i] : ((const unsigned int*)index)[i];
 	c.a = ca + 12*set + set_offset; c.b = c.a + 3; c.s = 1;
 	return c;
+}
+
+__device__ __forceinline__ CUDA_MainCoeff palette_coeff(const CUDA_LocalPaletteView& p,
+	unsigned int tile, unsigned int lx, unsigned int ly, unsigned int lz, unsigned int set_offset)
+{
+	const CUDA_PaletteTile m=p.meta[tile];
+	const size_t q=(size_t)m.index_offset+(((size_t)lx*m.ny+ly)*m.nz+lz)*m.width;
+	const unsigned int local=m.width==1 ? p.index[q] : ((const unsigned short*)p.index)[q/2];
+	CUDA_MainCoeff c;
+	c.a=p.table+12*(m.dictionary_offset+local)+set_offset;
+	c.b=c.a+3;c.s=1;
+	return c;
+}
+
+__device__ __forceinline__ CUDA_MainCoeff palette_coeff_xyz(const CUDA_LocalPaletteView& p,
+	unsigned int x, unsigned int y, unsigned int z, unsigned int set_offset)
+{
+	const unsigned int bx=x/p.xc,by=y/7,bz=z/31;
+	const unsigned int tile=(bx*p.gy+by)*p.gz+bz;
+	return palette_coeff(p,tile,x-bx*p.xc,y-by*7,z-bz*31,set_offset);
 }
 
 #include "cuda_upml.cuh"
@@ -140,6 +169,11 @@ struct GPU_Backend_CUDA::Impl
 	GPU_CoeffSets opportunity_coefficients;  //!< exact host metadata retained only for that census
 	std::string palette_benchmark;           //!< setup-only local-palette benchmark path; empty in production
 	GPU_CoeffSets palette_coefficients;      //!< exact host metadata retained only for that benchmark
+	CUDA_LocalPalette local_palette_host;    //!< production candidate, retained until fused selection
+	CUDA_LocalPaletteView local_palette;     //!< device view after production candidate upload
+	bool local_palette_requested, local_palette_forced, local_palette_eligible, local_palette_active;
+	size_t local_palette_global_bytes;
+	std::string local_palette_report;
 
 	//! The main updates cover the nodes in [main_start, main_stop), the fused UPML kernels the others (see cuda_ext_upml.cu)
 	CUDA_GridDim main_start, main_stop;
@@ -221,6 +255,9 @@ struct GPU_Backend_CUDA::Impl
 		}
 		return Alloc<unsigned int>(sets.index.size(), sets.index.data());
 	}
+
+	//! Release an owned allocation early and remove it from destructor ownership.
+	void FreeAllocation(void* ptr);
 
 	//! No UPML regions updated by the main kernels (call after changing main_start/main_stop)
 	void ResetZSlabs();
