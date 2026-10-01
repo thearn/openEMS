@@ -154,7 +154,6 @@ protected:
 		A.index = d->index; A.mode = d->coeff_mode;
 		A.ca = d->coeff_mode ? d->coeff : full_a;
 		A.cb = d->coeff_mode ? d->coeff : full_b;
-		A.palette = d->local_palette; A.local_palette = d->local_palette_active;
 		return A;
 	}
 	float* Upload(const ArrayLib::ArrayNIJK<FDTD_FLOAT>& arr) {return d->Alloc<float>(arr.size(), arr.data());}
