@@ -16,13 +16,9 @@
 */
 
 #include <algorithm>
-#include <chrono>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
-#include <fstream>
-#include <iomanip>
 #include <map>
 #include <set>
 #include <iostream>
@@ -175,19 +171,16 @@ __global__ void update_currents(float* __restrict__ curr, const float* __restric
 // ---- fused step
 
 // the voltages of node (x,y,z), the same operations as update_voltages
-template<bool LOCAL>
 __device__ __forceinline__ void fused_volt(const float* __restrict__ volt, const float* __restrict__ curr,
                                            const void* index, const float* va, const float* vb, unsigned int mode,
-	                                           const CUDA_LocalPaletteView& P, unsigned int tile,
-	                                           const CUDA_GridDim& N, unsigned int x, unsigned int y, unsigned int z,
-	                                           unsigned int lx, unsigned int ly, unsigned int lz, float v[3])
+                                           const CUDA_GridDim& N, unsigned int x, unsigned int y, unsigned int z, float v[3])
 {
 	const unsigned int sn = N.nx*N.ny*N.nz;
 	const unsigned int i  = nijk(N, 0, x, y, z);
 	const unsigned int xm = (x>0) ? N.ny*N.nz : 0;
 	const unsigned int ym = (y>0) ? N.nz : 0;
 	const unsigned int zm = (z>0) ? 1 : 0;
-	const CUDA_MainCoeff C = LOCAL ? palette_coeff(P,tile,lx,ly,lz,0) : main_coeff(index, va, vb, mode, sn, i, 0);
+	const CUDA_MainCoeff C = main_coeff(index, va, vb, mode, sn, i, 0);
 	float t;
 	t  = volt[i] * C.a[0];
 	t += C.b[0] * (curr[2*sn+i] - curr[2*sn+i-ym] - curr[sn+i] + curr[sn+i-zm]);
@@ -244,11 +237,11 @@ __device__ __forceinline__ void fused_ade(const CUDA_FusedADE& A, const CUDA_Gri
 // second buffer, written by the node's own block; the current flux in place).
 // HAS_ADE: a voltage ADE group is corrected in the kernel (A.count>0). A compile-time parameter:
 // the unused check alone made the kernel about 18% slower on an A100 (sm_80).
-template<unsigned int MODE, bool HAS_REGIONS, bool HAS_ADE, bool LOCAL>
+template<unsigned int MODE, bool HAS_REGIONS, bool HAS_ADE>
 __global__ void __launch_bounds__(FUSED_TZ*FUSED_TY) update_fused(
 	const float* __restrict__ volt_in, const float* __restrict__ curr_in, float* volt_out, float* __restrict__ curr_out,
 	const void* index, const float* va, const float* vb, const float* ia, const float* ib, unsigned int mode,
-	CUDA_LocalPaletteView P, CUDA_GridDim N, CUDA_GridDim B, CUDA_GridDim E, CUDA_FusedRegions F, CUDA_FusedADE A, unsigned int xc)
+	CUDA_GridDim N, CUDA_GridDim B, CUDA_GridDim E, CUDA_FusedRegions F, CUDA_FusedADE A, unsigned int xc)
 {
 	__shared__ float sV[3][FUSED_TY][FUSED_TZ];
 	const unsigned int tz = threadIdx.x, ty = threadIdx.y;
@@ -261,7 +254,6 @@ __global__ void __launch_bounds__(FUSED_TZ*FUSED_TY) update_fused(
 	const bool in_grid = (z<N.nz) && (y<N.ny);
 	const unsigned int sn = N.nx*N.ny*N.nz;
 	const unsigned int coeff_mode = MODE<3 ? MODE : mode;
-	const unsigned int tile=(blockIdx.z*P.gy+blockIdx.y)*P.gz+blockIdx.x;
 
 	// the new voltages at x: computed on main nodes, else from the UPML regions (or unused)
 	auto volt_at = [&](unsigned int x, float v[3])
@@ -271,8 +263,7 @@ __global__ void __launch_bounds__(FUSED_TZ*FUSED_TY) update_fused(
 			const int r = HAS_REGIONS && F.count ? fused_region_of(F, x, y, z) : -1;
 			if (r<0)
 			{
-				fused_volt<LOCAL>(volt_in, curr_in, index, va, vb, coeff_mode, P, tile, N, x, y, z,
-				                  x-xs,ty,tz,v);
+				fused_volt(volt_in, curr_in, index, va, vb, coeff_mode, N, x, y, z, v);
 				if (HAS_ADE)
 					fused_ade(A, N, x, y, z, v);
 			}
@@ -318,7 +309,7 @@ __global__ void __launch_bounds__(FUSED_TZ*FUSED_TY) update_fused(
 			else if (update)
 			{
 				const unsigned int i = nijk(N, 0, x, y, z);
-				const CUDA_MainCoeff C = LOCAL ? palette_coeff(P,tile,x-xs,ty,tz,6) : main_coeff(index, ia, ib, coeff_mode, sn, i, 6);
+				const CUDA_MainCoeff C = main_coeff(index, ia, ib, coeff_mode, sn, i, 6);
 				float c;
 				//for x
 				c  = curr_in[i] * C.a[0];
@@ -341,14 +332,14 @@ __global__ void __launch_bounds__(FUSED_TZ*FUSED_TY) update_fused(
 	}
 }
 
-template<unsigned int MODE, bool HAS_REGIONS, bool HAS_ADE, bool LOCAL>
+template<unsigned int MODE, bool HAS_REGIONS, bool HAS_ADE>
 static void launch_update_fused(dim3 grid, dim3 block, cudaStream_t stream,
 	const float* volt_in, const float* curr_in, float* volt_out, float* curr_out,
 	const void* index, const float* va, const float* vb, const float* ia, const float* ib,
-	unsigned int mode, CUDA_LocalPaletteView P, CUDA_GridDim N, CUDA_GridDim B, CUDA_GridDim E, CUDA_FusedRegions F, CUDA_FusedADE A, unsigned int xc)
+	unsigned int mode, CUDA_GridDim N, CUDA_GridDim B, CUDA_GridDim E, CUDA_FusedRegions F, CUDA_FusedADE A, unsigned int xc)
 {
-	update_fused<MODE, HAS_REGIONS, HAS_ADE, LOCAL><<<grid, block, 0, stream>>>(
-		volt_in, curr_in, volt_out, curr_out, index, va, vb, ia, ib, mode, P, N, B, E, F, A, xc);
+	update_fused<MODE, HAS_REGIONS, HAS_ADE><<<grid, block, 0, stream>>>(
+		volt_in, curr_in, volt_out, curr_out, index, va, vb, ia, ib, mode, N, B, E, F, A, xc);
 }
 
 // the dumped values of a snapshot: entries [0, nv) from the voltages, [nv, n) from the currents
@@ -422,7 +413,7 @@ __global__ void field_dft(const float* __restrict__ f, const GPU_GatherEntry* __
 __global__ void update_currents_nodes(const float* __restrict__ curr_in, float* __restrict__ curr_out, const float* __restrict__ volt,
                                       const CUDA_FixupEntry* entries, unsigned int count,
                                       const void* index, const float* ia, const float* ib, unsigned int mode, CUDA_GridDim N,
-	                                  CUDA_FusedRegions F, CUDA_LocalPaletteView P, bool local_palette)
+                                      CUDA_FusedRegions F)
 {
 	const unsigned int k = blockIdx.x*blockDim.x + threadIdx.x;
 	if (k>=count)
@@ -446,8 +437,7 @@ __global__ void update_currents_nodes(const float* __restrict__ curr_in, float* 
 			return;
 		}
 	}
-	const unsigned int x=i/(N.ny*N.nz),y=(i/N.nz)%N.ny,z=i%N.nz;
-	const CUDA_MainCoeff C = local_palette ? palette_coeff_xyz(P,x,y,z,6) : main_coeff(index, ia, ib, mode, sn, i, 6);
+	const CUDA_MainCoeff C = main_coeff(index, ia, ib, mode, sn, i, 6);
 	float c;
 	if (mask&1)
 	{
@@ -587,9 +577,6 @@ GPU_Backend_CUDA::Impl::Impl()
 	coeff_mode = 0;
 	index = NULL;
 	coeff = NULL;
-	local_palette={NULL,NULL,NULL,0,0,0,0};
-	local_palette_requested=local_palette_forced=local_palette_eligible=local_palette_active=false;
-	local_palette_global_bytes=0;
 	energy = NULL;
 	energy_count = 0;
 	fused_step = -1;
@@ -609,17 +596,6 @@ GPU_Backend_CUDA::Impl::Impl()
 	CUDA_Check(cudaEventCreateWithFlags(&snap_evaluated, cudaEventDisableTiming), "cudaEventCreate");
 	CUDA_Check(cudaEventCreateWithFlags(&snap_done[0], cudaEventDisableTiming), "cudaEventCreate");
 	CUDA_Check(cudaEventCreateWithFlags(&snap_done[1], cudaEventDisableTiming), "cudaEventCreate");
-}
-
-void GPU_Backend_CUDA::Impl::FreeAllocation(void* ptr)
-{
-	if(!ptr)return;
-	Flush();
-	std::vector<void*>::iterator found=std::find(m_Allocations.begin(),m_Allocations.end(),ptr);
-	if(found==m_Allocations.end())
-		throw std::runtime_error("GPU_Backend_CUDA: allocation ownership mismatch");
-	CUDA_Check(cudaFree(ptr),"cudaFree");
-	m_Allocations.erase(found);
 }
 
 GPU_Backend_CUDA::Impl::~Impl()
@@ -646,14 +622,7 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 	fused_step = 0;
 	const char* env = getenv("OPENEMS_CUDA_FUSED_STEP");
 	if ((fused_blockers>0) || (env && (atoi(env)==0)))
-	{
-		local_palette_host=CUDA_LocalPalette();
 		return false;
-	}
-	const bool palette_full_grid=(fregions.count>0) ||
-		(main_start.nx==0 && main_start.ny==0 && main_start.nz==0 &&
-		 main_stop.nx==dim.nx && main_stop.ny==dim.ny && main_stop.nz==dim.nz);
-	const bool palette_candidate=local_palette_eligible && !local_palette_host.meta.empty() && palette_full_grid;
 
 	// The fused step needs a second set of fields (24 bytes per cell). An allocation that
 	// oversubscribes the device can succeed (e.g. WDDM paging to host memory under WSL) and then
@@ -662,10 +631,7 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 	// OPENEMS_CUDA_FUSED_STEP=1 forces the fused step.
 	size_t decision_free_bytes = 0, decision_total_bytes = 0;
 	const size_t decision_field_bytes = 2*3*(size_t)numCells*sizeof(float);
-	// A production palette is uploaded while the global representation is still
-	// live, then the latter is retired. Charge that transient overlap here.
-	const size_t palette_overlap_bytes=palette_candidate?local_palette_host.bytes():0;
-	const size_t decision_need = decision_field_bytes + fused_step_extra_bytes + palette_overlap_bytes;
+	const size_t decision_need = decision_field_bytes + fused_step_extra_bytes;
 	const char* reserve_env = getenv("OPENEMS_CUDA_MEMORY_RESERVE_MB");
 	const size_t decision_reserve = (size_t)(reserve_env ? atof(reserve_env) : 512.0)*1024*1024;
 	{
@@ -682,7 +648,6 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 			          << " MiB extension buffers)"
 			          << " and a " << decision_reserve/1048576 << " MiB reserve, " << decision_free_bytes/1048576 << " MiB of "
 			          << decision_total_bytes/1048576 << " MiB are free" << std::endl;
-			local_palette_host=CUDA_LocalPalette();
 			return false;
 		}
 	}
@@ -912,47 +877,6 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 		std::cout << "GPU_Backend_CUDA: wrote palette benchmark " << palette_benchmark << std::endl;
 	}
 
-	if(palette_candidate)
-	{
-		const std::chrono::steady_clock::time_point upload_start=std::chrono::steady_clock::now();
-		local_palette.index=Alloc<unsigned char>(local_palette_host.index.size(),local_palette_host.index.data());
-		local_palette.table=Alloc<float>(local_palette_host.table.size(),local_palette_host.table.data());
-		local_palette.meta=Alloc<CUDA_PaletteTile>(local_palette_host.meta.size(),local_palette_host.meta.data());
-		local_palette.gx=local_palette_host.gx;local_palette.gy=local_palette_host.gy;
-		local_palette.gz=local_palette_host.gz;local_palette.xc=local_palette_host.xc;
-		Flush();
-		const double upload_s=std::chrono::duration<double>(std::chrono::steady_clock::now()-upload_start).count();
-		const size_t local_bytes=local_palette_host.bytes();
-		const size_t tiles=local_palette_host.meta.size(),one=local_palette_host.one_byte_tiles,two=local_palette_host.two_byte_tiles;
-		const size_t dictionaries=local_palette_host.shared_dictionaries;
-		const double encoding_s=local_palette_host.encoding_s;
-		FreeAllocation(index);index=NULL;
-		FreeAllocation(coeff);coeff=NULL;
-		local_palette_active=true;
-		std::cout<<"GPU_Backend_CUDA: production local coefficient palette ("
-		         <<local_bytes/1048576.0<<" MiB, retired "<<local_palette_global_bytes/1048576.0<<" MiB global)"<<std::endl;
-		if(!local_palette_report.empty())
-		{
-			std::ofstream out(local_palette_report.c_str(),std::ios::out|std::ios::trunc);
-			if(!out)throw std::runtime_error("cannot write CUDA local-palette report");
-			out<<std::setprecision(10)<<"{\n  \"schema\":1,\"selected\":true,\"forced\":"<<(local_palette_forced?"true":"false")
-			   <<",\"dimensions\":{\"x\":"<<dim.nx<<",\"y\":"<<dim.ny<<",\"z\":"<<dim.nz<<"},\"tiles\":"<<tiles
-			   <<",\"one_byte_tiles\":"<<one<<",\"two_byte_tiles\":"<<two<<",\"shared_dictionaries\":"<<dictionaries
-			   <<",\"logical_lookups_per_launch\":"<<local_palette_host.logical_lookups
-			   <<",\"global_bytes\":"<<local_palette_global_bytes<<",\"local_bytes\":"<<local_bytes
-			   <<",\"local_index_bytes\":"<<local_palette_host.index.size()<<",\"local_table_bytes\":"<<local_palette_host.table.size()*sizeof(float)
-			   <<",\"local_metadata_bytes\":"<<local_palette_host.meta.size()*sizeof(CUDA_PaletteTile)
-			   <<",\"encoding_s\":"<<encoding_s<<",\"upload_s\":"<<upload_s
-			   <<",\"transient_overlap_bytes\":"<<palette_overlap_bytes<<",\"global_retired\":true"
-			   <<",\"decision_free_bytes\":"<<decision_free_bytes<<",\"decision_need_bytes\":"<<decision_need
-			   <<",\"decision_reserve_bytes\":"<<decision_reserve<<"\n}\n";
-			if(!out)throw std::runtime_error("failed writing CUDA local-palette report");
-		}
-		local_palette_host=CUDA_LocalPalette();
-	}
-	else
-		local_palette_host=CUDA_LocalPalette();
-
 	// both buffers start with the current fields
 	volt_next = Alloc<float>(3*numCells);
 	curr_next = Alloc<float>(3*numCells);
@@ -1096,16 +1020,6 @@ bool GPU_Backend_CUDA::Init(const Operator* op)
 	const char* palette_benchmark = getenv("OPENEMS_CUDA_PALETTE_BENCHMARK");
 	if (palette_benchmark && *palette_benchmark)
 		d->palette_benchmark = palette_benchmark;
-	const char* local_palette=getenv("OPENEMS_CUDA_LOCAL_PALETTE");
-	d->local_palette_requested=local_palette && *local_palette && strcmp(local_palette,"0")!=0;
-	d->local_palette_forced=d->local_palette_requested && strcmp(local_palette,"force")==0;
-	const char* local_palette_report=getenv("OPENEMS_CUDA_LOCAL_PALETTE_REPORT");
-	if(local_palette_report && *local_palette_report)d->local_palette_report=local_palette_report;
-	if(getenv("OPENEMS_CUDA_LOCAL_PALETTE_SELF_TEST") && atoi(getenv("OPENEMS_CUDA_LOCAL_PALETTE_SELF_TEST"))!=0)
-	{
-		CUDA_SelfTestLocalPalette();
-		std::cout<<"GPU_Backend_CUDA: local coefficient palette host self-test passed"<<std::endl;
-	}
 	unsigned int numLines[3];
 	for (int n=0; n<3; ++n)
 		numLines[n] = op->GetNumberOfLines(n, true);
@@ -1160,36 +1074,6 @@ bool GPU_Backend_CUDA::Init(const Operator* op)
 		d->coeff_mode = sets.mode;
 		d->index = d->AllocIndex(sets);
 		d->coeff = d->Alloc<float>(sets.table.size(), sets.table.data());
-		d->local_palette_global_bytes=d->numCells*(sets.mode==1?sizeof(unsigned short):sizeof(unsigned int))+sets.table.size()*sizeof(float);
-		if(d->local_palette_requested)
-		{
-			const unsigned int xc=getenv("OPENEMS_CUDA_FUSED_XC")?std::max(1,atoi(getenv("OPENEMS_CUDA_FUSED_XC"))):FUSED_XC;
-			d->local_palette_host=CUDA_BuildLocalPalette(sets,d->dim.nx,d->dim.ny,d->dim.nz,xc);
-			if(getenv("OPENEMS_CUDA_LOCAL_PALETTE_VALIDATE") && atoi(getenv("OPENEMS_CUDA_LOCAL_PALETTE_VALIDATE"))!=0)
-				CUDA_ValidateLocalPalette(d->local_palette_host,sets);
-			d->local_palette_eligible=d->local_palette_forced || 5*d->local_palette_host.bytes()<=4*d->local_palette_global_bytes;
-			std::cout<<"GPU_Backend_CUDA: local coefficient palette "
-			         <<(d->local_palette_eligible?"eligible":"not selected")<<" ("
-			         <<d->local_palette_host.bytes()/1048576.0<<" MiB local, "
-			         <<d->local_palette_global_bytes/1048576.0<<" MiB global, "
-			         <<std::setprecision(6)<<d->local_palette_host.encoding_s<<" s encoding)"<<std::endl;
-			if(!d->local_palette_eligible)
-			{
-				if(!d->local_palette_report.empty())
-				{
-					std::ofstream out(d->local_palette_report.c_str(),std::ios::out|std::ios::trunc);
-					if(!out)throw std::runtime_error("cannot write CUDA local-palette report");
-					out<<std::setprecision(10)<<"{\n  \"schema\":1,\"selected\":false,\"reason\":\"storage_saving_below_20_percent\""
-					   <<",\"dimensions\":{\"x\":"<<d->dim.nx<<",\"y\":"<<d->dim.ny<<",\"z\":"<<d->dim.nz<<"}"
-					   <<",\"tiles\":"<<d->local_palette_host.meta.size()<<",\"one_byte_tiles\":"<<d->local_palette_host.one_byte_tiles
-					   <<",\"two_byte_tiles\":"<<d->local_palette_host.two_byte_tiles<<",\"shared_dictionaries\":"<<d->local_palette_host.shared_dictionaries
-					   <<",\"global_bytes\":"<<d->local_palette_global_bytes<<",\"local_bytes\":"<<d->local_palette_host.bytes()
-					   <<",\"encoding_s\":"<<d->local_palette_host.encoding_s<<"\n}\n";
-					if(!out)throw std::runtime_error("failed writing CUDA local-palette report");
-				}
-				d->local_palette_host=CUDA_LocalPalette();
-			}
-		}
 		std::cout << "GPU_Backend_CUDA: " << sets.count << " distinct coefficient sets, compressed update coefficients ("
 		          << (sets.mode==1 ? 16 : 32) << " bit index)" << std::endl;
 		if (!d->opportunity_report.empty() && !d->palette_benchmark.empty())
@@ -1238,27 +1122,23 @@ void GPU_Backend_CUDA::UpdateVoltages()
 		const bool specialize = !(getenv("OPENEMS_CUDA_FUSED_SPECIALIZE") && atoi(getenv("OPENEMS_CUDA_FUSED_SPECIALIZE"))==0);
 		const bool ade = d->fade.count>0;
 #define FUSED_ARGS grid, block, d->Stream(), (const float*)d->volt, (const float*)d->curr, d->volt_next, d->curr_next, \
-		(const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->local_palette, d->dim, B, E, d->fregions, d->fade, xc
-#define FUSED_LAUNCH(M, R, L) (ade ? launch_update_fused<M, R, true, L>(FUSED_ARGS) : launch_update_fused<M, R, false, L>(FUSED_ARGS))
-		if(d->local_palette_active && d->fregions.count)
-			FUSED_LAUNCH(0,true,true);
-		else if(d->local_palette_active)
-			FUSED_LAUNCH(0,false,true);
-		else if (!specialize)
-			FUSED_LAUNCH(3, true, false);
+		(const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, d->fade, xc
+#define FUSED_LAUNCH(M, R) (ade ? launch_update_fused<M, R, true>(FUSED_ARGS) : launch_update_fused<M, R, false>(FUSED_ARGS))
+		if (!specialize)
+			FUSED_LAUNCH(3, true);
 		// with the UPML regions in the kernel: specialized on the coefficient mode as well
 		else if (d->fregions.count && (d->coeff_mode==0))
-			FUSED_LAUNCH(0, true, false);
+			FUSED_LAUNCH(0, true);
 		else if (d->fregions.count && (d->coeff_mode==1))
-			FUSED_LAUNCH(1, true, false);
+			FUSED_LAUNCH(1, true);
 		else if (d->fregions.count)
-			FUSED_LAUNCH(2, true, false);
+			FUSED_LAUNCH(2, true);
 		else if (d->coeff_mode==0)
-			FUSED_LAUNCH(0, false, false);
+			FUSED_LAUNCH(0, false);
 		else if (d->coeff_mode==1)
-			FUSED_LAUNCH(1, false, false);
+			FUSED_LAUNCH(1, false);
 		else
-			FUSED_LAUNCH(2, false, false);
+			FUSED_LAUNCH(2, false);
 #undef FUSED_LAUNCH
 #undef FUSED_ARGS
 		d->CheckLaunch("update_fused");
@@ -1284,8 +1164,7 @@ void GPU_Backend_CUDA::UpdateCurrents()
 		if (d->fixup_count)
 			CUDA_Launch(d, "update_currents_nodes", update_currents_nodes, d->fixup_count, 1, 1, (const float*)d->curr, d->curr_next, (const float*)d->volt,
 			            (const CUDA_FixupEntry*)d->fixup, d->fixup_count, (const void*)d->index,
-			            (const float*)(c ? d->coeff : d->ii), (const float*)(c ? d->coeff : d->iv), d->coeff_mode, d->dim, d->fregions,
-			            d->local_palette, d->local_palette_active);
+			            (const float*)(c ? d->coeff : d->ii), (const float*)(c ? d->coeff : d->iv), d->coeff_mode, d->dim, d->fregions);
 		std::swap(d->curr, d->curr_next);
 		return;
 	}

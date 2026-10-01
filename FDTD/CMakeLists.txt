@@ -20,7 +20,6 @@ if(ENABLE_CUDA)
   set(CUDA_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/cuda/gpu_backend_cuda.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/cuda/cuda_opportunity_report.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/cuda/cuda_local_palette.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cuda/cuda_palette_benchmark.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/cuda/cuda_ext_excitation.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/cuda/cuda_ext_upml.cu
