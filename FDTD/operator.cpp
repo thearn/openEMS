@@ -46,6 +46,8 @@
 #include "CSPrimPolygon.h"
 #include "CSTransform.h"
 #include "CSPrimCurve.h"
+#include "CSPrimWire.h"
+#include "CSPrimPolyhedron.h"
 
 #include "CSPropMaterial.h"
 #include "CSPropLumpedElement.h"
@@ -1088,6 +1090,7 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 	SetupPhaseTimer setup_timer;
 	InitPrimitiveBoxes();
 	InitPolygonIndex();
+	InitSolidIndex();
 	Init_EC();
 	InitDataStorage();
 	setup_timer.Mark("allocate");
@@ -1183,6 +1186,27 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 						FDTD_FLOAT c[4] = {GetVV(n,x,y,z), GetVI(n,x,y,z), GetII(n,x,y,z), GetIV(n,x,y,z)};
 						OperatorHash(main_hash, c, sizeof(c));
 					}
+		// OPENEMS_OPERATOR_CHECKSUM=2: a hash per x line too, to locate a difference;
+		// OPENEMS_CHECKSUM_DUMP_X=x writes that line's coefficients to checksum_dump.txt
+		if (atoi(getenv("OPENEMS_OPERATOR_CHECKSUM"))>=2)
+		{
+			const char* dx = getenv("OPENEMS_CHECKSUM_DUMP_X");
+			for (unsigned int x=0; x<numLines[0]; ++x)
+			{
+				uint64_t h = 14695981039346656037ULL;
+				FILE* f = (dx && (unsigned)atoi(dx)==x) ? fopen("checksum_dump.txt","w") : NULL;
+				for (int n=0; n<3; ++n)
+					for (unsigned int y=0; y<numLines[1]; ++y)
+						for (unsigned int z=0; z<numLines[2]; ++z)
+						{
+							FDTD_FLOAT c[4] = {GetVV(n,x,y,z), GetVI(n,x,y,z), GetII(n,x,y,z), GetIV(n,x,y,z)};
+							OperatorHash(h, c, sizeof(c));
+							if (f) fprintf(f, "%d %u %u %.9g %.9g %.9g %.9g %.9g %.9g\n", n, y, z, discLines[1][y], discLines[2][z], c[0], c[1], c[2], c[3]);
+						}
+				if (f) fclose(f);
+				cout << "OPENEMS_OPERATOR_CHECKSUM x " << x << " " << std::hex << h << std::dec << endl;
+			}
+		}
 		OperatorHash(main_hash, &dT, sizeof(dT));
 		OperatorHash(main_hash, m_Nr_PEC, sizeof(m_Nr_PEC));
 		cout << "OPENEMS_OPERATOR_CHECKSUM main " << std::hex << main_hash << std::dec << endl;
@@ -1403,7 +1427,21 @@ CSProperties* Operator::PropertyByPriority(const double* coord, const std::vecto
 		bool inside;
 		auto indexed = m_PolyIndex.find(prim);
 		if (indexed==m_PolyIndex.end())
-			inside = prim->IsInside(coord);
+		{
+			auto solid = m_SolidIndex.find(prim);
+			if (solid==m_SolidIndex.end())
+				inside = prim->IsInside(coord);
+			else
+			{
+				inside = solid->second.IsInside(coord);
+				if (m_PolyIndexVerify && inside!=prim->IsInside(coord))
+				{
+					cerr << "Operator::PropertyByPriority: solid index disagrees with IsInside of primitive " << prim->GetID()
+						 << " at " << coord[0] << "," << coord[1] << "," << coord[2] << endl;
+					throw std::runtime_error("solid index mismatch");
+				}
+			}
+		}
 		else
 		{
 			inside = indexed->second.IsInside(coord);
@@ -1544,6 +1582,344 @@ void Operator::InitPolygonIndex()
 	}
 	if (!m_PolyIndex.empty())
 		cout << "Operator::InitPolygonIndex: " << m_PolyIndex.size() << " polygons indexed (" << edges << " edge entries)"
+			 << (m_PolyIndexVerify ? ", every query verified against IsInside" : "") << endl;
+}
+
+bool Operator::SolidIndex::Voxel(const double* c, size_t& v) const
+{
+	// the bounding box test of CSPrimWire/CSPrimPolyhedron::IsInside, then the voxel holding c
+	for (int k=0;k<3;++k)
+		if ((box[2*k]>c[k]) || (box[2*k+1]<c[k]))
+			return false;
+	unsigned int i[3];
+	for (int k=0;k<3;++k)
+	{
+		double f = std::floor((c[k]-box[2*k])/h[k]);
+		i[k] = (f<0) ? 0 : ((f>=n[k]) ? n[k]-1 : (unsigned int)f);
+	}
+	v = ((size_t)i[2]*n[1] + i[1])*n[0] + i[0];
+	return true;
+}
+
+int Operator::SolidIndex::RayParity(const double* c, size_t v) const
+{
+	// crossings of the ray from c along +x with the closed triangle surface: 1 inside, 0 outside,
+	// -1 when c is within rounding of a triangle's projected edge or of its surface (ask CGAL)
+	const size_t col = v/n[0];
+	const double y = c[1], z = c[2];
+	int crossings = 0;
+	for (unsigned int k=colOffset[col]; k<colOffset[col+1]; ++k)
+	{
+		const double* t = &tri[9*colFaces[k]];
+		double d[3], m[3];
+		for (int e=0;e<3;++e)
+		{
+			const double* a = t+3*e;
+			const double* b = t+3*((e+1)%3);
+			const double u = (b[1]-a[1])*(z-a[2]);
+			const double w = (b[2]-a[2])*(y-a[1]);
+			d[e] = u-w;
+			m[e] = 1e-10*(fabs(u)+fabs(w));
+		}
+		int pos = 0, neg = 0, zero = 0;
+		for (int e=0;e<3;++e)
+		{
+			if (d[e]>m[e]) ++pos;
+			else if (d[e]<-m[e]) ++neg;
+			else ++zero;
+		}
+		if (pos && neg)
+			continue;   // (y,z) outside the projected triangle
+		if (zero)
+			return -1;  // on or near a projected edge, or a triangle parallel to x
+		// x where the triangle's plane meets the ray line
+		const double e1[3] = {t[3]-t[0], t[4]-t[1], t[5]-t[2]};
+		const double e2[3] = {t[6]-t[0], t[7]-t[1], t[8]-t[2]};
+		const double nx = e1[1]*e2[2]-e1[2]*e2[1];
+		const double ny = e1[2]*e2[0]-e1[0]*e2[2];
+		const double nz = e1[0]*e2[1]-e1[1]*e2[0];
+		const double x = t[0] - (ny*(y-t[1]) + nz*(z-t[2]))/nx;
+		const double tol = 1e-9*(fabs(x)+fabs(c[0])+h[0]);
+		if (fabs(x-c[0])<=tol)
+			return -1;  // on or near the surface
+		if (x>c[0])
+			++crossings;
+	}
+	return crossings&1;
+}
+
+bool Operator::SolidIndex::IsInside(const double* coord) const
+{
+	// the primitive's local coordinates, as its IsInside computes them
+	double c[3] = {coord[0], coord[1], coord[2]};
+	if (transform)
+		transform->InvertTransform(c,c);
+	size_t v;
+	if (!Voxel(c, v))
+		return false;
+	if (wire)
+	{
+		// CSPrimWire::IsInside over the points/segments that can reach this voxel
+		const size_t np = points.size()/3;
+		double foot, dist, distPP;
+		for (unsigned int k=offset[v]; k<offset[v+1]; ++k)
+		{
+			const size_t i = items[k];
+			const double* p0 = &points[3*i];
+			dist = sqrt(pow(c[0]-p0[0],2)+pow(c[1]-p0[1],2)+pow(c[2]-p0[2],2));
+			if (dist<radius)
+				return true;
+			if (i<np-1)
+			{
+				const double* p1 = &points[3*i+3];
+				distPP = sqrt(pow(p1[0]-p0[0],2)+pow(p1[1]-p0[1],2)+pow(p1[2]-p0[2],2))+radius;
+				if (dist<distPP)
+				{
+					Point_Line_Distance(c, p0, p1, foot, dist);
+					if ((foot>0) && (foot<1) && (dist<radius))
+						return true;
+				}
+			}
+		}
+		return false;
+	}
+	if (surface[v])
+	{
+		const int parity = colOffset.empty() ? -1 : RayParity(c, v);
+		return (parity<0) ? prim->IsInside(coord) : (parity==1);
+	}
+	std::atomic<signed char>& s = state.get()[v];
+	signed char known = s.load(std::memory_order_relaxed);
+	if (known==0)
+	{
+		// no face reaches the voxel, so every point in it is on the same side; three samples
+		// (the polyhedron's parity rays from different points) must agree, else ask every time
+		static const double frac[3][3] = {{.5,.5,.5}, {.27,.61,.39}, {.73,.36,.58}};
+		const unsigned int ix = v%n[0], iy = (v/n[0])%n[1], iz = v/((size_t)n[0]*n[1]);
+		const unsigned int idx[3] = {ix, iy, iz};
+		int votes = 0;
+		for (int t=0;t<3;++t)
+		{
+			double p[3];
+			for (int k=0;k<3;++k)
+				p[k] = box[2*k] + (idx[k]+frac[t][k])*h[k];
+			if (transform)
+				transform->Transform(p,p);
+			votes += prim->IsInside(p) ? 1 : 0;
+		}
+		known = (votes==3) ? 1 : ((votes==0) ? -1 : 2);
+		s.store(known, std::memory_order_relaxed);
+	}
+	if (known==2)
+		return prim->IsInside(coord);
+	return known==1;
+}
+
+void Operator::InitSolidIndex()
+{
+	m_SolidIndex.clear();
+	const char* env = getenv("OPENEMS_SOLID_INDEX");
+	if ((env && atoi(env)==0) || (m_MeshType!=CARTESIAN) || (CSX==NULL))
+		return;
+	size_t wires = 0, solids = 0, voxels = 0;
+	for (CSPrimitives* prim : CSX->GetAllPrimitives(false, CSProperties::ANY))
+	{
+		int type = prim->GetType();
+		if ((type!=CSPrimitives::WIRE) && (type!=CSPrimitives::POLYHEDRON))
+			continue;
+		// IsInside converts from the primitive's mesh type; only the Cartesian case is indexed
+		if (prim->GetCoordInputType()!=CARTESIAN)
+			continue;
+		CSPrimWire* w = (type==CSPrimitives::WIRE) ? dynamic_cast<CSPrimWire*>(prim) : NULL;
+		CSPrimPolyhedron* ph = (type==CSPrimitives::POLYHEDRON) ? dynamic_cast<CSPrimPolyhedron*>(prim) : NULL;
+		if ((w==NULL) && (ph==NULL))
+			continue;
+		if (w && (w->GetNumberOfPoints()<1))
+			continue;
+		if (ph && ((ph->GetDimension()<3) || (ph->GetNumFaces()<1)))
+			continue;   // IsInside is false throughout (no tree); leave it to the primitive
+		SolidIndex index;
+		index.prim = prim;
+		index.wire = (w!=NULL);
+		index.transform = prim->HasTransform() ? prim->GetTransform() : NULL;
+		// the box IsInside tests (m_BoundBox) is the one Update() computed with GetBoundBox
+		prim->GetBoundBox(index.box);
+		bool finite = true;
+		for (int k=0;k<6;++k)
+			finite = finite && std::isfinite(index.box[k]);
+		if (!finite)
+			continue;
+
+		// boxes (lo xyz, hi xyz) of the items that decide IsInside near them
+		std::vector<std::array<double,6>> boxes;
+		if (w)
+		{
+			index.radius = w->GetWireRadius();
+			const size_t np = w->GetNumberOfPoints();
+			index.points.resize(3*np);
+			for (size_t i=0;i<np;++i)
+				w->GetPoint(i, &index.points[3*i], CARTESIAN, false);
+			for (size_t i=0;i<np;++i)
+			{
+				const double* p0 = &index.points[3*i];
+				const double* p1 = (i<np-1) ? &index.points[3*i+3] : p0;
+				std::array<double,6> b;
+				for (int k=0;k<3;++k)
+				{
+					b[k] = std::min(p0[k],p1[k])-index.radius;
+					b[3+k] = std::max(p0[k],p1[k])+index.radius;
+				}
+				boxes.push_back(b);
+			}
+		}
+		else
+		{
+			// the +x ray test needs a closed surface of triangles (what CGAL's tree holds)
+			bool triangles = true;
+			for (unsigned int f=0; f<ph->GetNumFaces(); ++f)
+			{
+				unsigned int nv = 0;
+				ph->GetFace(f, nv);
+				triangles = triangles && (nv==3) && ph->GetFaceValid(f);
+			}
+			if (triangles)
+				for (unsigned int f=0; f<ph->GetNumFaces(); ++f)
+				{
+					unsigned int nv = 0;
+					int* vert = ph->GetFace(f, nv);
+					for (unsigned int j=0;j<3;++j)
+						for (int k=0;k<3;++k)
+							index.tri.push_back(ph->GetVertex(vert[j])[k]);
+				}
+			for (unsigned int f=0; f<ph->GetNumFaces(); ++f)
+			{
+				unsigned int nv = 0;
+				int* vert = ph->GetFace(f, nv);
+				std::array<double,6> b = {INFINITY,INFINITY,INFINITY,-INFINITY,-INFINITY,-INFINITY};
+				for (unsigned int j=0;j<nv;++j)
+				{
+					const float* p = ph->GetVertex(vert[j]);
+					for (int k=0;k<3;++k)
+					{
+						b[k] = std::min(b[k], (double)p[k]);
+						b[3+k] = std::max(b[3+k], (double)p[k]);
+					}
+				}
+				if (nv>0)
+					boxes.push_back(b);
+			}
+		}
+
+		// voxels of about equal edge, ~16 (polyhedron faces) or ~1024 (wire segments) per item
+		double L[3], vol = 1;
+		for (int k=0;k<3;++k)
+		{
+			L[k] = index.box[2*k+1]-index.box[2*k];
+			vol *= std::max(L[k], 1e-12);
+		}
+		const double target = std::min(std::max((w ? 1024. : 16.)*boxes.size(), 4096.), 8388608.);
+		const double edge = std::cbrt(vol/target);
+		size_t total = 1;
+		for (int k=0;k<3;++k)
+		{
+			index.n[k] = (L[k]>0) ? (unsigned int)std::min(std::max(std::ceil(L[k]/edge), 1.), 1024.) : 1;
+			index.h[k] = (L[k]>0) ? L[k]/index.n[k] : 1;
+			total *= index.n[k];
+		}
+
+		// mark every voxel an item's box (padded beyond rounding) reaches
+		double scale = 1;
+		for (int k=0;k<6;++k)
+			scale = std::max(scale, fabs(index.box[k]));
+		const double pad = 1e-9*scale;
+		auto range = [&](const std::array<double,6>& b, int k, unsigned int& lo, unsigned int& hi) {
+			double a = std::floor((b[k]-pad-index.box[2*k])/index.h[k]);
+			double c = std::floor((b[3+k]+pad-index.box[2*k])/index.h[k]);
+			if ((c<0) || (a>=index.n[k]))
+				return false;
+			lo = (a<0) ? 0 : (unsigned int)a;
+			hi = (c>=index.n[k]) ? index.n[k]-1 : (unsigned int)c;
+			return true;
+		};
+		std::vector<unsigned int> count(w ? total+1 : 0, 0);
+		if (ph)
+			index.surface.assign(total, 0);
+		for (int pass=0; pass<(w ? 2 : 1); ++pass)
+		{
+			std::vector<unsigned int> fill;
+			if (w && (pass==1))
+			{
+				index.offset.assign(total+1, 0);
+				for (size_t v=0; v<total; ++v)
+					index.offset[v+1] = index.offset[v]+count[v];
+				index.items.resize(index.offset[total]);
+				fill.assign(index.offset.begin(), index.offset.end()-1);
+			}
+			for (size_t i=0; i<boxes.size(); ++i)
+			{
+				unsigned int lo[3], hi[3];
+				if (!range(boxes[i],0,lo[0],hi[0]) || !range(boxes[i],1,lo[1],hi[1]) || !range(boxes[i],2,lo[2],hi[2]))
+					continue;
+				for (unsigned int z=lo[2]; z<=hi[2]; ++z)
+					for (unsigned int y=lo[1]; y<=hi[1]; ++y)
+						for (unsigned int x=lo[0]; x<=hi[0]; ++x)
+						{
+							size_t v = ((size_t)z*index.n[1] + y)*index.n[0] + x;
+							if (ph)
+								index.surface[v] = 1;
+							else if (pass==0)
+								++count[v];
+							else
+								index.items[fill[v]++] = i;   // ascending i: IsInside's order
+						}
+			}
+		}
+		if (ph && !index.tri.empty())
+		{
+			// (y,z) columns of voxels: the triangles whose yz box (padded) reaches each
+			const size_t ncol = (size_t)index.n[1]*index.n[2];
+			std::vector<unsigned int> count(ncol+1, 0);
+			for (int pass=0; pass<2; ++pass)
+			{
+				std::vector<unsigned int> fill;
+				if (pass==1)
+				{
+					index.colOffset.assign(ncol+1, 0);
+					for (size_t q=0; q<ncol; ++q)
+						index.colOffset[q+1] = index.colOffset[q]+count[q];
+					index.colFaces.resize(index.colOffset[ncol]);
+					fill.assign(index.colOffset.begin(), index.colOffset.end()-1);
+				}
+				for (size_t i=0; i<boxes.size(); ++i)
+				{
+					unsigned int lo[3], hi[3];
+					if (!range(boxes[i],1,lo[1],hi[1]) || !range(boxes[i],2,lo[2],hi[2]))
+						continue;
+					for (unsigned int z=lo[2]; z<=hi[2]; ++z)
+						for (unsigned int y=lo[1]; y<=hi[1]; ++y)
+						{
+							size_t q = (size_t)z*index.n[1] + y;
+							if (pass==0)
+								++count[q];
+							else
+								index.colFaces[fill[q]++] = i;
+						}
+				}
+			}
+		}
+		if (ph)
+		{
+			std::atomic<signed char>* s = new std::atomic<signed char>[total];
+			for (size_t v=0; v<total; ++v)
+				s[v].store(0);
+			index.state = std::shared_ptr<std::atomic<signed char>>(s, std::default_delete<std::atomic<signed char>[]>());
+		}
+		voxels += total;
+		(w ? wires : solids) += 1;
+		m_SolidIndex.emplace(prim, std::move(index));
+	}
+	if (!m_SolidIndex.empty())
+		cout << "Operator::InitSolidIndex: " << solids << " polyhedra and " << wires << " wires indexed (" << voxels << " voxels)"
 			 << (m_PolyIndexVerify ? ", every query verified against IsInside" : "") << endl;
 }
 

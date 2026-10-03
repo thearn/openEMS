@@ -29,6 +29,8 @@
 #include <array>
 #include <vector>
 #include <unordered_map>
+#include <atomic>
+#include <memory>
 
 class CSTransform;
 
@@ -280,6 +282,37 @@ protected:
 	void InitPolygonIndex();
 	std::unordered_map<const CSPrimitives*, PolygonIndex> m_PolyIndex;
 	bool m_PolyIndexVerify = false;
+
+	//! Voxel index over the local bounding box of a Cartesian polyhedron or wire (see InitSolidIndex).
+	//! Wire: each voxel lists the points/segments whose radius-padded box reaches it, tested with
+	//! CSPrimWire::IsInside's arithmetic; a voxel without any is outside. Polyhedron: a voxel no
+	//! face box reaches has one inside state (from three IsInside samples that must agree, cached
+	//! on first use); in other voxels a +x ray counts crossings, and near-degenerate cases ask the primitive.
+	struct SolidIndex
+	{
+		CSPrimitives* prim;
+		bool wire;
+		double box[6];                         //!< the primitive's own (untransformed) box
+		const CSTransform* transform;
+		unsigned int n[3];
+		double h[3];
+		std::vector<unsigned int> offset;      //!< CSR offsets per voxel into items
+		std::vector<unsigned int> items;       //!< wire: point/segment indices; polyhedron: unused
+		std::vector<double> points;            //!< wire: Cartesian points (xyz)
+		double radius = 0;
+		std::vector<unsigned char> surface;    //!< polyhedron: 1 where a face box reaches the voxel
+		std::shared_ptr<std::atomic<signed char>> state;   //!< polyhedron: 0 unknown, 1 in, -1 out, 2 ask
+		//! polyhedron of valid triangles: per (y,z) voxel column, the triangles whose yz box reaches it,
+		//! for the parity of a +x ray; empty when the polyhedron has other faces
+		std::vector<unsigned int> colOffset;
+		std::vector<unsigned int> colFaces;
+		std::vector<double> tri;               //!< 9 coordinates per triangle
+		int RayParity(const double* c, size_t v) const;
+		bool IsInside(const double* coord) const;
+		bool Voxel(const double* c, size_t& v) const;
+	};
+	void InitSolidIndex();
+	std::unordered_map<const CSPrimitives*, SolidIndex> m_SolidIndex;
 
 	//! use New() for creating a new Operator
 	Operator();

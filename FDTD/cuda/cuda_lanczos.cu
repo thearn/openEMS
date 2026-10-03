@@ -61,6 +61,8 @@ __global__ void apply_kernel(Grid g, const float* SC, const float* IL, const flo
 	out[2*g.total+i] = SC[2*g.total+i]*(d1x-d0y);
 }
 
+static const int DOT_BLOCKS = 1024;
+
 __global__ void dot_kernel(const float* a, const float* b, size_t n, double* result)
 {
 	__shared__ double buf[256];
@@ -69,7 +71,7 @@ __global__ void dot_kernel(const float* a, const float* b, size_t n, double* res
 		s += (double)a[i]*b[i];
 	buf[threadIdx.x] = s; __syncthreads();
 	for (int k=blockDim.x/2; k>0; k>>=1) { if (threadIdx.x<k) buf[threadIdx.x]+=buf[threadIdx.x+k]; __syncthreads(); }
-	if (threadIdx.x==0) atomicAdd(result, buf[0]);
+	if (threadIdx.x==0) result[blockIdx.x] = buf[0];   // summed on the host in block order: run-to-run identical
 }
 
 __global__ void lanczos_update(float* w, const float* q, const float* qp, float a, float b, size_t n)
@@ -132,7 +134,7 @@ double CUDA_LanczosMaxEig(const float* SC_h, const float* IL_h, unsigned N0, uns
 	if (free_b < 5*n*sizeof(float) + (256u<<20)) return -1;
 	float *SC=0,*IL=0,*q=0,*qp=0,*w=0; double* red=0;
 	bool ok = cudaMalloc(&SC,n*4)==cudaSuccess && cudaMalloc(&IL,n*4)==cudaSuccess && cudaMalloc(&q,n*4)==cudaSuccess
-	          && cudaMalloc(&qp,n*4)==cudaSuccess && cudaMalloc(&w,n*4)==cudaSuccess && cudaMalloc(&red,sizeof(double))==cudaSuccess;
+	          && cudaMalloc(&qp,n*4)==cudaSuccess && cudaMalloc(&w,n*4)==cudaSuccess && cudaMalloc(&red,DOT_BLOCKS*sizeof(double))==cudaSuccess;
 	double lambda = -1;
 	if (ok)
 	{
@@ -142,7 +144,8 @@ double CUDA_LanczosMaxEig(const float* SC_h, const float* IL_h, unsigned N0, uns
 		if (timing) std::cout << "OPENEMS_SETUP_TIME lanczos_upload " << since() << " s" << std::endl;
 		const int T=256; const int B=std::min<size_t>((n+T-1)/T, 65535*8);
 		const size_t cells=g.total; const unsigned AB=(unsigned)((cells+T-1)/T);
-		auto dot=[&](const float* a,const float* b){ double r=0; cudaMemset(red,0,sizeof(double)); dot_kernel<<<1024,T>>>(a,b,n,red); cudaMemcpy(&r,red,sizeof(double),cudaMemcpyDeviceToHost); return r; };
+		std::vector<double> part(DOT_BLOCKS);
+		auto dot=[&](const float* a,const float* b){ dot_kernel<<<DOT_BLOCKS,T>>>(a,b,n,red); cudaMemcpy(part.data(),red,DOT_BLOCKS*sizeof(double),cudaMemcpyDeviceToHost); double r=0; for (double v : part) r+=v; return r; };
 		random_fill<<<B,T>>>(q,n);
 		// the start vector must vanish where SC = 0 (no degree of freedom); scaling by SC handles it in A
 		double nrm = sqrt(dot(q,q));
