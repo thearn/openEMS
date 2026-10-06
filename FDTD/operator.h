@@ -320,6 +320,15 @@ protected:
 	virtual void Init();
 	void Delete();
 	virtual void Reset();
+public:
+	//! Free the host copy of the update coefficients (vv, vi, ii, iv) once an engine that keeps its own copy (the GPU
+	//! engine) has been created; GetVV/GetVI/GetII/GetIV and CreateEngine must not be used afterwards.
+	void ReleaseCoefficients();
+	bool CoefficientsReleased() const {return m_CoefficientsReleased;}
+	//! host bytes held by the update coefficients
+	size_t CoefficientBytes() const {return vv_ptr ? 4*(size_t)3*numLines[0]*numLines[1]*numLines[2]*sizeof(FDTD_FLOAT) : 0;}
+protected:
+	bool m_CoefficientsReleased = false;
 	virtual void InitOperator();
 	virtual void InitDataStorage();
 	virtual void CalcUpdateCoefficients();

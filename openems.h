@@ -156,6 +156,9 @@ protected:
 	bool m_debugCSX;
 	bool m_DumpStats;
 	bool m_debugBox, m_debugPEC, m_no_simulation;
+	//! free the operator's host coefficients once the GPU engine holds its own (--release-host-operator)
+	bool m_ReleaseHostOperator;
+	void ReleaseHostOperator();
 	bool m_dry_run;
 
 	double endCrit;

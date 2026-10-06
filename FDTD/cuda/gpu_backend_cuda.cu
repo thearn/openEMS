@@ -1043,32 +1043,24 @@ bool GPU_Backend_CUDA::Init(const Operator* op)
 	d->volt = d->Alloc<float>(count);
 	d->curr = d->Alloc<float>(count);
 
-	// upload the final operator coefficients, including all changes by operator extensions
-	std::vector<float> vv(count), vi(count), ii(count), iv(count);
-	unsigned int pos[3];
-	size_t idx = 0;
-	for (int n=0; n<3; ++n)
-		for (pos[0]=0; pos[0]<numLines[0]; ++pos[0])
-			for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
-				for (pos[2]=0; pos[2]<numLines[2]; ++pos[2], ++idx)
-				{
-					vv[idx] = op->GetVV(n, pos[0], pos[1], pos[2]);
-					vi[idx] = op->GetVI(n, pos[0], pos[1], pos[2]);
-					ii[idx] = op->GetII(n, pos[0], pos[1], pos[2]);
-					iv[idx] = op->GetIV(n, pos[0], pos[1], pos[2]);
-				}
-
 	// Most nodes share one of a few coefficient sets (same material and mesh spacing): store
-	// every distinct set of the 12 coefficients of a node once and a set index per node
+	// every distinct set of the 12 coefficients of a node once and a set index per node. The sets
+	// are read from the operator directly (node i in x, y, z order, z fastest); the full arrays are
+	// built only if the sets are refused, so the upload holds no host copy of the coefficients.
 	const size_t sn = d->numCells;
-	const std::vector<float>* src[4] = {&vv, &vi, &ii, &iv};
+	const unsigned int ny = numLines[1], nz = numLines[2];
 	GPU_CoeffSets sets;
 	const char* force_compressed = getenv("OPENEMS_CUDA_COEFF_COMPRESSED");
 	if (GPU_FindSets(sn, 12, [&](size_t i, float* values)
 	    {
-		    for (int c=0; c<4; ++c)
-			    for (int n=0; n<3; ++n)
-				    values[3*c+n] = (*src[c])[n*sn+i];
+		    const unsigned int x = (unsigned int)(i/((size_t)ny*nz)), y = (unsigned int)((i/nz)%ny), z = (unsigned int)(i%nz);
+		    for (int n=0; n<3; ++n)
+		    {
+			    values[n] = op->GetVV(n, x, y, z);
+			    values[3+n] = op->GetVI(n, x, y, z);
+			    values[6+n] = op->GetII(n, x, y, z);
+			    values[9+n] = op->GetIV(n, x, y, z);
+		    }
 	    }, sets) && ((force_compressed && atoi(force_compressed)!=0) || (sets.count<=sn/4)))
 	{
 		d->coeff_mode = sets.mode;
@@ -1088,6 +1080,20 @@ bool GPU_Backend_CUDA::Init(const Operator* op)
 		return true;
 	}
 
+	// upload the final operator coefficients, including all changes by operator extensions
+	std::vector<float> vv(count), vi(count), ii(count), iv(count);
+	unsigned int pos[3];
+	size_t idx = 0;
+	for (int n=0; n<3; ++n)
+		for (pos[0]=0; pos[0]<numLines[0]; ++pos[0])
+			for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
+				for (pos[2]=0; pos[2]<numLines[2]; ++pos[2], ++idx)
+				{
+					vv[idx] = op->GetVV(n, pos[0], pos[1], pos[2]);
+					vi[idx] = op->GetVI(n, pos[0], pos[1], pos[2]);
+					ii[idx] = op->GetII(n, pos[0], pos[1], pos[2]);
+					iv[idx] = op->GetIV(n, pos[0], pos[1], pos[2]);
+				}
 	d->coeff_mode = 0;
 	d->vv = d->Alloc<float>(count, vv.data());
 	d->vi = d->Alloc<float>(count, vi.data());

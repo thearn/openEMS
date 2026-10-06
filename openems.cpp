@@ -28,6 +28,7 @@
 #include "FDTD/engine_multithread.h"
 #include "FDTD/operator_multithread.h"
 #include "FDTD/operator_gpu.h"
+#include "FDTD/engine_gpu.h"
 #include "FDTD/extensions/operator_ext_excitation.h"
 #include "FDTD/extensions/operator_ext_tfsf.h"
 #include "FDTD/extensions/operator_ext_mur_abc.h"
@@ -88,6 +89,7 @@ openEMS::openEMS()
 	DebugOp = false;
 	m_debugCSX = false;
 	m_debugBox = m_debugPEC = m_no_simulation = false;
+	m_ReleaseHostOperator = false;
 	m_dry_run = false;
 	m_DumpStats = false;
 
@@ -298,6 +300,17 @@ void openEMS::collectCommandLineArguments()
 			),
 			"Force use n threads for multithreaded engine "
 			"(needs: --engine=multithreaded)"
+		)
+		(
+			"release-host-operator",
+			po::bool_switch()->notifier(
+				[&](bool val)
+				{
+					if (!val) return;
+					m_ReleaseHostOperator = true;
+				}
+			),
+			"free the operator's host update coefficients once the GPU engine holds its own (no operator reuse afterwards)"
 		)
 		(
 			"no-simulation",
@@ -1447,6 +1460,7 @@ int openEMS::SetupFDTD()
 
 	// Cleanup all unused material storages...
 	FDTD_Op->CleanupMaterialStorage();
+	ReleaseHostOperator();
 
 	//check and warn for unused properties and primitives
 	m_CSX->WarnUnusedPrimitves(cerr);
@@ -1468,6 +1482,12 @@ int openEMS::RestartFDTD()
 	{
 		cerr << "openEMS::RestartFDTD: Error, no existing operator to reuse!" << endl;
 		return 3;
+	}
+	if (FDTD_Op->CoefficientsReleased())
+	{
+		cerr << "openEMS::RestartFDTD: Error, the operator's host coefficients were released (--release-host-operator); "
+		        "a reused operator needs them: release only on the last run" << endl;
+		return 6;
 	}
 	std::string ec = m_CSX->Update();
 	if (!ec.empty())
@@ -1519,7 +1539,18 @@ int openEMS::RestartFDTD()
 
 	if (SetupProcessing()==false)
 		return 2;
+	ReleaseHostOperator();
 	return 0;
+}
+
+void openEMS::ReleaseHostOperator()
+{
+	// only the GPU engine keeps its own copy of the coefficients (the CPU engines step from the operator's)
+	if (!m_ReleaseHostOperator || !dynamic_cast<Engine_GPU*>(FDTD_Eng) || FDTD_Op->CoefficientsReleased())
+		return;
+	const size_t bytes = FDTD_Op->CoefficientBytes();
+	FDTD_Op->ReleaseCoefficients();
+	cout << "openEMS: released the operator's host coefficients (" << bytes/1048576 << " MiB); the GPU engine holds its own" << endl;
 }
 
 string FormatTime(int sec)
