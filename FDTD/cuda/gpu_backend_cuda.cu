@@ -16,6 +16,7 @@
 */
 
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -222,6 +223,28 @@ __device__ __forceinline__ void fused_ade(const CUDA_FusedADE& A, const CUDA_Gri
 #define FUSED_TZ 32   // threads along z, the last one computes the border voltages only
 #define FUSED_TY 8    // threads along y, the last row computes the border voltages only
 #define FUSED_XC 4    // x lines per block (default): short blocks are faster, despite the voltages of one more x line
+
+// OPENEMS_SETUP_TIMES=1: the engine's setup phases, in the format of the operator's (operator.cpp SetupPhaseTimer)
+namespace
+{
+class EngineSetupTimer
+{
+public:
+	EngineSetupTimer() : enabled(getenv("OPENEMS_SETUP_TIMES") && atoi(getenv("OPENEMS_SETUP_TIMES"))!=0),
+	                     start(std::chrono::steady_clock::now()) {}
+	void Mark(const char* name)
+	{
+		if (!enabled)
+			return;
+		const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+		std::cout << "OPENEMS_SETUP_TIME " << name << " " << std::chrono::duration<double>(now-start).count() << " s" << std::endl;
+		start = now;
+	}
+private:
+	bool enabled;
+	std::chrono::steady_clock::time_point start;
+};
+}
 
 // x lines per fused block: OPENEMS_CUDA_FUSED_XC, else 8 on compute capability 8.9 (RTX 40: 4.9 % faster stepping than 4
 // on an RTX 4060, Lollipop 48 M cells, bit-identical; throughput-2026-10 H0), else FUSED_XC (measured on an RTX 2080 Ti
@@ -916,6 +939,7 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 void GPU_Backend_CUDA::Impl::BuildFusedSkip(const CUDA_GridDim& B, const CUDA_GridDim& E, unsigned int xc, const dim3& grid)
 {
 	fused_skip_built = true;
+	EngineSetupTimer timer;
 	const char* env = getenv("OPENEMS_CUDA_SKIP_ZERO");
 	if ((env && atoi(env)==0) || e_zero.empty())
 	{
@@ -956,6 +980,7 @@ void GPU_Backend_CUDA::Impl::BuildFusedSkip(const CUDA_GridDim& B, const CUDA_Gr
 	for (unsigned char b : skip)
 		skipped += b;
 	std::vector<unsigned char>().swap(e_zero);
+	timer.Mark("engine_zero_skip_blocks");
 	if (skipped)
 	{
 		fused_skip = Alloc<unsigned char>(blocks, skip.data());
@@ -1111,9 +1136,11 @@ bool GPU_Backend_CUDA::Init(const Operator* op)
 		return false;
 	}
 
+	EngineSetupTimer timer;
 	const size_t count = 3*d->numCells;
 	d->volt = d->Alloc<float>(count);
 	d->curr = d->Alloc<float>(count);
+	timer.Mark("engine_fields");
 
 	// Most nodes share one of a few coefficient sets (same material and mesh spacing): store
 	// every distinct set of the 12 coefficients of a node once and a set index per node. The sets
@@ -1135,6 +1162,7 @@ bool GPU_Backend_CUDA::Init(const Operator* op)
 		    }
 	    }, sets) && ((force_compressed && atoi(force_compressed)!=0) || (sets.count<=sn/4)))
 	{
+		timer.Mark("engine_coefficient_sets");
 		d->coeff_mode = sets.mode;
 		{
 			// the nodes whose voltages stay zero whatever their neighbours: vv = vi = 0 in all three components
@@ -1148,8 +1176,10 @@ bool GPU_Backend_CUDA::Init(const Operator* op)
 			for (size_t i=0; i<sn; ++i)
 				d->e_zero[i] = zero_set[sets.index[i]];
 		}
+		timer.Mark("engine_zero_mask");
 		d->index = d->AllocIndex(sets);
 		d->coeff = d->Alloc<float>(sets.table.size(), sets.table.data());
+		timer.Mark("engine_coefficient_upload");
 		std::cout << "GPU_Backend_CUDA: " << sets.count << " distinct coefficient sets, compressed update coefficients ("
 		          << (sets.mode==1 ? 16 : 32) << " bit index)" << std::endl;
 		if (!d->opportunity_report.empty() && !d->palette_benchmark.empty())
