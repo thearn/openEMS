@@ -265,6 +265,25 @@ def case_lumped(bc='MUR', size=10):
     return FDTD, CSX
 
 
+def case_pec_block():
+    """ a solid metal block inside the domain, larger than a fused block and its halo: the CUDA backend skips the blocks
+    inside it (their fields stay zero) """
+    FDTD = openEMS(NrTS=800, EndCriteria=0)
+    FDTD.SetGaussExcite(5.5e9, 4.5e9)
+    FDTD.SetBoundaryCond(['PML_8'] * 6)
+    CSX = ContinuousStructure()
+    FDTD.SetCSX(CSX)
+    mesh = CSX.GetGrid()
+    mesh.SetDeltaUnit(unit)
+    for ax, n in (('x', 30), ('y', 30), ('z', 60)):
+        mesh.AddLine(ax, np.arange(-n, n + 0.5, 1))
+    CSX.AddMetal('block').AddBox([-12, -14, -40], [12, 14, 40], priority=10)
+    CSX.AddExcitation('src', exc_type=0, exc_val=[0, 0, 1]).AddBox([0, 20, -2], [0, 20, 2])
+    CSX.AddProbe('et', p_type=2).AddPoint([0, -20, 0])
+    CSX.AddProbe('ht', p_type=3).AddPoint([16, 0, 0])
+    return FDTD, CSX
+
+
 def case_lumped_pml():
     """ the lumped RLC elements with PML: the voltages they change in the fused CUDA step """
     return case_lumped('PML_8', 20)
@@ -462,6 +481,7 @@ cases = [('excitation',     case_excitation,     True),
          ('materials',      case_materials,      True),
          ('lumped',         case_lumped,         True),
          ('lumped_pml',     case_lumped_pml,     True),
+         ('pec_block',      case_pec_block,      True),
          ('tfsf',           case_tfsf,           True),
          ('absorbers',      case_absorbers,      True),
          ('cylinder_closed', case_cylinder_closed, True),
@@ -505,6 +525,8 @@ for name, case, on_device in cases:
         if name=='dumps_snapshot' and backend in FULL_DEVICE_BACKENDS:
             assert 'Engine_GPU: field dumps from snapshots' in logs['gpu'], \
                 f'FAIL [{name}]: the {backend} backend did not take field snapshots for the dumps'
+        if name=='pec_block' and backend=='CUDA':
+            assert 'inside zero-field metal and are skipped' in logs['gpu'], f'FAIL [{name}]: no fused block was skipped'
         if name=='dumps' and backend in DEVICE_DFT_BACKENDS:
             assert 'Engine_GPU: frequency domain dumps accumulated on the device' in logs['gpu'], \
                 f'FAIL [{name}]: the {backend} backend did not accumulate the frequency domain dumps'
