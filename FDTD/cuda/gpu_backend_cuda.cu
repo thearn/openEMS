@@ -223,6 +223,20 @@ __device__ __forceinline__ void fused_ade(const CUDA_FusedADE& A, const CUDA_Gri
 #define FUSED_TY 8    // threads along y, the last row computes the border voltages only
 #define FUSED_XC 4    // x lines per block (default): short blocks are faster, despite the voltages of one more x line
 
+// x lines per fused block: OPENEMS_CUDA_FUSED_XC, else 8 on compute capability 8.9 (RTX 40: 4.9 % faster stepping than 4
+// on an RTX 4060, Lollipop 48 M cells, bit-identical; throughput-2026-10 H0), else FUSED_XC (measured on an RTX 2080 Ti
+// and an A100)
+static unsigned int FusedXC(int device)
+{
+	const char* env = getenv("OPENEMS_CUDA_FUSED_XC");
+	if (env)
+		return std::max(1, atoi(env));
+	int major = 0, minor = 0;
+	cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+	cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+	return (major==8 && minor==9) ? 8 : FUSED_XC;
+}
+
 // Fused step: the voltages and currents of the main nodes [B, E) in one pass, from the current
 // fields (volt_in, curr_in) into the next buffers (volt_out, curr_out); every value is computed
 // with the same operations as update_voltages/update_currents.
@@ -812,7 +826,7 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 			census.begin = {0, 0, 0};
 			census.end = census.dim;
 		}
-		census.xc = getenv("OPENEMS_CUDA_FUSED_XC") ? std::max(1, atoi(getenv("OPENEMS_CUDA_FUSED_XC"))) : FUSED_XC;
+		census.xc = FusedXC(ctx->device);
 		census.useful_y = FUSED_TY-1;
 		census.useful_z = FUSED_TZ-1;
 		for (unsigned int r=0; r<fregions.count; ++r)
@@ -877,7 +891,7 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 		CUDA_PaletteBenchmarkInput benchmark;
 		benchmark.path=palette_benchmark;
 		benchmark.nx=dim.nx;benchmark.ny=dim.ny;benchmark.nz=dim.nz;
-		benchmark.xc=getenv("OPENEMS_CUDA_FUSED_XC") ? std::max(1,atoi(getenv("OPENEMS_CUDA_FUSED_XC"))) : FUSED_XC;
+		benchmark.xc=FusedXC(ctx->device);
 		benchmark.global_index=index;benchmark.global_table=coeff;
 		std::swap(benchmark.coefficients,palette_coefficients);
 		benchmark.stream=Stream();
@@ -1188,7 +1202,7 @@ void GPU_Backend_CUDA::UpdateVoltages()
 			B.nx = B.ny = B.nz = 0;
 			E = d->dim;
 		}
-		static const unsigned int xc = getenv("OPENEMS_CUDA_FUSED_XC") ? std::max(1, atoi(getenv("OPENEMS_CUDA_FUSED_XC"))) : FUSED_XC;
+		static const unsigned int xc = FusedXC(d->ctx->device);
 		const dim3 block(FUSED_TZ, FUSED_TY, 1);
 		const dim3 grid((E.nz-B.nz+FUSED_TZ-2)/(FUSED_TZ-1), (E.ny-B.ny+FUSED_TY-2)/(FUSED_TY-1), (E.nx-B.nx+xc-1)/xc);
 		if (!d->fused_skip_built)
