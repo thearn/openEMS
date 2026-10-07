@@ -167,6 +167,16 @@ struct GPU_Backend_CUDA::Impl
 	//! Decide once whether the fused step is used, and prepare it
 	bool DecideFusedStep();
 
+	//! Blocks of the fused kernel whose fields provably stay zero (inside solid metal: every node of the block and its
+	//! one-node halo has zero voltage update coefficients vv and vi in all three components, no extension changes a
+	//! voltage there, and it lies in the main nodes): they return at once. e_zero: the per-node flag, found from the
+	//! coefficients while they are uploaded (the operator's host copy may be released later); fused_skip: one byte per
+	//! block of the fused launch grid, built at the first fused launch. OPENEMS_CUDA_SKIP_ZERO=0 turns it off.
+	std::vector<unsigned char> e_zero;
+	unsigned char* fused_skip;
+	bool fused_skip_built;
+	void BuildFusedSkip(const CUDA_GridDim& B, const CUDA_GridDim& E, unsigned int xc, const dim3& grid);
+
 	//! Field snapshots (see GPU_Backend_CUDA::SnapshotFields()): the dumped values, evaluated on the device
 	//! (gather_dumps) and downloaded on the copy stream into one of two page-locked host slots while the
 	//! next timesteps run

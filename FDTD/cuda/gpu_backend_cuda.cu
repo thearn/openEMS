@@ -26,6 +26,7 @@
 #include <stdexcept>
 
 #include "cuda_internal.h"
+#include "tools/useful.h"
 #include "FDTD/operator.h"
 #include "FDTD/extensions/engine_ext_upml.h"
 #include "FDTD/extensions/engine_ext_excitation.h"
@@ -241,9 +242,13 @@ template<unsigned int MODE, bool HAS_REGIONS, bool HAS_ADE>
 __global__ void __launch_bounds__(FUSED_TZ*FUSED_TY) update_fused(
 	const float* __restrict__ volt_in, const float* __restrict__ curr_in, float* volt_out, float* __restrict__ curr_out,
 	const void* index, const float* va, const float* vb, const float* ia, const float* ib, unsigned int mode,
-	CUDA_GridDim N, CUDA_GridDim B, CUDA_GridDim E, CUDA_FusedRegions F, CUDA_FusedADE A, unsigned int xc)
+	CUDA_GridDim N, CUDA_GridDim B, CUDA_GridDim E, CUDA_FusedRegions F, CUDA_FusedADE A, unsigned int xc,
+	const unsigned char* __restrict__ skip)
 {
 	__shared__ float sV[3][FUSED_TY][FUSED_TZ];
+	// a block inside zero-field metal (Impl::BuildFusedSkip): every thread returns before any barrier
+	if (skip && skip[(blockIdx.z*gridDim.y + blockIdx.y)*gridDim.x + blockIdx.x])
+		return;
 	const unsigned int tz = threadIdx.x, ty = threadIdx.y;
 	const unsigned int z = B.nz + blockIdx.x*(FUSED_TZ-1) + tz;
 	const unsigned int y = B.ny + blockIdx.y*(FUSED_TY-1) + ty;
@@ -336,10 +341,11 @@ template<unsigned int MODE, bool HAS_REGIONS, bool HAS_ADE>
 static void launch_update_fused(dim3 grid, dim3 block, cudaStream_t stream,
 	const float* volt_in, const float* curr_in, float* volt_out, float* curr_out,
 	const void* index, const float* va, const float* vb, const float* ia, const float* ib,
-	unsigned int mode, CUDA_GridDim N, CUDA_GridDim B, CUDA_GridDim E, CUDA_FusedRegions F, CUDA_FusedADE A, unsigned int xc)
+	unsigned int mode, CUDA_GridDim N, CUDA_GridDim B, CUDA_GridDim E, CUDA_FusedRegions F, CUDA_FusedADE A, unsigned int xc,
+	const unsigned char* skip)
 {
 	update_fused<MODE, HAS_REGIONS, HAS_ADE><<<grid, block, 0, stream>>>(
-		volt_in, curr_in, volt_out, curr_out, index, va, vb, ia, ib, mode, N, B, E, F, A, xc);
+		volt_in, curr_in, volt_out, curr_out, index, va, vb, ia, ib, mode, N, B, E, F, A, xc, skip);
 }
 
 // the dumped values of a snapshot: entries [0, nv) from the voltages, [nv, n) from the currents
@@ -584,6 +590,8 @@ GPU_Backend_CUDA::Impl::Impl()
 	fused_step_extra_bytes = 0;
 	fregions.count = 0;
 	volt_next = curr_next = NULL;
+	fused_skip = NULL;
+	fused_skip_built = false;
 	fixup = NULL;
 	fixup_count = 0;
 	fade.count = 0;
@@ -891,6 +899,56 @@ bool GPU_Backend_CUDA::Impl::DecideFusedStep()
 	return true;
 }
 
+void GPU_Backend_CUDA::Impl::BuildFusedSkip(const CUDA_GridDim& B, const CUDA_GridDim& E, unsigned int xc, const dim3& grid)
+{
+	fused_skip_built = true;
+	const char* env = getenv("OPENEMS_CUDA_SKIP_ZERO");
+	if ((env && atoi(env)==0) || e_zero.empty())
+	{
+		std::vector<unsigned char>().swap(e_zero);
+		return;
+	}
+	// nodes an extension changes (a voltage, or a node of an ADE group) never lie in a skipped block
+	std::vector<unsigned char> touched(numCells, 0);
+	for (unsigned int f : volt_modified)
+		touched[f % numCells] = 1;
+	for (const CUDA_ADECandidate& C : ade_candidates)
+		for (unsigned int f : C.flat)
+			touched[f] = 1;
+	const size_t blocks = (size_t)grid.x*grid.y*grid.z;
+	std::vector<unsigned char> skip(blocks, 0);
+	size_t skipped = 0;
+	const unsigned int ny = dim.ny, nz = dim.nz;
+	ParallelLines(grid.z, SetupThreads(grid.z), [&](unsigned int bz, unsigned int)
+	{
+		for (unsigned int by=0; by<grid.y; ++by)
+			for (unsigned int bx=0; bx<grid.x; ++bx)
+			{
+				// the block's nodes (threads, its border row and column, the x line after its last) and a one-node halo
+				const unsigned int z0 = B.nz + bx*(FUSED_TZ-1), y0 = B.ny + by*(FUSED_TY-1), x0 = B.nx + bz*xc;
+				const unsigned int z1 = z0 + FUSED_TZ + 1, y1 = y0 + FUSED_TY + 1, x1 = std::min(x0 + xc, E.nx) + 2;
+				bool ok = (z0>=main_start.nz+1) && (y0>=main_start.ny+1) && (x0>=main_start.nx+1)
+				          && (z1<=main_stop.nz) && (y1<=main_stop.ny) && (x1<=main_stop.nx);
+				for (unsigned int x=x0-1; ok && x<x1; ++x)
+					for (unsigned int y=y0-1; ok && y<y1; ++y)
+					{
+						const size_t base = ((size_t)x*ny + y)*nz;
+						for (unsigned int z=z0-1; ok && z<z1; ++z)
+							ok = e_zero[base+z] && !touched[base+z];
+					}
+				skip[((size_t)bz*grid.y + by)*grid.x + bx] = ok;
+			}
+	});
+	for (unsigned char b : skip)
+		skipped += b;
+	std::vector<unsigned char>().swap(e_zero);
+	if (skipped)
+	{
+		fused_skip = Alloc<unsigned char>(blocks, skip.data());
+		std::cout << "GPU_Backend_CUDA: " << skipped << " of " << blocks << " fused blocks lie inside zero-field metal and are skipped" << std::endl;
+	}
+}
+
 void GPU_Backend_CUDA::Impl::ResetZSlabs()
 {
 	zslab_lo = zslab_hi = false;
@@ -1064,6 +1122,18 @@ bool GPU_Backend_CUDA::Init(const Operator* op)
 	    }, sets) && ((force_compressed && atoi(force_compressed)!=0) || (sets.count<=sn/4)))
 	{
 		d->coeff_mode = sets.mode;
+		{
+			// the nodes whose voltages stay zero whatever their neighbours: vv = vi = 0 in all three components
+			std::vector<unsigned char> zero_set(sets.count, 0);
+			for (size_t k=0; k<sets.count; ++k)
+			{
+				const float* t = &sets.table[12*k];
+				zero_set[k] = (t[0]==0) && (t[1]==0) && (t[2]==0) && (t[3]==0) && (t[4]==0) && (t[5]==0);
+			}
+			d->e_zero.resize(sn);
+			for (size_t i=0; i<sn; ++i)
+				d->e_zero[i] = zero_set[sets.index[i]];
+		}
 		d->index = d->AllocIndex(sets);
 		d->coeff = d->Alloc<float>(sets.table.size(), sets.table.data());
 		std::cout << "GPU_Backend_CUDA: " << sets.count << " distinct coefficient sets, compressed update coefficients ("
@@ -1095,6 +1165,9 @@ bool GPU_Backend_CUDA::Init(const Operator* op)
 					iv[idx] = op->GetIV(n, pos[0], pos[1], pos[2]);
 				}
 	d->coeff_mode = 0;
+	d->e_zero.resize(sn);
+	for (size_t i=0; i<sn; ++i)
+		d->e_zero[i] = (vv[i]==0) && (vv[sn+i]==0) && (vv[2*sn+i]==0) && (vi[i]==0) && (vi[sn+i]==0) && (vi[2*sn+i]==0);
 	d->vv = d->Alloc<float>(count, vv.data());
 	d->vi = d->Alloc<float>(count, vi.data());
 	d->ii = d->Alloc<float>(count, ii.data());
@@ -1118,6 +1191,8 @@ void GPU_Backend_CUDA::UpdateVoltages()
 		static const unsigned int xc = getenv("OPENEMS_CUDA_FUSED_XC") ? std::max(1, atoi(getenv("OPENEMS_CUDA_FUSED_XC"))) : FUSED_XC;
 		const dim3 block(FUSED_TZ, FUSED_TY, 1);
 		const dim3 grid((E.nz-B.nz+FUSED_TZ-2)/(FUSED_TZ-1), (E.ny-B.ny+FUSED_TY-2)/(FUSED_TY-1), (E.nx-B.nx+xc-1)/xc);
+		if (!d->fused_skip_built)
+			d->BuildFusedSkip(B, E, xc, grid);
 		const bool timed = CUDA_KernelTimes::Enabled();
 		if (timed)
 			CUDA_KernelTimes::Begin(d->Stream());
@@ -1128,7 +1203,7 @@ void GPU_Backend_CUDA::UpdateVoltages()
 		const bool specialize = !(getenv("OPENEMS_CUDA_FUSED_SPECIALIZE") && atoi(getenv("OPENEMS_CUDA_FUSED_SPECIALIZE"))==0);
 		const bool ade = d->fade.count>0;
 #define FUSED_ARGS grid, block, d->Stream(), (const float*)d->volt, (const float*)d->curr, d->volt_next, d->curr_next, \
-		(const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, d->fade, xc
+		(const void*)d->index, va, vb, ia, ib, d->coeff_mode, d->dim, B, E, d->fregions, d->fade, xc, (const unsigned char*)d->fused_skip
 #define FUSED_LAUNCH(M, R) (ade ? launch_update_fused<M, R, true>(FUSED_ARGS) : launch_update_fused<M, R, false>(FUSED_ARGS))
 		if (!specialize)
 			FUSED_LAUNCH(3, true);
