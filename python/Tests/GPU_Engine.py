@@ -516,4 +516,37 @@ for name, case, on_device in cases:
         print('  no GPU device, device backend not tested')
     print('PASS [{}]'.format(name))
 
+# --release-host-operator: the GPU engine's results are unchanged when the operator's host coefficients are freed
+# after the upload, and a reuse of that operator is refused (RestartFDTD error 6)
+print('Testing case: release_host_operator')
+plain = os.path.join(tempfile.gettempdir(), 'GPU_Engine_lumped_gpu')
+backend = re.search(r'Create FDTD engine \(GPU, backend: (\w+)', run_captured(case_lumped, plain, 'gpu'))
+if backend and backend.group(1) in FULL_DEVICE_BACKENDS:
+    FDTD, CSX = case_lumped()
+    released = os.path.join(tempfile.gettempdir(), 'GPU_Engine_lumped_released')
+    log_file = released + '.log'
+    sys.stdout.flush()
+    saved = os.dup(1)
+    with open(log_file, 'w') as log:
+        os.dup2(log.fileno(), 1)
+        try:
+            FDTD.Run(released, cleanup=True, engine='gpu', release_host_operator=True)
+            reuse = FDTD.RunReuse(released + '_reuse', cleanup=True, engine='gpu')
+        finally:
+            try:
+                ctypes.CDLL(ctypes.util.find_library('c')).fflush(None)
+            except (OSError, AttributeError, TypeError):
+                pass
+            os.dup2(saved, 1)
+            os.close(saved)
+    with open(log_file) as log:
+        text = log.read()
+    assert "released the operator's host coefficients" in text, 'FAIL [release_host_operator]: the coefficients were not released'
+    diff, _, _, worst = compare_outputs(plain, released, rtol=0)
+    assert not diff, 'FAIL [release_host_operator]: results differ: ' + ', '.join(f'{n} ({d:.1e})' for n, d in diff)
+    assert reuse == 6, f'FAIL [release_host_operator]: the reuse of a released operator returned {reuse}, not 6'
+    print('PASS [release_host_operator]')
+else:
+    print('  no CUDA or Metal device, not tested')
+
 print('PASS')
