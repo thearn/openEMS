@@ -19,6 +19,10 @@ number moved up and patch releases now have somewhere to go.
 
 ### Added
 
+- **CUDA device memory report.** `OPENEMS_CUDA_MEMORY_REPORT=1` prints, at the
+  first time step, the device memory by the function that allocated it, against
+  the device's own use.
+
 - **SAR calculation reworked.** Averaging is done once for all frequencies
   instead of per frequency, and the calculation is multi-threaded, together
   giving a large speedup. Averaging follows IEEE/IEC 62704-1. The `--autorange`
@@ -73,6 +77,11 @@ number moved up and patch releases now have somewhere to go.
 - Python unit and integration tests, run in CI after each smoke test.
 
 ### Changed
+
+- **Less CUDA device memory for UPML.** The full UPML coefficient arrays are
+  uploaded only when read (separate UPML updates, or fused updates without
+  coefficient sets); fused updates with sets never read them. On a 107 M-cell
+  antenna model this freed 1.1 GB.
 
 - **The MPI engine was removed.** It had not compiled for years, as it used
   the C++ MPI bindings that MPI-3 dropped, it had no tests, and several

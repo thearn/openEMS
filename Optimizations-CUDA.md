@@ -154,13 +154,39 @@ at most 3%), other fused tile widths (within 1%), a CUDA NF2FF (the separable
 CPU far field takes 3 to 5 s), temporal blocking (the steps between half-steps
 carry the excitation, sheet ADE and fix-ups).
 
+## Device memory (2026-10)
+
+`OPENEMS_CUDA_MEMORY_REPORT=1` prints, at the first time step, the device memory each function allocated
+(`Impl::Alloc` records its caller; the names come from `dladdr`) against the device's own use. On the TFPA-1 patch
+array at 107 M cells (antenna-foundry `curated/tfpa1`, converged tier) it read, per cell:
+
+| owner | before | after |
+|---|---|---|
+| fields, coefficient index and sets (`GPU_Backend_CUDA::Init`) | 26.0 B | 26.0 B |
+| UPML (`CUDA_Ext_UPML`) | 15.2 B | 4.0 B |
+| frequency-domain dumps (`AddFieldDFT`; the NF2FF box) | 10.4 B | 0.16 B |
+| dispersive (ADE) material | 1.7 B | 1.7 B |
+| total | 53 B | 32 B |
+
+- **UPML**: the full coefficient arrays (18 floats a cell) were uploaded beside the coefficient sets that the fused
+  updates read. They are now uploaded at their first use: the separate UPML updates, or fused ones whose sets were
+  refused. The operator extension keeps its host arrays for the whole run, which allows the deferred upload.
+- **NF2FF dumps**: the box's faces held every mesh line, where far-field accuracy needs about a twentieth of a
+  wavelength. A dump's `opt_resolution` already samples it coarser; antenna-foundry now passes it
+  (`SimulationRecipe.nf2ff_resolution_mm`). At 2 mm on the TFPA-1 the radiation agreed to 0.002 dB.
+
+With the memory freed the 107 M-cell model takes the fused step on the RTX 4060 (3.1 G cell updates/s against 2.2 with
+separate updates), and a 194 M-cell model runs with separate updates in 6.1 GB. Still open: a mesh with more than
+65,536 distinct coefficient sets (graded meshes reach that) gets a 32-bit index, 2 more bytes a cell.
+
 ## Known limits (not performance, but related)
 
 - Float precision only.
 - 32-bit indexing in the kernels: meshes up to ~1.4 billion cells.
-- Device memory: ~24 bytes per node for the fields plus the compressed
-  coefficients, or 72 bytes per node with the full arrays. The host keeps a
-  pinned mirror of the fields (24 bytes per node).
+- Device memory: ~24 bytes per node for the fields, plus 2 or 4 bytes for the
+  compressed coefficients' index (72 bytes with the full arrays), plus the
+  extensions (see Device memory above); the fused step needs a second copy of
+  the fields. The host keeps a pinned mirror of the fields (24 bytes per node).
 - `CMAKE_CUDA_ARCHITECTURES` is set to `native`, so a build only runs on GPUs of
   the build machine's architecture. Packaged builds need an explicit list (for
   example `75;80;86;89;90`) plus PTX for newer GPUs.
