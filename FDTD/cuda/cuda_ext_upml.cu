@@ -86,7 +86,7 @@ public:
 	virtual void DoPreVoltageUpdates()
 	{
 		if (!Fused())
-			Pre(d->volt, m_VoltFlux, m_VV, m_VVFO);
+			PreVolt();
 		else if ((d->fused_step>0) && d->fregions.count)
 		{
 			// in the kernel: the current voltage flux in, the new one into the second buffer,
@@ -107,12 +107,12 @@ public:
 		if (Fused() && (d->fused_step<=0) && !m_InMain)
 			FuseVolt(d->volt);
 		else if (!Fused())
-			Post(d->volt, m_VoltFlux, m_VVFN);
+			PostVolt();
 	}
 	virtual void DoPreCurrentUpdates()
 	{
 		if (!Fused())
-			Pre(d->curr, m_CurrFlux, m_II, m_IIFO);
+			PreCurr();
 		else if ((d->fused_step>0) && !d->fregions.count)
 			FuseCurr(d->curr_next);
 	}
@@ -121,10 +121,29 @@ public:
 		if (Fused() && (d->fused_step<=0) && !m_InMain)
 			FuseCurr(d->curr);
 		else if (!Fused())
-			Post(d->curr, m_CurrFlux, m_IIFN);
+			PostCurr();
 	}
 
 protected:
+	// the separate UPML updates read the full coefficient arrays, uploaded at their first use (EnsureFull)
+	void PreVolt() {EnsureFull(); Pre(d->volt, m_VoltFlux, m_VV, m_VVFO);}
+	void PostVolt() {EnsureFull(); Post(d->volt, m_VoltFlux, m_VVFN);}
+	void PreCurr() {EnsureFull(); Pre(d->curr, m_CurrFlux, m_II, m_IIFO);}
+	void PostCurr() {EnsureFull(); Post(d->curr, m_CurrFlux, m_IIFN);}
+	//! The full coefficient arrays (18 floats a cell) on the device: needed by the separate UPML updates and by the
+	//! fused ones when the sets were refused; the fused updates with sets never read them, so they are not uploaded
+	//! unless used (the operator extension keeps its host arrays for the whole run)
+	void EnsureFull()
+	{
+		if (m_VV)
+			return;
+		m_VV   = Upload(m_OpExt->vv);
+		m_VVFO = Upload(m_OpExt->vvfo);
+		m_VVFN = Upload(m_OpExt->vvfn);
+		m_II   = Upload(m_OpExt->ii);
+		m_IIFO = Upload(m_OpExt->iifo);
+		m_IIFN = Upload(m_OpExt->iifn);
+	}
 	void Pre(float* field, float* flux, const float* c_old, const float* c_fo)
 	{
 		CUDA_Launch(d, "upml_pre", upml_pre, m_Region.lz*m_Region.ly, 1, m_Region.lx, field, flux, c_old, c_fo, d->dim, m_Region);
@@ -164,6 +183,7 @@ protected:
 
 	GPU_Backend_CUDA::Impl* d;
 	Engine* m_Eng;
+	Operator_Ext_UPML* m_OpExt;
 	UPMLRegion m_Region;
 	bool m_InMain;   //!< fused: updated by the main kernels (see CUDA_ZSlabs)
 	int m_Side;      //!< fused step with the regions in the kernel: the side of the region (see CUDA_FusedRegions)
@@ -184,6 +204,7 @@ CUDA_Ext_UPML::CUDA_Ext_UPML(GPU_Backend_CUDA::Impl* impl, Operator_Ext_UPML* op
 {
 	d = impl;
 	m_Eng = eng;
+	m_OpExt = op_ext;
 	m_InMain = false;
 	m_Side = -1;
 	m_VoltFlux2 = NULL;
@@ -200,12 +221,7 @@ CUDA_Ext_UPML::CUDA_Ext_UPML(GPU_Backend_CUDA::Impl* impl, Operator_Ext_UPML* op
 	const size_t cells = (size_t)m_Region.lx*m_Region.ly*m_Region.lz;
 	m_VoltFlux = d->Alloc<float>(3*cells);
 	m_CurrFlux = d->Alloc<float>(3*cells);
-	m_VV   = Upload(op_ext->vv);
-	m_VVFO = Upload(op_ext->vvfo);
-	m_VVFN = Upload(op_ext->vvfn);
-	m_II   = Upload(op_ext->ii);
-	m_IIFO = Upload(op_ext->iifo);
-	m_IIFN = Upload(op_ext->iifn);
+	m_VV = m_VVFO = m_VVFN = m_II = m_IIFO = m_IIFN = NULL;
 
 	// the 18 coefficients of a cell for the fused kernels: vv[3], vvfo[3], vvfn[3], ii[3], iifo[3], iifn[3]
 	const FDTD_FLOAT* src[6] = {op_ext->vv.data(), op_ext->vvfo.data(), op_ext->vvfn.data(),
@@ -225,6 +241,8 @@ CUDA_Ext_UPML::CUDA_Ext_UPML(GPU_Backend_CUDA::Impl* impl, Operator_Ext_UPML* op
 		m_SetIndex = d->AllocIndex(sets);
 		m_Sets = d->Alloc<float>(sets.table.size(), sets.table.data());
 	}
+	else
+		EnsureFull();   // the fused updates read the full arrays without sets
 }
 
 CUDA_Ext_UPML::~CUDA_Ext_UPML()
