@@ -205,13 +205,15 @@ struct GPU_Backend_CUDA::Impl
 
 	cudaStream_t Stream() const {return ctx->stream;}
 
-	//! Device buffer of \a count elements, initialized with \a host or zero; freed with this Impl
+	//! Device buffer of \a count elements, initialized with \a host or zero; freed with this Impl. Never inlined: each
+	//! allocation records its caller, so MemoryReport() can say which function holds the device memory.
 	template <typename T>
-	T* Alloc(size_t count, const T* host=NULL)
+	__attribute__((noinline)) T* Alloc(size_t count, const T* host=NULL)
 	{
 		T* ptr = NULL;
 		CUDA_Check(cudaMalloc(&ptr, std::max(count, (size_t)1)*sizeof(T)), "cudaMalloc");
 		m_Allocations.push_back(ptr);
+		m_AllocRecords.push_back({__builtin_return_address(0), std::max(count, (size_t)1)*sizeof(T)});
 		// on the work stream: it does not synchronize with the legacy default stream
 		if (host && count)
 			CUDA_Check(cudaMemcpyAsync(ptr, host, count*sizeof(T), cudaMemcpyHostToDevice, Stream()), "cudaMemcpy");
@@ -246,12 +248,19 @@ struct GPU_Backend_CUDA::Impl
 	//! Page-lock host memory (once) for fast transfers
 	void PinHostMemory(void* ptr, size_t bytes);
 
+	//! Device memory by the function that allocated it (Alloc), against the device's own use, printed once when the
+	//! environment variable OPENEMS_CUDA_MEMORY_REPORT=1 (call after setup, e.g. at the first time step)
+	void MemoryReport();
+	bool memory_reported = false;
+
 	//! Launch geometry: one thread per (i,j,k), i fastest
 	static dim3 Block(size_t ni, size_t nj);
 	static dim3 Grid(dim3 block, size_t ni, size_t nj, size_t nk);
 
 protected:
 	std::vector<void*> m_Allocations;
+	struct AllocRecord {void* caller; size_t bytes;};
+	std::vector<AllocRecord> m_AllocRecords;
 	std::set<void*> m_Pinned;
 };
 

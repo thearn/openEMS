@@ -18,6 +18,8 @@
 #include <algorithm>
 #include <chrono>
 #include <climits>
+#include <cxxabi.h>
+#include <dlfcn.h>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -1280,8 +1282,50 @@ void GPU_Backend_CUDA::UpdateVoltages()
 	            d->volt, (const float*)d->curr, (const void*)d->index, (const float*)(c ? d->coeff : d->vv), (const float*)(c ? d->coeff : d->vi), d->coeff_mode, d->dim, B, E, d->zslabs);
 }
 
+void GPU_Backend_CUDA::Impl::MemoryReport()
+{
+	memory_reported = true;
+	const char* env = getenv("OPENEMS_CUDA_MEMORY_REPORT");
+	if (!env || !atoi(env))
+		return;
+	std::map<std::string, std::pair<size_t, size_t>> by;      // function -> (bytes, allocations)
+	size_t total = 0;
+	for (const AllocRecord& r : m_AllocRecords)
+	{
+		std::string name = "?";
+		Dl_info info;
+		if (dladdr(r.caller, &info) && info.dli_sname)
+		{
+			int status = 0;
+			char* demangled = abi::__cxa_demangle(info.dli_sname, NULL, NULL, &status);
+			name = (status==0 && demangled) ? demangled : info.dli_sname;
+			free(demangled);
+			const size_t paren = name.find('(');
+			if (paren!=std::string::npos)
+				name.resize(paren);
+		}
+		by[name].first += r.bytes; by[name].second += 1; total += r.bytes;
+	}
+	size_t free_bytes = 0, total_bytes = 0;
+	if (cudaMemGetInfo(&free_bytes, &total_bytes)!=cudaSuccess)
+		cudaGetLastError();
+	std::vector<std::pair<size_t, std::string>> rows;
+	for (const auto& kv : by)
+		rows.push_back({kv.second.first, kv.first});
+	std::sort(rows.rbegin(), rows.rend());
+	const double cells = (double)numCells;
+	std::cout << "GPU_Backend_CUDA memory: " << total/1048576 << " MiB in " << m_AllocRecords.size() << " allocations ("
+	          << (double)total/cells << " B per cell); the device has " << (total_bytes-free_bytes)/1048576 << " of "
+	          << total_bytes/1048576 << " MiB in use (this process, its CUDA context and any other)" << std::endl;
+	for (const auto& r : rows)
+		std::cout << "GPU_Backend_CUDA memory:   " << r.first/1048576 << " MiB (" << (double)r.first/cells << " B per cell) "
+		          << r.second << " x" << by[r.second].second << std::endl;
+}
+
 void GPU_Backend_CUDA::UpdateCurrents()
 {
+	if (!d->memory_reported)
+		d->MemoryReport();
 	const bool c = d->coeff_mode>0;
 	if (d->fused_step>0)
 	{
