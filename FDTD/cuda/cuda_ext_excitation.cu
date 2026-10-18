@@ -16,6 +16,8 @@
 */
 
 #include <set>
+#include <algorithm>
+#include <vector>
 
 #include "cuda_internal.h"
 #include "FDTD/engine.h"
@@ -46,12 +48,16 @@ __global__ void excitation_apply(float* field, const unsigned int* index, const 
 }
 
 // same, in the order of the host, for excitation points sharing an edge
-__global__ void excitation_apply_serial(float* field, const unsigned int* index, const float* amp,
-                                        const unsigned int* delay, const float* signal, ExcitationParam P)
+// entries that share an edge, sorted by edge (stable): one thread per edge applies its entries in their order, so each
+// edge sees the additions the serial kernel would make, in the same order (bit-identical), and edges run in parallel
+__global__ void excitation_apply_segments(float* field, const unsigned int* index, const float* amp,
+                                          const unsigned int* delay, const float* signal, ExcitationParam P,
+                                          const unsigned int* seg_start, unsigned int num_segments)
 {
-	if (blockIdx.x*blockDim.x + threadIdx.x != 0)
+	const unsigned int s = blockIdx.x*blockDim.x + threadIdx.x;
+	if (s>=num_segments)
 		return;
-	for (unsigned int n=0; n<P.count; ++n)
+	for (unsigned int n=seg_start[s]; n<seg_start[s+1]; ++n)
 		excite(field, index, amp, delay, signal, P, n);
 }
 
@@ -67,7 +73,9 @@ protected:
 	struct Sources
 	{
 		unsigned int count;
-		bool serial;            //!< points share an edge, apply them one after the other
+		bool serial;            //!< points share an edge: sorted by edge, applied per edge (excitation_apply_segments)
+		unsigned int num_segments; //!< distinct edges when serial
+		unsigned int* seg_start;   //!< first entry of each distinct edge (num_segments+1)
 		unsigned int* index;    //!< flat NIJK index of the excited edge
 		float* amp;
 		unsigned int* delay;
@@ -120,9 +128,35 @@ void CUDA_Ext_Excitation::Setup(Sources& s, unsigned int count, unsigned int* co
 		if (!edges.insert(flat[n]).second)
 			s.serial = true;
 	}
-	s.index = d->Alloc<unsigned int>(count, flat.data());
-	s.amp = d->Alloc<float>(count, amp);
-	s.delay = d->Alloc<unsigned int>(count, delay);
+	s.num_segments = 0;
+	s.seg_start = NULL;
+	if (!s.serial)
+	{
+		s.index = d->Alloc<unsigned int>(count, flat.data());
+		s.amp = d->Alloc<float>(count, amp);
+		s.delay = d->Alloc<unsigned int>(count, delay);
+	}
+	else
+	{
+		std::vector<unsigned int> order(count);
+		for (unsigned int n=0; n<count; ++n)
+			order[n] = n;
+		std::stable_sort(order.begin(), order.end(), [&flat](unsigned int a, unsigned int b) {return flat[a]<flat[b];});
+		std::vector<unsigned int> f(count), dl(count), starts;
+		std::vector<float> am(count);
+		for (unsigned int n=0; n<count; ++n)
+		{
+			f[n] = flat[order[n]]; am[n] = amp[order[n]]; dl[n] = delay[order[n]];
+			if (n==0 || f[n]!=f[n-1])
+				starts.push_back(n);
+		}
+		s.num_segments = starts.size();
+		starts.push_back(count);
+		s.index = d->Alloc<unsigned int>(count, f.data());
+		s.amp = d->Alloc<float>(count, am.data());
+		s.delay = d->Alloc<unsigned int>(count, dl.data());
+		s.seg_start = d->Alloc<unsigned int>(starts.size(), starts.data());
+	}
 	s.signal = d->Alloc<float>(m_Op_Exc->m_Exc->GetLength(), signal);
 }
 
@@ -140,8 +174,9 @@ void CUDA_Ext_Excitation::Apply(Sources& s, float* field)
 	param.count = s.count;
 
 	if (s.serial)
-		CUDA_Launch(d, "excitation_apply_serial", excitation_apply_serial, 1, 1, 1,
-		            field, (const unsigned int*)s.index, (const float*)s.amp, (const unsigned int*)s.delay, (const float*)s.signal, param);
+		CUDA_Launch(d, "excitation_apply_segments", excitation_apply_segments, s.num_segments, 1, 1,
+		            field, (const unsigned int*)s.index, (const float*)s.amp, (const unsigned int*)s.delay, (const float*)s.signal, param,
+		            (const unsigned int*)s.seg_start, s.num_segments);
 	else
 		CUDA_Launch(d, "excitation_apply", excitation_apply, s.count, 1, 1,
 		            field, (const unsigned int*)s.index, (const float*)s.amp, (const unsigned int*)s.delay, (const float*)s.signal, param);
