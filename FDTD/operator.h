@@ -361,6 +361,8 @@ protected:
 	double CalcTimestep_Var4();
 	//! Conformal thin conducting sheets (OPENEMS_CONFORMAL_SHEETS=1)
 	void ApplyConformalSheets();
+	//! Add per-edge capacitance and conductance increments from OPENEMS_EDGE_FIELDS (an HDF5 file), if set.
+	void ApplyEdgeFields();
 	std::unordered_set<size_t> m_ConformalFree;
 	size_t m_ConfStride[4] = {0,0,0,0};
 
