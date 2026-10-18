@@ -22,6 +22,8 @@
 
 #include "CSPrimCurve.h"
 #include "CSPropExcitation.h"
+#include <hdf5.h>
+#include <cmath>
 
 using std::cout;
 using std::cerr;
@@ -131,7 +133,11 @@ bool Operator_Ext_Excitation::BuildExtension()
 
 	std::vector<CSProperties*> vec_prop = CSX->GetPropertyByType(CSProperties::EXCITATION);
 
-	if (vec_prop.size()==0)
+	// OPENEMS_EXTRA_EXCITATION=file.h5: soft excitation entries beyond the model's own, float64 rows of
+	// (component, i, j, k, amplitude, delay in timesteps) in /volt (edge voltages) and /curr (edge currents)
+	const char* extra = getenv("OPENEMS_EXTRA_EXCITATION");
+	bool has_extra = extra!=NULL && extra[0]!=0;
+	if (vec_prop.size()==0 && !has_extra)
 	{
 		cerr << "Operator::CalcFieldExcitation: Warning, no excitation properties found" << endl;
 		return false;
@@ -288,6 +294,53 @@ bool Operator_Ext_Excitation::BuildExtension()
 				}
 			}
 		}
+	}
+
+	if (has_extra)
+	{
+		hid_t file = H5Fopen(extra, H5F_ACC_RDONLY, H5P_DEFAULT);
+		if (file<0)
+		{
+			cerr << "Operator_Ext_Excitation: cannot open " << extra << endl;
+			exit(1);
+		}
+		const char* names[2] = {"/volt", "/curr"};
+		unsigned int numLines[] = {m_Op->GetNumberOfLines(0,true),m_Op->GetNumberOfLines(1,true),m_Op->GetNumberOfLines(2,true)};
+		for (int q=0; q<2; ++q)
+		{
+			if (H5Lexists(file, names[q], H5P_DEFAULT)<=0)
+				continue;
+			hid_t ds = H5Dopen2(file, names[q], H5P_DEFAULT);
+			hid_t sp = H5Dget_space(ds);
+			hsize_t dims[2] = {0, 0};
+			if (H5Sget_simple_extent_ndims(sp)!=2 || (H5Sget_simple_extent_dims(sp, dims, NULL), dims[1]!=6))
+			{
+				cerr << "Operator_Ext_Excitation: " << names[q] << " must be (N, 6)" << endl;
+				exit(1);
+			}
+			std::vector<double> rows(dims[0]*6);
+			H5Dread(ds, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, rows.data());
+			H5Sclose(sp); H5Dclose(ds);
+			for (hsize_t r=0; r<dims[0]; ++r)
+			{
+				const double* row = &rows[r*6];
+				unsigned int comp = (unsigned int)row[0];
+				unsigned int p3[3] = {(unsigned int)row[1], (unsigned int)row[2], (unsigned int)row[3]};
+				if (comp>2 || p3[0]>=numLines[0] || p3[1]>=numLines[1] || p3[2]>=numLines[2] || row[5]<0)
+				{
+					cerr << "Operator_Ext_Excitation: " << names[q] << " row " << r << " is outside the mesh" << endl;
+					exit(1);
+				}
+				std::vector<unsigned int>* idx = q==0 ? volt_vIndex : curr_vIndex;
+				for (int n=0; n<3; ++n)
+					idx[n].push_back(p3[n]);
+				(q==0 ? volt_vExcit : curr_vExcit).push_back((FDTD_FLOAT)row[4]);
+				(q==0 ? volt_vDelay : curr_vDelay).push_back((unsigned int)llround(row[5]));
+				(q==0 ? volt_vDir : curr_vDir).push_back(comp);
+			}
+			cout << "Operator_Ext_Excitation: " << dims[0] << " " << (q==0 ? "voltage" : "current") << " entries from " << extra << endl;
+		}
+		H5Fclose(file);
 	}
 
 	// set voltage excitations
