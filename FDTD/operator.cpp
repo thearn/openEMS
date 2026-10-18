@@ -2810,38 +2810,11 @@ double Operator::CalcTimestep_Var3()
 // applied to it. A face of the plane partially covered carries the normal H over its free area:
 // L and R scale by A_free/A. Faces with a free fraction below OPENEMS_CONFORMAL_AMIN (default 0.3)
 // keep their L, which bounds the local frequency rise. Enabled by OPENEMS_CONFORMAL_SHEETS=1.
-// read a float32 dataset of rank `rank` from an open HDF5 file into `out` (C order), its dimensions into `dims`
-static bool ReadFloatDataSet(hid_t file, const char* name, int rank, std::vector<hsize_t>& dims, std::vector<float>& out)
-{
-	if (H5Lexists(file, name, H5P_DEFAULT)<=0)
-		return false;
-	hid_t ds = H5Dopen2(file, name, H5P_DEFAULT);
-	hid_t sp = H5Dget_space(ds);
-	if (H5Sget_simple_extent_ndims(sp)!=rank)
-	{
-		cerr << "Operator: dataset " << name << " is not of rank " << rank << endl;
-		exit(1);
-	}
-	dims.assign(rank, 0);
-	H5Sget_simple_extent_dims(sp, dims.data(), NULL);
-	size_t n = 1;
-	for (int r=0; r<rank; ++r)
-		n *= dims[r];
-	out.assign(n, 0.f);
-	if (H5Dread(ds, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, out.data())<0)
-	{
-		cerr << "Operator: cannot read " << name << endl;
-		exit(1);
-	}
-	H5Sclose(sp); H5Dclose(ds);
-	return true;
-}
-
 void Operator::ApplyEdgeFields()
 {
-	// OPENEMS_EDGE_FIELDS=file.h5: per-edge increments of the edge capacitance (/dC, F) and conductance (/dG, S), each
-	// a float32 (3, nx, ny, nz) array in C order over an index box whose first index is the float32 dataset /start (3
-	// values), added to the material's before the update coefficients are formed (smooth design fields on a fixed mesh)
+	// OPENEMS_EDGE_FIELDS=file.h5: per-edge increments of the edge capacitance (F) and conductance (S), added to the
+	// material's before the update coefficients are formed (smooth design fields on a fixed mesh): /edges, float64
+	// (N, 4) rows of (component, i, j, k), and /dC, /dG, float32 (N) (either may be absent)
 	const char* fn = getenv("OPENEMS_EDGE_FIELDS");
 	if (fn==NULL || fn[0]==0)
 		return;
@@ -2851,46 +2824,56 @@ void Operator::ApplyEdgeFields()
 		cerr << "Operator::ApplyEdgeFields: cannot open " << fn << endl;
 		exit(1);
 	}
-	std::vector<hsize_t> sd; std::vector<float> start;
-	if (!ReadFloatDataSet(file, "/start", 1, sd, start) || start.size()!=3)
+	if (H5Lexists(file, "/edges", H5P_DEFAULT)<=0)
 	{
-		cerr << "Operator::ApplyEdgeFields: " << fn << " has no /start of three indices" << endl;
+		cerr << "Operator::ApplyEdgeFields: " << fn << " has no /edges" << endl;
 		exit(1);
 	}
-	unsigned int count = 0;
-	double sum[2] = {0, 0};
+	hid_t ds = H5Dopen2(file, "/edges", H5P_DEFAULT);
+	hid_t sp = H5Dget_space(ds);
+	hsize_t dims[2] = {0, 0};
+	if (H5Sget_simple_extent_ndims(sp)!=2 || (H5Sget_simple_extent_dims(sp, dims, NULL), dims[1]!=4))
+	{
+		cerr << "Operator::ApplyEdgeFields: /edges must be (N, 4)" << endl;
+		exit(1);
+	}
+	std::vector<double> edges(dims[0]*4);
+	H5Dread(ds, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, edges.data());
+	H5Sclose(sp); H5Dclose(ds);
 	const char* names[2] = {"/dC", "/dG"};
+	double sum[2] = {0, 0};
 	for (int q=0; q<2; ++q)
 	{
-		std::vector<hsize_t> dims; std::vector<float> d;
-		if (!ReadFloatDataSet(file, names[q], 4, dims, d))
+		if (H5Lexists(file, names[q], H5P_DEFAULT)<=0)
 			continue;
-		if (dims[0]!=3)
+		hid_t dq = H5Dopen2(file, names[q], H5P_DEFAULT);
+		hid_t sq = H5Dget_space(dq);
+		hsize_t n = 0;
+		H5Sget_simple_extent_dims(sq, &n, NULL);
+		if (H5Sget_simple_extent_ndims(sq)!=1 || n!=dims[0])
 		{
-			cerr << "Operator::ApplyEdgeFields: " << names[q] << " must be (3, nx, ny, nz)" << endl;
+			cerr << "Operator::ApplyEdgeFields: " << names[q] << " must be (N) beside /edges" << endl;
 			exit(1);
 		}
-		for (unsigned int n=0; n<3; ++n)
-			for (hsize_t i=0; i<dims[1]; ++i)
-				for (hsize_t j=0; j<dims[2]; ++j)
-					for (hsize_t k=0; k<dims[3]; ++k)
-					{
-						float v = d[((n*dims[1] + i)*dims[2] + j)*dims[3] + k];
-						if (v==0)
-							continue;
-						unsigned int pos[3] = {(unsigned int)start[0]+(unsigned int)i, (unsigned int)start[1]+(unsigned int)j, (unsigned int)start[2]+(unsigned int)k};
-						if (pos[0]>=numLines[0] || pos[1]>=numLines[1] || pos[2]>=numLines[2])
-						{
-							cerr << "Operator::ApplyEdgeFields: " << names[q] << " reaches past the mesh" << endl;
-							exit(1);
-						}
-						unsigned int ipos = MainOp->SetPos(pos[0],pos[1],pos[2]);
-						if (q==0) EC_C[n][ipos] += v; else EC_G[n][ipos] += v;
-						sum[q] += v; ++count;
-					}
+		std::vector<float> v(n);
+		H5Dread(dq, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, v.data());
+		H5Sclose(sq); H5Dclose(dq);
+		for (hsize_t r=0; r<n; ++r)
+		{
+			unsigned int c = (unsigned int)edges[r*4];
+			unsigned int pos[3] = {(unsigned int)edges[r*4+1], (unsigned int)edges[r*4+2], (unsigned int)edges[r*4+3]};
+			if (c>2 || pos[0]>=numLines[0] || pos[1]>=numLines[1] || pos[2]>=numLines[2])
+			{
+				cerr << "Operator::ApplyEdgeFields: row " << r << " is outside the mesh" << endl;
+				exit(1);
+			}
+			unsigned int ipos = MainOp->SetPos(pos[0],pos[1],pos[2]);
+			if (q==0) EC_C[c][ipos] += v[r]; else EC_G[c][ipos] += v[r];
+			sum[q] += v[r];
+		}
 	}
 	H5Fclose(file);
-	cout << "Operator::ApplyEdgeFields: " << count << " edge increments from " << fn << " (sum dC " << sum[0] << " F, sum dG " << sum[1] << " S)" << endl;
+	cout << "Operator::ApplyEdgeFields: " << dims[0] << " edges from " << fn << " (sum dC " << sum[0] << " F, sum dG " << sum[1] << " S)" << endl;
 }
 
 void Operator::ApplyConformalSheets()
