@@ -2872,8 +2872,53 @@ void Operator::ApplyEdgeFields()
 			sum[q] += v[r];
 		}
 	}
+	// /hedges, float64 (M, 4) rows of (component, i, j, k), and /Lscale, float32 (M): the magnetic edges' L and R scaled
+	// (the free fraction of a primary face partly inside a conductor, as ApplyConformalSheets scales a sheet's faces)
+	size_t nh = 0; double lsum = 0;
+	if (H5Lexists(file, "/hedges", H5P_DEFAULT)>0)
+	{
+		hid_t dh = H5Dopen2(file, "/hedges", H5P_DEFAULT);
+		hid_t sh = H5Dget_space(dh);
+		hsize_t hd[2] = {0, 0};
+		if (H5Sget_simple_extent_ndims(sh)!=2 || (H5Sget_simple_extent_dims(sh, hd, NULL), hd[1]!=4) || H5Lexists(file, "/Lscale", H5P_DEFAULT)<=0)
+		{
+			cerr << "Operator::ApplyEdgeFields: /hedges must be (M, 4), with /Lscale (M)" << endl;
+			exit(1);
+		}
+		std::vector<double> hedges(hd[0]*4);
+		H5Dread(dh, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, hedges.data());
+		H5Sclose(sh); H5Dclose(dh);
+		hid_t dl = H5Dopen2(file, "/Lscale", H5P_DEFAULT);
+		hid_t sl = H5Dget_space(dl);
+		hsize_t m = 0;
+		H5Sget_simple_extent_dims(sl, &m, NULL);
+		if (H5Sget_simple_extent_ndims(sl)!=1 || m!=hd[0])
+		{
+			cerr << "Operator::ApplyEdgeFields: /Lscale must be (M) beside /hedges" << endl;
+			exit(1);
+		}
+		std::vector<float> s(m);
+		H5Dread(dl, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, s.data());
+		H5Sclose(sl); H5Dclose(dl);
+		for (hsize_t r=0; r<m; ++r)
+		{
+			unsigned int c = (unsigned int)hedges[r*4];
+			unsigned int pos[3] = {(unsigned int)hedges[r*4+1], (unsigned int)hedges[r*4+2], (unsigned int)hedges[r*4+3]};
+			if (c>2 || pos[0]>=numLines[0] || pos[1]>=numLines[1] || pos[2]>=numLines[2] || !(s[r]>0))
+			{
+				cerr << "Operator::ApplyEdgeFields: /hedges row " << r << " is outside the mesh or its scale is not positive" << endl;
+				exit(1);
+			}
+			unsigned int ipos = MainOp->SetPos(pos[0],pos[1],pos[2]);
+			EC_L[c][ipos] *= s[r]; EC_R[c][ipos] *= s[r];
+			lsum += s[r];
+		}
+		nh = m;
+	}
 	H5Fclose(file);
-	cout << "Operator::ApplyEdgeFields: " << dims[0] << " edges from " << fn << " (sum dC " << sum[0] << " F, sum dG " << sum[1] << " S)" << endl;
+	cout << "Operator::ApplyEdgeFields: " << dims[0] << " edges from " << fn << " (sum dC " << sum[0] << " F, sum dG " << sum[1] << " S)";
+	if (nh) cout << ", " << nh << " magnetic edges scaled (mean " << lsum/nh << ")";
+	cout << endl;
 }
 
 void Operator::ApplyConformalSheets()
