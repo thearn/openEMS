@@ -1,3 +1,4 @@
+#include <unordered_map>
 #include <unordered_set>
 #include <map>
 #include <mutex>
@@ -2826,8 +2827,9 @@ double Operator::CalcTimestep_Var3()
 // In each sheet plane, an in-plane edge partially covered by the sheet carries the field of its
 // free part: its voltage is E*l_free, so C and G scale by l/l_free, and the sheet model is not
 // applied to it. A face of the plane partially covered carries the normal H over its free area:
-// L and R scale by A_free/A. Faces with a free fraction below OPENEMS_CONFORMAL_AMIN (default 0.3)
-// keep their L, which bounds the local frequency rise. Enabled by OPENEMS_CONFORMAL_SHEETS=1.
+// L and R scale by A_free/A, never below OPENEMS_CONFORMAL_AMIN (default 0.3), which bounds the local
+// frequency rise: under it a face hands over to the covered state (see ApplyConformalSheets). Edge
+// scales are floored at OPENEMS_CONFORMAL_UMIN (default 1e-4). Enabled by OPENEMS_CONFORMAL_SHEETS=1.
 void Operator::ApplyEdgeFields()
 {
 	// OPENEMS_EDGE_FIELDS=file.h5: per-edge increments of the edge capacitance (F) and conductance (S), added to the
@@ -2947,7 +2949,7 @@ void Operator::ApplyConformalSheets()
 	const char* envA = getenv("OPENEMS_CONFORMAL_AMIN");
 	const double amin = envA ? atof(envA) : 0.3;
 	const char* envU = getenv("OPENEMS_CONFORMAL_UMIN");
-	const double umin = envU ? atof(envU) : 0.05;
+	const double umin = envU ? atof(envU) : 1e-4;   // a larger C only lowers the local frequency: no stability bound
 	m_ConformalFree.clear();
 	MainOp->ResetShift();
 	{
@@ -2984,7 +2986,7 @@ void Operator::ApplyConformalSheets()
 		if (b.empty()) b.assign(box, box+6);
 		for (int n=0;n<3;++n) { b[2*n]=std::min(b[2*n],std::min(box[2*n],box[2*n+1])); b[2*n+1]=std::max(b[2*n+1],std::max(box[2*n],box[2*n+1])); }
 	}
-	size_t nPartialEdges=0, nPartialFaces=0, nKeptFaces=0;
+	size_t nPartialEdges=0, nPartialFaces=0, nKeptFaces=0, nHandedEdges=0;
 	for (auto& pl : planes)
 	{
 		const int nn = pl.first.first; const unsigned int k = pl.first.second;
@@ -3005,85 +3007,149 @@ void Operator::ApplyConformalSheets()
 			double c[3]; c[nn]=zc; c[a]=ca; c[b]=cb;
 			return PropertyByPriority(c, prims, false, NULL)!=NULL;
 		};
-		// Coverage continuous in the sheet's edges (solvers-2026-10, the Rev E gradient session): an edge's covered
-		// length from the boundary crossings found by bisection between coarse samples (to 1e-5 of the edge), a face's
-		// free area from a 64 x 64 sample once a 4 x 4 one finds it mixed (the former 16 samples per edge and 8 x 8 per
-		// face stepped a strip's response by 0.7 dB as its edge crossed a sample column). A face under the free-area
-		// minimum is scaled by the minimum, never left unscaled (that reset was a step of 1/amin).
-		const int Ns = 16, Nf = 64, Nc = 4;
-		std::mutex lock;
-		ParallelLines(a1-a0+1, SetupThreads(a1-a0+1), [&](unsigned int li, unsigned int)
+		// Coverage continuous in the sheet's boundary (solvers-2026-10, the Rev E gradient session), so a sheet edge's
+		// position moves the response smoothly:
+		// - an edge's free fraction is exact: the boundary crossings between coarse samples found by bisection;
+		// - a face's free area is a 4-point Gauss rule over lines crossing the boundary (along the face's partly
+		//   covered edges), each line's free fraction exact as an edge's: exact for a straight boundary;
+		// - below the free-area minimum a face hands over to the covered state instead of being held: with
+		//   s = 1 - A_free/(amin A) its L and R scale by amin + s (1 - amin) (never below amin, the timestep bound),
+		//   and each wholly free edge bounding it scales C and G as one free over a fraction 1 - s, so at full
+		//   coverage the face is unscaled and its edges closed, as the covered sheet has them.
+		// The former 16 samples per edge, 8 x 8 (then 64 x 64) per face and the reset (then hold) at the minimum each
+		// stepped a strip's response, by up to 0.7 dB, as its edge moved.
+		const int Ns = 16, Nc = 4;
+		const double GX[4] = {-0.8611363115940526, -0.3399810435848563, 0.3399810435848563, 0.8611363115940526};
+		const double GW[4] = {0.3478548451374538, 0.6521451548625461, 0.6521451548625461, 0.3478548451374538};
+		// free fraction of the segment [lo,hi] along in-plane axis n at coordinate `fixed` on the other
+		auto segFree = [&](int n, double lo, double hi, double fixed) -> double
+		{
+			auto cov = [&](double t) -> bool { return (n==a) ? covered(t, fixed) : covered(fixed, t); };
+			double q[Ns+2]; bool st[Ns+2];
+			const double eps = 1e-6*(hi-lo);
+			q[0] = lo+eps; q[Ns+1] = hi-eps;
+			for (int s=0;s<Ns;++s) q[s+1] = lo + (s+0.5)/Ns*(hi-lo);
+			int cnt=0;
+			for (int s=0;s<Ns+2;++s) cnt += (st[s] = cov(q[s]));
+			if (cnt==0) return 1.0;
+			if (cnt==Ns+2) return 0.0;
+			double coveredLen = (st[0] ? eps : 0) + (st[Ns+1] ? eps : 0);
+			for (int s=0;s<Ns+1;++s)
+			{
+				if (st[s]==st[s+1]) { if (st[s]) coveredLen += q[s+1]-q[s]; continue; }
+				double x0 = q[s], x1 = q[s+1];                      // one transition between: bisect it
+				for (int it=0; it<24; ++it)
+				{
+					double xm = 0.5*(x0+x1);
+					if (cov(xm)==st[s]) x0 = xm; else x1 = xm;
+				}
+				double xs = 0.5*(x0+x1);
+				coveredLen += st[s] ? (xs-q[s]) : (q[s+1]-xs);
+			}
+			return std::min(1.0, std::max(0.0, 1.0-coveredLen/(hi-lo)));
+		};
+		auto isPartial = [](double f) { return f>1e-7 && f<1.0-1e-7; };
+		// pass 1: every in-plane edge's free fraction, edges along a (0) and along b (1) at (i,j)
+		const unsigned int NA = a1-a0+1, NB = b1-b0+1;
+		std::vector<float> Fe[2] = {std::vector<float>((size_t)NA*NB, 1.f), std::vector<float>((size_t)NA*NB, 1.f)};
+		auto FI = [&](unsigned int i, unsigned int j) -> size_t { return (size_t)(i-a0)*NB + (j-b0); };
+		ParallelLines(NA, SetupThreads(NA), [&](unsigned int li, unsigned int)
 		{
 			unsigned int i = a0+li;
-			size_t pe=0, pf=0, kf=0;
-			std::vector<size_t> freeEdges;
 			for (unsigned int j=b0; j<=b1; ++j)
 			{
-				unsigned int pos[3]; pos[nn]=k; pos[a]=i; pos[b]=j;
-				// edge along a from line i to i+1 at b-line j
-				for (int dir=0; dir<2; ++dir)
+				if (i+1<numLines[a]) Fe[0][FI(i,j)] = segFree(a, GetDiscLine(a,i), GetDiscLine(a,i+1), GetDiscLine(b,j));
+				if (j+1<numLines[b]) Fe[1][FI(i,j)] = segFree(b, GetDiscLine(b,j), GetDiscLine(b,j+1), GetDiscLine(a,i));
+			}
+		});
+		// pass 2: faces; those under the minimum ask their wholly free edges to hand over
+		std::mutex lock;
+		std::unordered_map<size_t,float> handover;                  // (dir*NA*NB + FI) -> the edge's free fraction
+		ParallelLines(NA, SetupThreads(NA), [&](unsigned int li, unsigned int)
+		{
+			unsigned int i = a0+li;
+			if (i+1>a1)
+				return;
+			size_t pf=0, kf=0;
+			std::vector<std::pair<size_t,float>> req;
+			for (unsigned int j=b0; j+1<=b1; ++j)
+			{
+				const double e[4] = {Fe[0][FI(i,j)], Fe[0][FI(i,j+1)], Fe[1][FI(i,j)], Fe[1][FI(i+1,j)]};
+				const size_t ek[4] = {FI(i,j), FI(i,j+1), (size_t)NA*NB+FI(i,j), (size_t)NA*NB+FI(i+1,j)};
+				const bool pa = isPartial(e[0]) || isPartial(e[1]), pb = isPartial(e[2]) || isPartial(e[3]);
+				bool allFree = true, allCov = true;
+				for (int q=0;q<4;++q) { allFree = allFree && e[q]>=1.0-1e-7; allCov = allCov && e[q]<=1e-7; }
+				const double la0=GetDiscLine(a,i), la1=GetDiscLine(a,i+1), lb0=GetDiscLine(b,j), lb1=GetDiscLine(b,j+1);
+				if (!pa && !pb && (allFree || allCov))
 				{
-					int n = dir==0 ? a : b;
-					int m = dir==0 ? b : a;
-					if (pos[n]+1>=numLines[n]) continue;
-					double lo = GetDiscLine(n,pos[n]), hi = GetDiscLine(n,pos[n]+1), fixed = GetDiscLine(m,pos[m]);
-					auto cov = [&](double t) -> bool { return (n==a) ? covered(t, fixed) : covered(fixed, t); };
-					// samples: the ends (just inside) and Ns midpoints
-					double q[Ns+2]; bool st[Ns+2];
-					const double eps = 1e-6*(hi-lo);
-					q[0] = lo+eps; q[Ns+1] = hi-eps;
-					for (int s=0;s<Ns;++s) q[s+1] = lo + (s+0.5)/Ns*(hi-lo);
-					int cnt=0;
-					for (int s=0;s<Ns+2;++s) { st[s] = cov(q[s]); cnt += (s>=1 && s<=Ns) ? st[s] : 0; }
-					if (!(st[0] || cnt>0 || st[Ns+1]) || (st[0] && cnt==Ns && st[Ns+1]))
-						continue;                                           // wholly free or wholly covered
-					double coveredLen = 0;
-					for (int s=0;s<Ns+1;++s)
-					{
-						if (st[s]==st[s+1]) { if (st[s]) coveredLen += q[s+1]-q[s]; continue; }
-						double x0 = q[s], x1 = q[s+1];                      // one transition between: bisect it
-						for (int it=0; it<20; ++it)
-						{
-							double xm = 0.5*(x0+x1);
-							if (cov(xm)==st[s]) x0 = xm; else x1 = xm;
-						}
-						double xs = 0.5*(x0+x1);
-						coveredLen += st[s] ? (xs-q[s]) : (q[s+1]-xs);
-					}
-					double u = std::max(1.0-coveredLen/(hi-lo), umin);
-					if (u>=1.0) continue;
-					size_t ipos = IDX(pos);
-					EC_C[n][ipos] /= u; EC_G[n][ipos] /= u;
-					freeEdges.push_back(n*(size_t)numLines[0]*numLines[1]*numLines[2] + ipos);
-					++pe;
-				}
-				// face [i,i+1] x [j,j+1] in the plane: current component nn at pos
-				if (i+1<numLines[a] && j+1<numLines[b])
-				{
-					double la0=GetDiscLine(a,i), la1=GetDiscLine(a,i+1), lb0=GetDiscLine(b,j), lb1=GetDiscLine(b,j+1);
-					int cc=0;
+					int cc=0;                                       // an island or hole inside the face
 					for (int s=0;s<Nc;++s) for (int t=0;t<Nc;++t)
 						cc += covered(la0+(s+0.5)/Nc*(la1-la0), lb0+(t+0.5)/Nc*(lb1-lb0));
 					if (cc==0 || cc==Nc*Nc)
-						continue;                                           // (a boundary inside a coarse cell is missed: below 1/16 of the face)
-					int cnt=0;
-					for (int s=0;s<Nf;++s) for (int t=0;t<Nf;++t)
-						cnt += covered(la0+(s+0.5)/Nf*(la1-la0), lb0+(t+0.5)/Nf*(lb1-lb0));
-					double af = 1.0-(double)cnt/(Nf*Nf);
-					if (af>=1.0) continue;
-					size_t ipos = IDX(pos);
-					if (af<amin) { af = amin; ++kf; }
-					EC_L[nn][ipos] *= af; EC_R[nn][ipos] *= af;
-					++pf;
+						continue;
 				}
+				const bool alongA = pa || !pb;                      // lines along a at the Gauss points in b, or the reverse
+				double af = 0;
+				for (int g=0; g<4; ++g)
+					af += 0.5*GW[g]*(alongA ? segFree(a, la0, la1, 0.5*(lb0+lb1)+0.5*GX[g]*(lb1-lb0))
+					                        : segFree(b, lb0, lb1, 0.5*(la0+la1)+0.5*GX[g]*(la1-la0)));
+				if (af>=1.0-1e-9 || af<=1e-9)
+					continue;                                       // free, or covered (where the hand-over ends)
+				double sc = af;
+				if (af<amin)
+				{
+					sc = amin + (1.0-af/amin)*(1.0-amin);
+					for (int q=0;q<4;++q)
+						if (e[q]>=1.0-1e-7)
+							req.emplace_back(ek[q], (float)(af/amin));
+					++kf;
+				}
+				unsigned int pos[3]; pos[nn]=k; pos[a]=i; pos[b]=j;
+				size_t ipos = IDX(pos);
+				EC_L[nn][ipos] *= sc; EC_R[nn][ipos] *= sc;
+				++pf;
 			}
 			std::lock_guard<std::mutex> guard(lock);
+			for (auto& r : req)
+			{
+				auto it = handover.find(r.first);
+				if (it==handover.end() || r.second<it->second)
+					handover[r.first] = r.second;
+			}
+			nPartialFaces+=pf; nKeptFaces+=kf;
+		});
+		// pass 3: edges, partly covered or handed over: C and G by 1/u
+		ParallelLines(NA, SetupThreads(NA), [&](unsigned int li, unsigned int)
+		{
+			unsigned int i = a0+li;
+			size_t pe=0, he=0;
+			std::vector<size_t> freeEdges;
+			for (unsigned int j=b0; j<=b1; ++j)
+				for (int dir=0; dir<2; ++dir)
+				{
+					const int n = dir==0 ? a : b;
+					unsigned int pos[3]; pos[nn]=k; pos[a]=i; pos[b]=j;
+					if (pos[n]+1>=numLines[n]) continue;
+					double u = Fe[dir][FI(i,j)];
+					if (u<=1e-7) continue;                          // covered: the sheet model
+					auto it = handover.find((size_t)dir*NA*NB + FI(i,j));
+					const bool handed = it!=handover.end() && it->second<u;
+					if (handed) u = it->second;
+					if (u>=1.0-1e-7) continue;                      // free
+					u = std::max(u, umin);
+					size_t ipos = IDX(pos);
+					EC_C[n][ipos] /= u; EC_G[n][ipos] /= u;
+					freeEdges.push_back(n*(size_t)numLines[0]*numLines[1]*numLines[2] + ipos);
+					if (handed) ++he; else ++pe;
+				}
+			std::lock_guard<std::mutex> guard(lock);
 			m_ConformalFree.insert(freeEdges.begin(), freeEdges.end());
-			nPartialEdges+=pe; nPartialFaces+=pf; nKeptFaces+=kf;
+			nPartialEdges+=pe; nHandedEdges+=he;
 		});
 	}
 	cout << "Operator::ApplyConformalSheets: " << planes.size() << " sheet planes, " << nPartialEdges << " partial edges, "
-	     << nPartialFaces << " partial faces (" << nKeptFaces << " held at the free-area minimum " << amin << ")" << endl;
+	     << nPartialFaces << " partial faces (" << nKeptFaces << " below the free-area minimum " << amin << ", handing over "
+	     << nHandedEdges << " edges)" << endl;
 }
 
 bool Operator::IsConformalFreeEdge(int n, const unsigned int pos[3]) const
