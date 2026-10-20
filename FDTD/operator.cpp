@@ -2933,6 +2933,7 @@ void Operator::ApplyConformalSheets()
 	const char* envU = getenv("OPENEMS_CONFORMAL_UMIN");
 	const double umin = envU ? atof(envU) : 1e-4;   // a larger C only lowers the local frequency: no stability bound
 	m_ConformalFree.clear();
+	m_ConformalSheetScale.clear();
 	MainOp->ResetShift();
 	{
 		const size_t i0 = MainOp->SetPos(0,0,0);
@@ -2968,7 +2969,7 @@ void Operator::ApplyConformalSheets()
 		if (b.empty()) b.assign(box, box+6);
 		for (int n=0;n<3;++n) { b[2*n]=std::min(b[2*n],std::min(box[2*n],box[2*n+1])); b[2*n+1]=std::max(b[2*n+1],std::max(box[2*n],box[2*n+1])); }
 	}
-	size_t nPartialEdges=0, nPartialFaces=0, nKeptFaces=0, nHandedEdges=0;
+	size_t nPartialEdges=0, nPartialFaces=0, nKeptFaces=0, nHandedEdges=0, nClosedCovered=0;
 	for (auto& pl : planes)
 	{
 		const int nn = pl.first.first; const unsigned int k = pl.first.second;
@@ -2995,10 +2996,12 @@ void Operator::ApplyConformalSheets()
 		// - a face's free area is a 4-point Gauss rule over lines crossing the boundary (along the face's partly
 		//   covered edges), each line's free fraction exact as an edge's: exact for a straight boundary;
 		// - a face's L and R scale by its exact free fraction a = A_free/A at every coverage. Under the free-area
-		//   minimum amin the timestep bound is kept by its wholly free edges instead: each scales C and G as one free
-		//   over a/amin, so the local frequency of the face with any of its edges stays under that at amin (the
-		//   partly covered edges, free over about a, already do). At full coverage the face's edges are closed, as
-		//   the covered sheet has them, so the response is continuous there too.
+		//   minimum amin the timestep bound is kept by its edges instead: each scales C and G by at least amin/a
+		//   (a wholly free one as one free over a/amin; a covered one, in the sheet model too, by amin/a), so the
+		//   local frequency of the face with any of its edges stays under that at amin (the partly covered edges,
+		//   free over about a, already do). At full coverage the face's edges are closed, as the covered sheet has
+		//   them, so the response is continuous there too (the covered edges' extra stiffness only lowers the field
+		//   a good conductor already holds near zero).
 		// The former 16 samples per edge, 8 x 8 (then 64 x 64) per face and the reset, hold or blend of the face's
 		// own scale at the minimum each stepped a strip's response, by up to 0.7 dB, as its edge moved.
 		const int Ns = 16, Nc = 4;
@@ -3081,8 +3084,7 @@ void Operator::ApplyConformalSheets()
 				if (af<amin)
 				{
 					for (int q=0;q<4;++q)
-						if (e[q]>=1.0-1e-7)
-							req.emplace_back(ek[q], (float)(af/amin));
+						req.emplace_back(ek[q], (float)(af/amin));
 					++kf;
 				}
 				const double sc = std::max(af, umin);               // the face's own scale stays exact
@@ -3104,8 +3106,9 @@ void Operator::ApplyConformalSheets()
 		ParallelLines(NA, SetupThreads(NA), [&](unsigned int li, unsigned int)
 		{
 			unsigned int i = a0+li;
-			size_t pe=0, he=0;
+			size_t pe=0, he=0, ce=0;
 			std::vector<size_t> freeEdges;
+			std::vector<std::pair<size_t,double>> sheetScale;
 			for (unsigned int j=b0; j<=b1; ++j)
 				for (int dir=0; dir<2; ++dir)
 				{
@@ -3113,8 +3116,19 @@ void Operator::ApplyConformalSheets()
 					unsigned int pos[3]; pos[nn]=k; pos[a]=i; pos[b]=j;
 					if (pos[n]+1>=numLines[n]) continue;
 					double u = Fe[dir][FI(i,j)];
-					if (u<=1e-7) continue;                          // covered: the sheet model
 					auto it = handover.find((size_t)dir*NA*NB + FI(i,j));
+					if (u<=1e-7)
+					{
+						// covered: the sheet model, which scales its C and G by this too (the operator here, as the
+						// timestep estimate sees it, has the edge's air C)
+						if (it==handover.end()) continue;
+						const double f = 1.0/std::max((double)it->second, umin);
+						size_t ipos = IDX(pos);
+						EC_C[n][ipos] *= f; EC_G[n][ipos] *= f;
+						sheetScale.emplace_back(n*(size_t)numLines[0]*numLines[1]*numLines[2] + ipos, f);
+						++ce;
+						continue;
+					}
 					const bool handed = it!=handover.end() && it->second<u;
 					if (handed) u = it->second;
 					if (u>=1.0-1e-7) continue;                      // free
@@ -3126,12 +3140,23 @@ void Operator::ApplyConformalSheets()
 				}
 			std::lock_guard<std::mutex> guard(lock);
 			m_ConformalFree.insert(freeEdges.begin(), freeEdges.end());
-			nPartialEdges+=pe; nHandedEdges+=he;
+			for (auto& c : sheetScale)
+				m_ConformalSheetScale[c.first] = c.second;
+			nPartialEdges+=pe; nHandedEdges+=he; nClosedCovered+=ce;
 		});
 	}
 	cout << "Operator::ApplyConformalSheets: " << planes.size() << " sheet planes, " << nPartialEdges << " partial edges, "
 	     << nPartialFaces << " partial faces (" << nKeptFaces << " below the free-area minimum " << amin << ", closing "
-	     << nHandedEdges << " free edges)" << endl;
+	     << nHandedEdges << " free and " << nClosedCovered << " covered edges)" << endl;
+}
+
+double Operator::ConformalSheetEdgeScale(int n, const unsigned int pos[3]) const
+{
+	if (m_ConformalSheetScale.empty())
+		return 1.0;
+	size_t ipos = m_ConfStride[0]+pos[0]*m_ConfStride[1]+pos[1]*m_ConfStride[2]+pos[2]*m_ConfStride[3];
+	auto it = m_ConformalSheetScale.find(n*(size_t)numLines[0]*numLines[1]*numLines[2] + ipos);
+	return it==m_ConformalSheetScale.end() ? 1.0 : it->second;
 }
 
 bool Operator::IsConformalFreeEdge(int n, const unsigned int pos[3]) const
