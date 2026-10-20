@@ -178,6 +178,8 @@ public:
 	virtual bool GetYeeCoords(int ny, unsigned int pos[3], double* coords, bool dualMesh) const;
 	//! True if a conformal sheet treatment made this in-plane edge a free (partially covered) edge
 	bool IsConformalFreeEdge(int n, const unsigned int pos[3]) const;
+	//! The factor a covered in-plane edge's C and G take from a conformal sheet face under the free-area minimum (1: none)
+	double ConformalSheetEdgeScale(int n, const unsigned int pos[3]) const;
 
 	virtual bool GetNodeCoords(const unsigned int pos[3], double* coords, bool dualMesh=false, CoordinateSystem c_system=UNDEFINED_CS) const;
 
@@ -364,6 +366,7 @@ protected:
 	//! Add per-edge capacitance and conductance increments from OPENEMS_EDGE_FIELDS (an HDF5 file), if set.
 	void ApplyEdgeFields();
 	std::unordered_set<size_t> m_ConformalFree;
+	std::unordered_map<size_t,double> m_ConformalSheetScale;
 	size_t m_ConfStride[4] = {0,0,0,0};
 
 	//! Calculate the FDTD equivalent circuit parameter for the given position and direction ny. \sa Calc_EffMat_Pos

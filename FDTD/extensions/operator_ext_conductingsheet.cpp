@@ -344,6 +344,9 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 				m_Op->EC_C[n][index]= dT*dT/4.0*16.0/Lmin;
 				for (int order=0; order<m_Order; ++order)
 					m_Op->EC_C[n][index] += dT*dT/4.0/L[order];
+				// a covered edge of a conformal sheet face under the free-area minimum: stiffer (Operator::ApplyConformalSheets)
+				const double cs = m_Op->ConformalSheetEdgeScale(n,pos);
+				m_Op->EC_C[n][index] *= cs; m_Op->EC_G[n][index] *= cs;
 				m_Op->Calc_ECOperatorPos(n,pos);
 
 				for (int order=0; order<m_Order; ++order)
