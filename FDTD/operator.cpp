@@ -2827,9 +2827,9 @@ double Operator::CalcTimestep_Var3()
 // In each sheet plane, an in-plane edge partially covered by the sheet carries the field of its
 // free part: its voltage is E*l_free, so C and G scale by l/l_free, and the sheet model is not
 // applied to it. A face of the plane partially covered carries the normal H over its free area:
-// L and R scale by A_free/A, never below OPENEMS_CONFORMAL_AMIN (default 0.3), which bounds the local
-// frequency rise: under it a face hands over to the covered state (see ApplyConformalSheets). Edge
-// scales are floored at OPENEMS_CONFORMAL_UMIN (default 1e-4). Enabled by OPENEMS_CONFORMAL_SHEETS=1.
+// L and R scale by A_free/A. Under OPENEMS_CONFORMAL_AMIN (default 0.3) the face's wholly free edges
+// close in proportion, which bounds the local frequency rise (see ApplyConformalSheets). Scales are
+// floored at OPENEMS_CONFORMAL_UMIN (default 1e-4). Enabled by OPENEMS_CONFORMAL_SHEETS=1.
 void Operator::ApplyEdgeFields()
 {
 	// OPENEMS_EDGE_FIELDS=file.h5: per-edge increments of the edge capacitance (F) and conductance (S), added to the
@@ -3012,12 +3012,13 @@ void Operator::ApplyConformalSheets()
 		// - an edge's free fraction is exact: the boundary crossings between coarse samples found by bisection;
 		// - a face's free area is a 4-point Gauss rule over lines crossing the boundary (along the face's partly
 		//   covered edges), each line's free fraction exact as an edge's: exact for a straight boundary;
-		// - below the free-area minimum a face hands over to the covered state instead of being held: with
-		//   s = 1 - A_free/(amin A) its L and R scale by amin + s (1 - amin) (never below amin, the timestep bound),
-		//   and each wholly free edge bounding it scales C and G as one free over a fraction 1 - s, so at full
-		//   coverage the face is unscaled and its edges closed, as the covered sheet has them.
-		// The former 16 samples per edge, 8 x 8 (then 64 x 64) per face and the reset (then hold) at the minimum each
-		// stepped a strip's response, by up to 0.7 dB, as its edge moved.
+		// - a face's L and R scale by its exact free fraction a = A_free/A at every coverage. Under the free-area
+		//   minimum amin the timestep bound is kept by its wholly free edges instead: each scales C and G as one free
+		//   over a/amin, so the local frequency of the face with any of its edges stays under that at amin (the
+		//   partly covered edges, free over about a, already do). At full coverage the face's edges are closed, as
+		//   the covered sheet has them, so the response is continuous there too.
+		// The former 16 samples per edge, 8 x 8 (then 64 x 64) per face and the reset, hold or blend of the face's
+		// own scale at the minimum each stepped a strip's response, by up to 0.7 dB, as its edge moved.
 		const int Ns = 16, Nc = 4;
 		const double GX[4] = {-0.8611363115940526, -0.3399810435848563, 0.3399810435848563, 0.8611363115940526};
 		const double GW[4] = {0.3478548451374538, 0.6521451548625461, 0.6521451548625461, 0.3478548451374538};
@@ -3095,15 +3096,14 @@ void Operator::ApplyConformalSheets()
 					                        : segFree(b, lb0, lb1, 0.5*(la0+la1)+0.5*GX[g]*(la1-la0)));
 				if (af>=1.0-1e-9 || af<=1e-9)
 					continue;                                       // free, or covered (where the hand-over ends)
-				double sc = af;
 				if (af<amin)
 				{
-					sc = amin + (1.0-af/amin)*(1.0-amin);
 					for (int q=0;q<4;++q)
 						if (e[q]>=1.0-1e-7)
 							req.emplace_back(ek[q], (float)(af/amin));
 					++kf;
 				}
+				const double sc = std::max(af, umin);               // the face's own scale stays exact
 				unsigned int pos[3]; pos[nn]=k; pos[a]=i; pos[b]=j;
 				size_t ipos = IDX(pos);
 				EC_L[nn][ipos] *= sc; EC_R[nn][ipos] *= sc;
@@ -3148,8 +3148,8 @@ void Operator::ApplyConformalSheets()
 		});
 	}
 	cout << "Operator::ApplyConformalSheets: " << planes.size() << " sheet planes, " << nPartialEdges << " partial edges, "
-	     << nPartialFaces << " partial faces (" << nKeptFaces << " below the free-area minimum " << amin << ", handing over "
-	     << nHandedEdges << " edges)" << endl;
+	     << nPartialFaces << " partial faces (" << nKeptFaces << " below the free-area minimum " << amin << ", closing "
+	     << nHandedEdges << " free edges)" << endl;
 }
 
 bool Operator::IsConformalFreeEdge(int n, const unsigned int pos[3]) const
