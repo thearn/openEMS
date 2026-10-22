@@ -16,6 +16,8 @@
 */
 
 #include "hip/hip_runtime.h"
+#include <map>
+#include <vector>
 #include "hip_internal.h"
 #include "FDTD/engine.h"
 #include "FDTD/extensions/operator_ext_lorentzmaterial.h"
@@ -71,7 +73,7 @@ public:
 	HIP_Ext_LorentzMaterial(GPU_Backend_HIP::Impl* impl, Operator_Ext_LorentzMaterial* op_ext);
 
 	virtual void DoPreVoltageUpdates() {for (size_t o=0; o<m_Volt.size(); ++o) Pre(m_Volt[o], d->volt);}
-	virtual void Apply2Voltages()      {for (size_t o=0; o<m_Volt.size(); ++o) Apply(m_Volt[o], d->volt);}
+	virtual void Apply2Voltages()      {for (size_t o=0; o<m_Volt.size(); ++o) if (!m_Volt[o].folded) Apply(m_Volt[o], d->volt);}
 	virtual void DoPreCurrentUpdates() {for (size_t o=0; o<m_Curr.size(); ++o) Pre(m_Curr[o], d->curr);}
 	virtual void Apply2Current()       {for (size_t o=0; o<m_Curr.size(); ++o) Apply(m_Curr[o], d->curr);}
 
@@ -83,7 +85,12 @@ protected:
 		size_t* pos;                //!< flat NIJK index of direction 0
 		float *ade, *lor;           //!< state
 		float *c_int, *c_ext, *c_lor;
+		bool folded;                //!< applied in the fused kernel (see HIP_ADECandidate)
+		std::vector<size_t> flat;   //!< host copy of pos (voltage orders, for the candidate groups)
+		std::vector<unsigned char> mask;   //!< active components of each position (voltage orders)
 	};
+	//! the voltage orders as ADE groups of the fused step, orders at the same positions together
+	void RegisterCandidates();
 
 	void Setup(std::vector<Order>& orders, size_t count, unsigned int** pos, bool voltage,
 	           bool lorentz, FDTD_FLOAT** c_int, FDTD_FLOAT** c_ext, FDTD_FLOAT** c_lor);
@@ -116,6 +123,44 @@ HIP_Ext_LorentzMaterial::HIP_Ext_LorentzMaterial(GPU_Backend_HIP::Impl* impl, Op
 			Setup(m_Curr, count, op_ext->m_LM_pos[o], false, op_ext->m_curr_Lor_ADE_On[o],
 			      op_ext->i_int_ADE[o], op_ext->i_ext_ADE[o], op_ext->m_curr_Lor_ADE_On[o] ? op_ext->i_Lor_ADE[o] : NULL);
 	}
+	RegisterCandidates();
+}
+
+void HIP_Ext_LorentzMaterial::RegisterCandidates()
+{
+	// The voltage ADE changes voltages between the half-steps: the fused step applies one group in
+	// its kernel, or recomputes the currents the changed voltages feed (see DecideFusedStep()).
+	std::map<std::vector<size_t>, std::vector<size_t>> groups;   // positions -> voltage orders
+	for (size_t o=0; o<m_Volt.size(); ++o)
+		groups[m_Volt[o].flat].push_back(o);
+	for (auto& g : groups)
+	{
+		for (size_t k=0; k<g.second.size(); k+=ADE_GROUP_MAX)
+		{
+			HIP_ADECandidate C;
+			const Order& first = m_Volt[g.second[k]];
+			C.count = (unsigned int)first.param.count;
+			C.flat = g.first;
+			C.mask.assign(C.count, 0);
+			std::vector<size_t> members;
+			for (size_t j=k; j<std::min(g.second.size(), k+(size_t)ADE_GROUP_MAX); ++j)
+			{
+				const Order& ord = m_Volt[g.second[j]];
+				C.ade[members.size()] = ord.ade;
+				for (size_t i=0; i<C.count; ++i)
+					C.mask[i] |= ord.mask[i];
+				members.push_back(g.second[j]);
+			}
+			C.orders = (unsigned int)members.size();
+			C.fold = [this, members]() {for (size_t o : members) m_Volt[o].folded = true;};
+			d->ade_candidates.push_back(C);
+		}
+	}
+	for (size_t o=0; o<m_Volt.size(); ++o)
+	{
+		std::vector<size_t>().swap(m_Volt[o].flat);
+		std::vector<unsigned char>().swap(m_Volt[o].mask);
+	}
 }
 
 float* HIP_Ext_LorentzMaterial::Coefficients(size_t count, FDTD_FLOAT** c)
@@ -141,11 +186,17 @@ void HIP_Ext_LorentzMaterial::Setup(std::vector<Order>& orders, size_t count, un
 	std::vector<size_t> flat(count);
 	for (size_t i=0; i<count; ++i)
 		flat[i] = ((size_t)pos[0][i]*d->dim.ny + pos[1][i])*d->dim.nz + pos[2][i];
-	// the voltage ADE changes these voltages between the half-steps: the fused step recomputes the currents they feed
+	ord.folded = false;
 	if (voltage)
+	{
+		// a component is active where its coefficients are not zero (else its ADE stays zero)
+		ord.flat = flat;
+		ord.mask.assign(count, 0);
 		for (unsigned int n=0; n<3; ++n)
 			for (size_t i=0; i<count; ++i)
-				d->volt_modified.push_back(n*d->numCells + flat[i]);
+				if ((c_int && c_int[n][i]!=0) || (c_ext && c_ext[n][i]!=0) || (c_lor && c_lor[n][i]!=0))
+					ord.mask[i] |= 1u<<n;
+	}
 	ord.pos = d->Alloc<size_t>(count, flat.data());
 
 	ord.ade = d->Alloc<float>(3*(size_t)count);

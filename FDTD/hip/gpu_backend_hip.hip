@@ -200,6 +200,30 @@ __device__ __forceinline__ void fused_volt(const float* __restrict__ volt, const
 	v[2] = t;
 }
 
+// the ADE correction of the voltage ADE group applied in the fused kernel (see HIP_FusedADE): the
+// operations of dispersive_apply, order by order, for a node the group contains
+template<typename I>
+__device__ __forceinline__ void fused_ade(const HIP_FusedADE& A, const HIP_GridDim& N,
+                                          unsigned int x, unsigned int y, unsigned int z, float v[3])
+{
+	const I flat = nijk<I>(N, 0, x, y, z);
+	const unsigned int word = A.bits[flat>>5];
+	const unsigned int bit = (unsigned int)(flat & 31);
+	if (!((word>>bit)&1))
+		return;
+	const unsigned int rank = A.prefix[flat>>5] + __popc(word & ((1u<<bit)-1));
+	const unsigned int m = A.mask[rank];
+	for (unsigned int n=0; n<3; ++n)
+	{
+		if (!((m>>n)&1))
+			continue;
+		float t = v[n];
+		for (unsigned int o=0; o<A.orders; ++o)
+			t = t - A.ade[o][n*A.count + rank];
+		v[n] = t;
+	}
+}
+
 // The tile is as wide as a wavefront, so that a wavefront is one row of it: 32 threads on
 // NVIDIA and on the RDNA GPUs of AMD, 64 on the CDNA ones. The kernel is compiled for both
 // widths and the backend picks by the warp size of the device (see UpdateVoltages), so one
@@ -222,11 +246,14 @@ __device__ __forceinline__ void fused_volt(const float* __restrict__ volt, const
 // With the UPML regions in the kernel (F.count>0, [B, E) is the whole grid), the region nodes
 // are computed like the main nodes, from the current flux (the new voltage flux goes to a
 // second buffer, written by the node's own block; the current flux in place).
-template<typename I, unsigned int TZ, unsigned int TY>
+// With ADE, the correction of one voltage ADE group (conducting sheets) is applied to the new
+// voltages of its nodes before they are stored or used (see fused_ade), instead of a launch after
+// the kernel and a recomputation of the currents they feed.
+template<typename I, unsigned int TZ, unsigned int TY, bool ADE>
 __global__ void __launch_bounds__(TZ*TY) update_fused(
 	const float* __restrict__ volt_in, const float* __restrict__ curr_in, float* volt_out, float* __restrict__ curr_out,
 	const void* index, const float* va, const float* vb, const float* ia, const float* ib, unsigned int mode,
-	HIP_GridDim N, HIP_GridDim B, HIP_GridDim E, HIP_FusedRegions F, unsigned int xc)
+	HIP_GridDim N, HIP_GridDim B, HIP_GridDim E, HIP_FusedRegions F, HIP_FusedADE A, unsigned int xc)
 {
 	__shared__ float sV[3][TY][TZ];
 	const unsigned int tz = threadIdx.x, ty = threadIdx.y;
@@ -246,7 +273,11 @@ __global__ void __launch_bounds__(TZ*TY) update_fused(
 		{
 			const int r = F.count ? fused_region_of(F, x, y, z) : -1;
 			if (r<0)
+			{
 				fused_volt<I>(volt_in, curr_in, index, va, vb, mode, N, x, y, z, v);
+				if (ADE)
+					fused_ade<I>(A, N, x, y, z, v);
+			}
 			else
 				upml_volt_value<I>(volt_in, curr_in, F.volt[r], N, F.R[r], x, y, z, owner && (x<xe), v);
 			if (owner && (x<xe))
@@ -326,6 +357,7 @@ struct HIP_FusedArgs
 	unsigned int mode;
 	HIP_GridDim N, B, E;
 	HIP_FusedRegions F;
+	HIP_FusedADE A;
 	unsigned int xc;
 };
 
@@ -334,8 +366,12 @@ static void launch_fused(hipStream_t stream, const HIP_FusedArgs& a)
 {
 	const dim3 block(TZ, TY, 1);
 	const dim3 grid((a.E.nz-a.B.nz+TZ-2)/(TZ-1), (a.E.ny-a.B.ny+TY-2)/(TY-1), (a.E.nx-a.B.nx+a.xc-1)/a.xc);
-	update_fused<I, TZ, TY><<<grid, block, 0, stream>>>(a.volt_in, a.curr_in, a.volt_out, a.curr_out, a.index,
-	                                                 a.va, a.vb, a.ia, a.ib, a.mode, a.N, a.B, a.E, a.F, a.xc);
+	if (a.A.count)
+		update_fused<I, TZ, TY, true><<<grid, block, 0, stream>>>(a.volt_in, a.curr_in, a.volt_out, a.curr_out, a.index,
+		                                                       a.va, a.vb, a.ia, a.ib, a.mode, a.N, a.B, a.E, a.F, a.A, a.xc);
+	else
+		update_fused<I, TZ, TY, false><<<grid, block, 0, stream>>>(a.volt_in, a.curr_in, a.volt_out, a.curr_out, a.index,
+		                                                        a.va, a.vb, a.ia, a.ib, a.mode, a.N, a.B, a.E, a.F, a.A, a.xc);
 }
 
 template<typename I, unsigned int TZ>
@@ -541,6 +577,9 @@ GPU_Backend_HIP::Impl::Impl()
 	fregions.count = 0;
 	volt_next = curr_next = NULL;
 	fixup = NULL;
+	fade.count = 0;
+	fade.orders = 0;
+	fold_group = -1;
 	index32 = false;
 	fixup_count = 0;
 	snap_nv = snap_n = 0;
@@ -579,6 +618,58 @@ bool GPU_Backend_HIP::Impl::DecideFusedStep()
 	// The currents of the nodes that read a voltage changed between the half-steps are computed
 	// again. With the UPML regions in the kernel, region nodes cannot (the current flux is
 	// updated in place): then the region kernels update the regions.
+	// Voltage ADE groups: one group whose nodes are all main nodes (not in a UPML region, not
+	// changed by another extension) is applied in the kernel, which needs no fix-up for it; the
+	// other groups register their changed voltages for the fix-up.
+	{
+		const bool fold_env = !getenv("OPENEMS_HIP_FUSED_ADE") || atoi(getenv("OPENEMS_HIP_FUSED_ADE"))!=0;
+		std::set<size_t> others(volt_modified.begin(), volt_modified.end());
+		bool folded_one = false;
+		fold_group = -1;
+		for (size_t g=0; g<ade_candidates.size(); ++g)
+		{
+			HIP_ADECandidate& C = ade_candidates[g];
+			bool ok = fold_env && !folded_one && (C.orders<=ADE_GROUP_MAX) && std::is_sorted(C.flat.begin(), C.flat.end());
+			for (size_t i=0; ok && i<C.flat.size(); ++i)
+			{
+				const size_t f = C.flat[i];
+				const unsigned int c[3] = {(unsigned int)(f/((size_t)dim.ny*dim.nz)), (unsigned int)((f/dim.nz)%dim.ny), (unsigned int)(f%dim.nz)};
+				ok = (c[0]>=main_start.nx) && (c[0]<main_stop.nx) && (c[1]>=main_start.ny) && (c[1]<main_stop.ny)
+				     && (c[2]>=main_start.nz) && (c[2]<main_stop.nz) && !(fregions.count && (fused_region_of(fregions, c[0], c[1], c[2])>=0));
+				for (unsigned int n=0; ok && n<3; ++n)
+					ok = !(((C.mask[i]>>n)&1) && others.count(n*numCells + f));
+			}
+			if (ok)
+			{
+				std::vector<unsigned int> bits((numCells+31)/32, 0), prefix(bits.size(), 0);
+				for (size_t f : C.flat)
+					bits[f>>5] |= 1u<<(f&31);
+				unsigned int running = 0;
+				for (size_t w=0; w<bits.size(); ++w)
+				{
+					prefix[w] = running;
+					running += __builtin_popcount(bits[w]);
+				}
+				fade.count = C.count;
+				fade.orders = C.orders;
+				fade.bits = Alloc<unsigned int>(bits.size(), bits.data());
+				fade.prefix = Alloc<unsigned int>(prefix.size(), prefix.data());
+				fade.mask = Alloc<unsigned char>(C.mask.size(), C.mask.data());
+				for (unsigned int o=0; o<C.orders; ++o)
+					fade.ade[o] = C.ade[o];
+				fold_group = (int)g;   // folded once the fused step has its buffers (below)
+				folded_one = true;
+				if (g_settings.GetVerboseLevel()>0)
+					std::cout << "GPU_Backend_HIP: ADE correction of " << C.count << " nodes (" << C.orders << " orders) in the fused kernel" << std::endl;
+				continue;
+			}
+			for (unsigned int n=0; n<3; ++n)
+				for (size_t i=0; i<C.flat.size(); ++i)
+					if ((C.mask[i]>>n)&1)
+						volt_modified.push_back(n*numCells + C.flat[i]);
+		}
+	}
+
 	const bool folded = fregions.count>0;
 	std::set<size_t> nodes;
 	for (size_t k=0; k<volt_modified.size(); ++k)
@@ -625,6 +716,7 @@ bool GPU_Backend_HIP::Impl::DecideFusedStep()
 		Free(curr_next);
 		volt_next = curr_next = NULL;
 		std::cout << "GPU_Backend_HIP: not enough device memory for the fused step, using separate updates" << std::endl;
+		fade.count = 0;   // the extension applies its ADE group itself
 		return false;
 	}
 	fixup_count = list.size();
@@ -635,6 +727,8 @@ bool GPU_Backend_HIP::Impl::DecideFusedStep()
 	HIP_Check(hipMemcpyAsync(curr_next, curr, 3*numCells*sizeof(float), hipMemcpyDeviceToDevice, Stream()), "fused step buffers");
 	Flush();
 	fused_step = 1;
+	if (fold_group>=0)
+		ade_candidates[fold_group].fold();
 	if (g_settings.GetVerboseLevel()>1)
 	{
 		std::cout << "GPU_Backend_HIP: fused voltage and current updates" << (index32 ? ", 32 bit indices" : "");
@@ -1000,7 +1094,7 @@ void GPU_Backend_HIP::UpdateVoltages()
 		const HIP_FusedArgs a = { (const float*)d->volt, (const float*)d->curr, d->volt_next, d->curr_next, (const void*)d->index,
 		                          (const float*)(c ? d->coeff : d->vv), (const float*)(c ? d->coeff : d->vi),
 		                          (const float*)(c ? d->coeff : d->ii), (const float*)(c ? d->coeff : d->iv),
-		                          d->coeff_mode, d->dim, B, E, d->fregions, xc };
+		                          d->coeff_mode, d->dim, B, E, d->fregions, d->fade, xc };
 #ifdef __HIP_PLATFORM_AMD__
 		// only AMD has wavefronts of 64; compiling them for NVIDIA would be dead code
 		static const unsigned int tz = getenv("OPENEMS_HIP_FUSED_TZ") ? atoi(getenv("OPENEMS_HIP_FUSED_TZ")) : 0;

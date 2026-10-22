@@ -23,6 +23,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <functional>
 #include <memory>
 #include <map>
 #include <set>
@@ -99,6 +100,34 @@ __device__ __forceinline__ HIP_MainCoeffT<I> main_coeff(const void* index, const
 //! Throw a std::runtime_error if \a err is an error
 void HIP_Check(hipError_t err, const char* what);
 
+#ifndef ADE_GROUP_MAX
+#define ADE_GROUP_MAX 8
+#endif
+//! A voltage ADE group whose correction the fused step applies in its kernel (see fused_ade()):
+//! node flags (one bit per node), per-word prefix counts of the flags (the rank of a flagged node
+//! is its index in the group, whose positions are sorted), the active components and the state
+//! of each order
+struct HIP_FusedADE
+{
+	unsigned int count, orders;
+	const unsigned int* bits;
+	const unsigned int* prefix;
+	const unsigned char* mask;
+	const float* ade[ADE_GROUP_MAX];
+};
+
+//! A voltage ADE group registered by an extension (dispersion orders at the same positions); the
+//! fused step either applies it in its kernel (fold() is called: the extension drops its apply
+//! launches) or registers its changed voltages for the current fix-up
+struct HIP_ADECandidate
+{
+	unsigned int count, orders;
+	std::vector<size_t> flat;              //!< node of each position, sorted
+	std::vector<unsigned char> mask;       //!< active components of each position
+	const float* ade[ADE_GROUP_MAX];       //!< state of each order, [direction][position]
+	std::function<void()> fold;
+};
+
 //! Device and work stream, shared by the backends of all grids of a simulation (see NewSubGridBackend())
 struct HIP_Context
 {
@@ -146,6 +175,9 @@ struct GPU_Backend_HIP::Impl
 	float *volt_next, *curr_next;
 	std::vector<size_t> volt_modified;       //!< flat indices of the voltages the extensions register as changed between the half-steps (excitation, lumped RLC)
 	HIP_FusedRegions fregions;              //!< the UPML regions in the kernel (see HIP_Ext_UPML::CanFuse())
+	std::vector<HIP_ADECandidate> ade_candidates; //!< voltage ADE groups of the extensions (see HIP_ADECandidate)
+	HIP_FusedADE fade;                      //!< the group applied in the fused kernel (count 0: none)
+	int fold_group;                         //!< index of that group in ade_candidates (-1: none)
 	size_t* fixup;                           //!< main nodes whose currents are recomputed after the voltage extensions
 	unsigned int fixup_count;
 	bool index32;                            //!< the fused step indexes with 32 bit (see Init())
