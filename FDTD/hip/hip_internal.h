@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -181,13 +182,15 @@ struct GPU_Backend_HIP::Impl
 
 	hipStream_t Stream() const {return ctx->stream;}
 
-	//! Device buffer of \a count elements, initialized with \a host or zero; freed with this Impl
+	//! Device buffer of \a count elements, initialized with \a host or zero; freed with this Impl. Never inlined:
+	//! each allocation records its caller, so MemoryReport() can say which function holds the device memory.
 	template <typename T>
-	T* Alloc(size_t count, const T* host=NULL)
+	__attribute__((noinline)) T* Alloc(size_t count, const T* host=NULL)
 	{
 		T* ptr = NULL;
 		HIP_Check(hipMalloc(&ptr, std::max(count, (size_t)1)*sizeof(T)), "hipMalloc");
 		m_Allocations.push_back(ptr);
+		m_AllocRecords[ptr] = {__builtin_return_address(0), std::max(count, (size_t)1)*sizeof(T)};
 		// on the work stream: it does not synchronize with the legacy default stream
 		if (host && count)
 			HIP_Check(hipMemcpyAsync(ptr, host, count*sizeof(T), hipMemcpyHostToDevice, Stream()), "hipMemcpy");
@@ -200,7 +203,7 @@ struct GPU_Backend_HIP::Impl
 	//! Uninitialized device buffer of \a count elements for an optional optimization, freed with
 	//! this Impl or by Free(); NULL if the device memory is not sufficient
 	template <typename T>
-	T* TryAlloc(size_t count)
+	__attribute__((noinline)) T* TryAlloc(size_t count)
 	{
 		T* ptr = NULL;
 		if (hipMalloc(&ptr, std::max(count, (size_t)1)*sizeof(T))!=hipSuccess)
@@ -209,6 +212,7 @@ struct GPU_Backend_HIP::Impl
 			return NULL;
 		}
 		m_Allocations.push_back(ptr);
+		m_AllocRecords[ptr] = {__builtin_return_address(0), std::max(count, (size_t)1)*sizeof(T)};
 		return ptr;
 	}
 
@@ -218,6 +222,7 @@ struct GPU_Backend_HIP::Impl
 		if (ptr==NULL)
 			return;
 		m_Allocations.erase(std::remove(m_Allocations.begin(), m_Allocations.end(), ptr), m_Allocations.end());
+		m_AllocRecords.erase(ptr);
 		(void)hipFree(ptr);
 	}
 
@@ -246,12 +251,19 @@ struct GPU_Backend_HIP::Impl
 	//! Page-lock host memory (once) for fast transfers
 	void PinHostMemory(void* ptr, size_t bytes);
 
+	//! Device memory by the function that allocated it (Alloc, TryAlloc), against the device's own use, printed once
+	//! if the environment variable OPENEMS_GPU_MEMORY_REPORT=1 (call after setup, e.g. at the first time step)
+	void MemoryReport();
+	bool memory_reported = false;
+
 	//! Launch geometry: one thread per (i,j,k), i fastest
 	static dim3 Block(size_t ni, size_t nj);
 	static dim3 Grid(dim3 block, size_t ni, size_t nj, size_t nk);
 
 protected:
 	std::vector<void*> m_Allocations;
+	struct AllocRecord {void* caller; size_t bytes;};
+	std::map<void*, AllocRecord> m_AllocRecords;
 	std::set<void*> m_Pinned;
 };
 

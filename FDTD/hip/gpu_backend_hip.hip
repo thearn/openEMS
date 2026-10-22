@@ -20,7 +20,10 @@
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
+#include <cxxabi.h>
+#include <dlfcn.h>
 #include <map>
 #include <set>
 #include <iostream>
@@ -871,8 +874,31 @@ std::string GPU_Backend_HIP::GetName() const
 	return "HIP (" + d->ctx->name + ")";
 }
 
+// OPENEMS_SETUP_TIMES=1: the engine's setup phases, in the format of the operator's (operator.cpp SetupPhaseTimer)
+namespace
+{
+class EngineSetupTimer
+{
+public:
+	EngineSetupTimer() : enabled(getenv("OPENEMS_SETUP_TIMES") && atoi(getenv("OPENEMS_SETUP_TIMES"))!=0),
+	                     start(std::chrono::steady_clock::now()) {}
+	void Mark(const char* name)
+	{
+		if (!enabled)
+			return;
+		const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+		std::cout << "OPENEMS_SETUP_TIME " << name << " " << std::chrono::duration<double>(now-start).count() << " s" << std::endl;
+		start = now;
+	}
+private:
+	bool enabled;
+	std::chrono::steady_clock::time_point start;
+};
+}
+
 bool GPU_Backend_HIP::Init(const Operator* op)
 {
+	EngineSetupTimer timer;
 	unsigned int numLines[3];
 	for (int n=0; n<3; ++n)
 		numLines[n] = op->GetNumberOfLines(n, true);
@@ -917,6 +943,7 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 	const size_t count = 3*d->numCells;
 	d->volt = d->Alloc<float>(count);
 	d->curr = d->Alloc<float>(count);
+	timer.Mark("engine_fields");
 
 	// upload the final operator coefficients, including all changes by operator extensions.
 	// Most nodes share one of a few coefficient sets (same material and mesh spacing): store
@@ -924,9 +951,12 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 	GPU_CoeffSets sets;
 	if (GPU_FindSets(d->numCells, 12, [&](size_t i, float* values) {GPU_NodeCoefficients(op, numLines, i, values);}, sets))
 	{
+		timer.Mark("engine_coefficient_sets");
 		d->coeff_mode = sets.mode;
 		d->index = d->AllocIndex(sets);
 		d->coeff = d->Alloc<float>(sets.table.size(), sets.table.data());
+		d->Flush();
+		timer.Mark("engine_coefficient_upload");
 		if (g_settings.GetVerboseLevel()>1)
 			std::cout << "GPU_Backend_HIP: " << sets.count << " distinct coefficient sets, compressed update coefficients ("
 			          << (sets.mode==1 ? 16 : 32) << " bit index)" << std::endl;
@@ -941,6 +971,8 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 	d->vi = upload(1);
 	d->ii = upload(2);
 	d->iv = upload(3);
+	d->Flush();
+	timer.Mark("engine_coefficient_upload");
 	return true;
 }
 
@@ -989,8 +1021,51 @@ void GPU_Backend_HIP::UpdateVoltages()
 	            d->volt, (const float*)d->curr, (const void*)d->index, (const float*)(c ? d->coeff : d->vv), (const float*)(c ? d->coeff : d->vi), d->coeff_mode, d->dim, B, E, d->zslabs);
 }
 
+void GPU_Backend_HIP::Impl::MemoryReport()
+{
+	memory_reported = true;
+	const char* env = getenv("OPENEMS_GPU_MEMORY_REPORT");
+	if (!env || !atoi(env))
+		return;
+	std::map<std::string, std::pair<size_t, size_t>> by;      // function -> (bytes, allocations)
+	size_t total = 0;
+	for (const auto& kv : m_AllocRecords)
+	{
+		const AllocRecord& r = kv.second;
+		std::string name = "?";
+		Dl_info info;
+		if (dladdr(r.caller, &info) && info.dli_sname)
+		{
+			int status = 0;
+			char* demangled = abi::__cxa_demangle(info.dli_sname, NULL, NULL, &status);
+			name = (status==0 && demangled) ? demangled : info.dli_sname;
+			free(demangled);
+			const size_t paren = name.find('(');
+			if (paren!=std::string::npos)
+				name.resize(paren);
+		}
+		by[name].first += r.bytes; by[name].second += 1; total += r.bytes;
+	}
+	size_t free_bytes = 0, total_bytes = 0;
+	if (hipMemGetInfo(&free_bytes, &total_bytes)!=hipSuccess)
+		(void)hipGetLastError();
+	std::vector<std::pair<size_t, std::string>> rows;
+	for (const auto& kv : by)
+		rows.push_back({kv.second.first, kv.first});
+	std::sort(rows.rbegin(), rows.rend());
+	const double cells = (double)numCells;
+	std::cout << "GPU_Backend_HIP memory: " << total/1048576 << " MiB in " << m_AllocRecords.size() << " allocations ("
+	          << (double)total/cells << " B per cell); the device has " << (total_bytes-free_bytes)/1048576 << " of "
+	          << total_bytes/1048576 << " MiB in use (this process, its context and any other)" << std::endl;
+	for (const auto& r : rows)
+		std::cout << "GPU_Backend_HIP memory:   " << r.first/1048576 << " MiB (" << (double)r.first/cells << " B per cell) "
+		          << r.second << " x" << by[r.second].second << std::endl;
+}
+
 void GPU_Backend_HIP::UpdateCurrents()
 {
+	if (!d->memory_reported)
+		d->MemoryReport();
 	const bool c = d->coeff_mode>0;
 	if (d->fused_step>0)
 	{
