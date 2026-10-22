@@ -7,8 +7,10 @@
 # PYTHON        interpreter whose environment gets the bindings
 #               (default: $HOME/.venvs/antenna-foundry/bin/python)
 # CONDA_PREFIX_OPENEMS  conda environment providing the compilers, CUDA,
-#               CSXCAD, VTK, HDF5 and Boost
-#               (default: $HOME/miniforge-speedup/envs/openems-gpu)
+#               CSXCAD, fparser, HDF5 and Boost, and the HIP headers of AMD's
+#               hip-dev package in opt/rocm-* (the GPU backend is HIP compiled
+#               as CUDA, OPENEMS_HIP_AS_CUDA)
+#               (default: $HOME/miniforge-speedup/envs/openems-upstream)
 # CUDA_ARCHS    default "75;80;86;89" (T4, A100, RTX 30, RTX 40)
 #
 # Configure runs every time so the embedded `git describe` version matches
@@ -17,7 +19,8 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON="${1:-$HOME/.venvs/antenna-foundry/bin/python}"
-E="${CONDA_PREFIX_OPENEMS:-$HOME/miniforge-speedup/envs/openems-gpu}"
+E="${CONDA_PREFIX_OPENEMS:-$HOME/miniforge-speedup/envs/openems-upstream}"
+ROCM="$(ls -d "$E"/opt/rocm-* | tail -n1)"
 ARCHS="${CUDA_ARCHS:-75;80;86;89}"
 PREFIX="$REPO/build/install"
 export PATH="$E/bin:$PATH"
@@ -30,12 +33,15 @@ cmake -S "$REPO" -B "$REPO/build" -G Ninja -Wno-dev \
   -DCMAKE_CXX_COMPILER="$E/bin/x86_64-conda-linux-gnu-g++" \
   -DCMAKE_CUDA_COMPILER="$E/bin/nvcc" \
   -DCMAKE_CUDA_HOST_COMPILER="$E/bin/x86_64-conda-linux-gnu-g++" \
-  -DENABLE_CUDA=ON -DENABLE_FLUSH_TO_ZERO=ON -DENABLE_RPATH=ON \
+  -DOPENEMS_HIP_AS_CUDA=ON -DROCM_PATH="$ROCM" -DHIP_INCLUDE_DIR="$ROCM/include" \
+  -DENABLE_FLUSH_TO_ZERO=ON -DENABLE_RPATH=ON \
+  -DCSXCAD_ROOT_DIR="$E" -DFPARSER_ROOT_DIR="$E" \
   -DCMAKE_PREFIX_PATH="$E" \
   -DCMAKE_INSTALL_PREFIX="$PREFIX" \
   -DCMAKE_INSTALL_RPATH="$PREFIX/lib;$E/lib" \
   -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,$E/lib" \
-  -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-rpath-link,$E/lib" >/dev/null
+  -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-rpath-link,$E/lib" \
+  -DCMAKE_MODULE_LINKER_FLAGS="-Wl,-rpath-link,$E/lib" >/dev/null
 ninja -C "$REPO/build" install >/dev/null
 
 # The conda interpreter's LDSHARED puts $E/lib first in the RPATH, which would
@@ -61,6 +67,7 @@ repo = Path(sys.argv[1]).resolve()
 libs = {Path(l.split()[-1]) for l in open('/proc/self/maps') if 'libopenEMS.so' in l}
 assert Path(openEMS.__file__).resolve().is_relative_to(repo), openEMS.__file__
 assert len(libs) == 1 and libs.pop().resolve().is_relative_to(repo / 'build/install/lib'), libs
+assert (repo / 'build/install/lib/openEMS/plugins/openEMS_gpu_hip_nvidia.so').exists(), 'no HIP plugin'
 print(f'openEMS from {repo}')
 EOF
 # grep -m1 closes the pipe early; with pipefail that would fail the script.
