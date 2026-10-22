@@ -111,6 +111,19 @@ HIP_Ext_Mur_ABC::HIP_Ext_Mur_ABC(GPU_Backend_HIP::Impl* impl, Operator_Ext_Mur_A
 	m_Param.nj = op_ext->m_numLines[1];
 
 	const size_t count = (size_t)m_Param.ni*m_Param.nj;
+	// Mur overwrites both tangential boundary voltages between the half-steps: the fused step
+	// recomputes the currents they feed
+	for (unsigned int i=0; i<m_Param.ni; ++i)
+		for (unsigned int j=0; j<m_Param.nj; ++j)
+		{
+			unsigned int pos[3];
+			pos[m_Param.ny] = m_Param.line;
+			pos[m_Param.nyP] = i;
+			pos[m_Param.nyPP] = j;
+			const size_t node = ((size_t)pos[0]*d->dim.ny + pos[1])*d->dim.nz + pos[2];
+			d->volt_modified.push_back(m_Param.nyP*d->numCells + node);
+			d->volt_modified.push_back(m_Param.nyPP*d->numCells + node);
+		}
 	m_Volt_nyP  = d->Alloc<float>(count);
 	m_Volt_nyPP = d->Alloc<float>(count);
 	m_Coeff_nyP  = d->Alloc<float>(count, op_ext->m_Mur_Coeff_nyP.data());
