@@ -139,6 +139,16 @@ void Operator::Init()
 	SetMaterialAvgMethod(QuarterCell);
 }
 
+void Operator::ReleaseCoefficients()
+{
+	delete vv_ptr;
+	delete vi_ptr;
+	delete iv_ptr;
+	delete ii_ptr;
+	vv_ptr = vi_ptr = iv_ptr = ii_ptr = NULL;
+	m_CoefficientsReleased = true;
+}
+
 void Operator::Delete()
 {
 	CSX = NULL;
@@ -908,6 +918,7 @@ double Operator::GetMinMeshStep() const
 
 void Operator::InitOperator()
 {
+	m_CoefficientsReleased = false;
 	delete vv_ptr;
 	delete vi_ptr;
 	delete iv_ptr;

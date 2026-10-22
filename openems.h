@@ -163,6 +163,9 @@ protected:
 	bool m_DumpStats;
 	bool m_debugBox, m_debugPEC, m_no_simulation;
 	bool m_exactEndCriteria;
+	//! free the operator's host coefficients once the GPU engine holds its own (--release-host-operator)
+	bool m_ReleaseHostOperator;
+	void ReleaseHostOperator();
 
 	double endCrit;
 	int m_OverSampling;
