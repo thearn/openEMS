@@ -27,6 +27,8 @@ using namespace std;
 
 #include <zlib.h>
 
+#include "useful.h"
+
 namespace
 {
 
@@ -87,17 +89,27 @@ bool WriteCompressed(ostream& out, const void* data, size_t bytes)
 	header[0] = (uint32_t)nblocks;
 	header[1] = (uint32_t)block;
 	header[2] = nblocks>0 ? (uint32_t)(bytes-(nblocks-1)*block) : 0;
-	vector<unsigned char> compressed;
-	vector<unsigned char> buf(compressBound(block));
+	// the blocks are compressed independently: in parallel, and joined in order (the same bytes as one by one)
 	const unsigned char* src = static_cast<const unsigned char*>(data);
+	vector<vector<unsigned char>> blocks(nblocks);
+	vector<char> failed(nblocks, 0);
+	ParallelLines(nblocks, SetupThreads(nblocks), [&](unsigned int b, unsigned int)
+	{
+		blocks[b].resize(compressBound(block));
+		uLongf len = (uLongf)blocks[b].size();
+		size_t size = min(block, bytes-b*block);
+		if (compress2(blocks[b].data(), &len, src+b*block, (uLong)size, Z_DEFAULT_COMPRESSION)!=Z_OK)
+			failed[b] = 1;
+		blocks[b].resize(len);
+	});
+	vector<unsigned char> compressed;
 	for (size_t b=0;b<nblocks;++b)
 	{
-		uLongf len = (uLongf)buf.size();
-		size_t size = min(block, bytes-b*block);
-		if (compress2(buf.data(), &len, src+b*block, (uLong)size, Z_DEFAULT_COMPRESSION)!=Z_OK)
+		if (failed[b])
 			return false;
-		header[3+b] = (uint32_t)len;
-		compressed.insert(compressed.end(), buf.begin(), buf.begin()+len);
+		header[3+b] = (uint32_t)blocks[b].size();
+		compressed.insert(compressed.end(), blocks[b].begin(), blocks[b].end());
+		vector<unsigned char>().swap(blocks[b]);
 	}
 	Base64(out, reinterpret_cast<const unsigned char*>(header.data()), header.size()*sizeof(uint32_t));
 	Base64(out, compressed.data(), compressed.size());
