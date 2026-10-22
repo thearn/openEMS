@@ -5,10 +5,12 @@
  leapfrog limit of the discrete operator by Lanczos and uses 0.98 of it; the run must stay
  bounded. With TimeStepFactor 1.07 (1.049 x the exact limit) the run must diverge, and openEMS
  must raise instead of treating the non-finite energy as converged.
+ With a GPU engine available, the device Lanczos (GPU_Backend::LanczosMaxEig) must find the same
+ limit as the host one (OPENEMS_LANCZOS_CPU=1) within 0.5 %.
 
  (c) 2026 solvers-2026-09 campaign
 """
-import os, tempfile
+import os, re, sys, tempfile
 import numpy as np
 from CSXCAD import ContinuousStructure
 from openEMS import openEMS
@@ -47,4 +49,36 @@ except RuntimeError as e:
     print('method 4 x 1.07: divergence detected')
 else:
     raise AssertionError('FAIL: a timestep 4.9% above the exact limit did not diverge')
+
+
+def exact_limit(engine, cpu):
+    """the exact limit printed by the setup (fd 1 captured), or None"""
+    os.environ['OPENEMS_LANCZOS_CPU'] = '1' if cpu else '0'
+    path = os.path.join(tempfile.gettempdir(), 'Timestep_Exact_setup.txt')
+    sys.stdout.flush()
+    saved = os.dup(1)
+    with open(path, 'w') as f:
+        os.dup2(f.fileno(), 1)
+        try:
+            build(method=4).Run(os.path.join(tempfile.gettempdir(), 'Timestep_Exact_setup'), cleanup=True,
+                                setup_only=True, verbose=1, engine=engine)
+        except Exception as e:
+            print('setup failed:', e)
+        finally:
+            sys.stdout.flush()
+            os.dup2(saved, 1)
+            os.close(saved)
+    del os.environ['OPENEMS_LANCZOS_CPU']
+    text = open(path).read()
+    m = re.search(r'exact limit (\S+) s .*?(GPU Lanczos|Lanczos \d+ iterations)', text)
+    return (float(m.group(1)), m.group(2).startswith('GPU')) if m else (None, False)
+
+
+host, _ = exact_limit('gpu', cpu=True)
+device, on_device = exact_limit('gpu', cpu=False)
+if not on_device:
+    print('no GPU Lanczos (no device backend): device check skipped')
+else:
+    assert host and abs(device/host-1) < 5e-3, f'FAIL: device limit {device} vs host {host}'
+    print(f'GPU Lanczos limit {device:.6g} s, host {host:.6g} s ({100*(device/host-1):+.3f} %)')
 print('PASS')

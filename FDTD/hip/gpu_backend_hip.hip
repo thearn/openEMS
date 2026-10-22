@@ -1213,6 +1213,15 @@ void GPU_Backend_HIP::WaitSnapshot()
 		std::cerr << "GPU_Backend_HIP: field snapshot failed: " << hipGetErrorString(err) << std::endl;
 }
 
+double HIP_LanczosMaxEig(int device, const float* SC_h, const float* IL_h, unsigned int N0, unsigned int N1, unsigned int N2,
+                         size_t i0, size_t sx, size_t sy, size_t sz, int iterations);   // hip_lanczos.hip
+
+double GPU_Backend_HIP::LanczosMaxEig(const float* SC, const float* IL, unsigned int N0, unsigned int N1, unsigned int N2,
+                                      size_t i0, size_t sx, size_t sy, size_t sz, int iterations)
+{
+	return HIP_LanczosMaxEig(d->ctx->device, SC, IL, N0, N1, N2, i0, sx, sy, sz, iterations);
+}
+
 bool GPU_Backend_HIP::CalcFastEnergy(const unsigned int numNodes[3], double& E_energy, double& H_energy)
 {
 	E_energy = H_energy = 0;

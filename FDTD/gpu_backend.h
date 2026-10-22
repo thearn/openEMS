@@ -227,6 +227,12 @@ public:
 	//! Sums of the squared voltages and currents of the first numNodes[n] nodes in each direction, see Engine_Interface_FDTD::CalcFastEnergy(). Returns false if the backend cannot compute them.
 	virtual bool CalcFastEnergy(const unsigned int numNodes[3], double& E_energy, double& H_energy) {UNUSED(numNodes); UNUSED(E_energy); UNUSED(H_energy); return false;}
 
+	//! Largest eigenvalue of the leapfrog operator for the exact timestep (Operator::CalcTimestep_Var4()), by \a iterations Lanczos steps on the device.
+	//! \a SC = sqrt(1/C) and \a IL = 1/L per edge (3 components, the operator's memory layout with origin \a i0 and strides \a sx, \a sy, \a sz). Returns -1 if the backend cannot compute it.
+	virtual double LanczosMaxEig(const float* SC, const float* IL, unsigned int N0, unsigned int N1, unsigned int N2,
+	                             size_t i0, size_t sx, size_t sy, size_t sz, int iterations)
+	{UNUSED(SC); UNUSED(IL); UNUSED(N0); UNUSED(N1); UNUSED(N2); UNUSED(i0); UNUSED(sx); UNUSED(sy); UNUSED(sz); UNUSED(iterations); return -1;}
+
 	//! Create a backend for a sub-grid (e.g. a cylindrical multi-grid level) whose work is ordered with the work of this backend. It's the responsibility of the caller to free it.
 	virtual GPU_Backend* NewSubGridBackend() = 0;
 	//! Create the device coupling of this (base grid) backend and \a sub_grid (created by NewSubGridBackend()), or NULL if this backend has none. It's the responsibility of the caller to free it.

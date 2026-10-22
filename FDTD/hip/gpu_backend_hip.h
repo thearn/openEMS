@@ -71,6 +71,8 @@ public:
 	virtual void AccumulateFieldDFT(int id, const std::vector<std::complex<float>>& weights);
 	virtual bool ReadFieldDFT(int id, unsigned int k, std::vector<std::complex<float>>& sums);
 	virtual bool CalcFastEnergy(const unsigned int numNodes[3], double& E_energy, double& H_energy);
+	virtual double LanczosMaxEig(const float* SC, const float* IL, unsigned int N0, unsigned int N1, unsigned int N2,
+	                             size_t i0, size_t sx, size_t sy, size_t sz, int iterations);
 
 	virtual GPU_Backend* NewSubGridBackend();
 	virtual GPU_MultiGridLink* CreateMultiGridLink(GPU_Backend* sub_grid, const GPU_MultiGridInterpolation& interpol);

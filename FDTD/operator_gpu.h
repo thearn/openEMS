@@ -50,6 +50,7 @@ protected:
 	  */
 	virtual bool Calc_EC();
 	virtual bool CalcPEC();
+	virtual double DeviceLanczosMaxEig(const float* SC, const float* IL, size_t i0, size_t sx, size_t sy, size_t sz, int iterations) const;
 
 	//! x line ranges of the threads, at most one per available CPU, bounds inclusive
 	void ThreadRanges(std::vector<unsigned int>& start, std::vector<unsigned int>& stop) const;

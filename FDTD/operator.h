@@ -355,6 +355,9 @@ protected:
 	double CalcTimestep_Var1();
 	double CalcTimestep_Var3();
 	double CalcTimestep_Var4();
+	//! Largest eigenvalue of the leapfrog operator on a device for CalcTimestep_Var4(), see GPU_Backend::LanczosMaxEig(); -1 if there is none
+	virtual double DeviceLanczosMaxEig(const float* SC, const float* IL, size_t i0, size_t sx, size_t sy, size_t sz, int iterations) const
+	{UNUSED(SC); UNUSED(IL); UNUSED(i0); UNUSED(sx); UNUSED(sy); UNUSED(sz); UNUSED(iterations); return -1;}
 	//! Conformal thin conducting sheets (OPENEMS_CONFORMAL_SHEETS=1)
 	void ApplyConformalSheets();
 	//! Add per-edge capacitance and conductance increments from OPENEMS_EDGE_FIELDS (an HDF5 file), if set.

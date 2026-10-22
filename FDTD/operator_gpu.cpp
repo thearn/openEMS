@@ -99,3 +99,10 @@ bool Operator_GPU::CalcPEC()
 	CalcPEC_Curves();
 	return true;
 }
+
+double Operator_GPU::DeviceLanczosMaxEig(const float* SC, const float* IL, size_t i0, size_t sx, size_t sy, size_t sz, int iterations) const
+{
+	if (m_Backend==NULL)
+		return -1;
+	return m_Backend->LanczosMaxEig(SC, IL, numLines[0], numLines[1], numLines[2], i0, sx, sy, sz, iterations);
+}
