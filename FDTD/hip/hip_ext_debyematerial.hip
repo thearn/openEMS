@@ -138,6 +138,7 @@ HIP_Ext_DebyeMaterial::HIP_Ext_DebyeMaterial(GPU_Backend_HIP::Impl* impl, Operat
 	for (unsigned int n=0; n<3; ++n)
 		for (size_t i=0; i<count; ++i)
 			d->volt_modified.push_back(n*d->numCells + flat[i]);
+	d->material_fixup = d->material_fixup || (count>0);
 
 	m_Pole  = d->Alloc<float>((size_t)m_Param.poles*3*count);
 	m_Pre   = d->Alloc<float>(3*(size_t)count);

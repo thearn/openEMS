@@ -205,6 +205,8 @@ __device__ __forceinline__ void fused_volt(const float* __restrict__ volt, const
 // OPENEMS_HIP_FUSED_TZ and _TY override the shape, to measure it on a new GPU.
 #define FUSED_TZ 32   // threads along z, the last one computes the border voltages only
 #define FUSED_TY 8    // threads along y, the last row computes the border voltages only
+#define FUSED_MAX_FIXUP 0.1      // with material_fixup: the largest share of the nodes in the current fix-up (DecideFusedStep)
+#define FUSED_MIN_CELLS 2000000  // with material_fixup: the smallest grid for the fused step (DecideFusedStep)
 #define FUSED_XC 4    // x lines per block (default): short blocks are faster, despite the voltages of one more x line
 
 // Fused step: the voltages and currents of the main nodes [B, E) in one pass, from the current
@@ -539,6 +541,7 @@ GPU_Backend_HIP::Impl::Impl()
 	fregions.count = 0;
 	volt_next = curr_next = NULL;
 	fixup = NULL;
+	material_fixup = false;
 	index32 = false;
 	fixup_count = 0;
 	snap_nv = snap_n = 0;
@@ -619,6 +622,25 @@ bool GPU_Backend_HIP::Impl::DecideFusedStep()
 			else if (fregions.count)
 				list.push_back(node);
 		}
+	// The fix-up recomputes the currents of these nodes every timestep, after the fused kernel, in a launch of its
+	// own. With the voltages of Lorentz/Debye materials or the Mur ABC that is worth it on a large grid, but not on
+	// a small one (a step of microseconds, where the extra launch and the fused kernel's halo cost more than the
+	// second pass saves) nor when the nodes are a large share of the grid: then the separate updates are kept.
+	// OPENEMS_HIP_FUSED_MAX_FIXUP and OPENEMS_HIP_FUSED_MIN_CELLS override FUSED_MAX_FIXUP and FUSED_MIN_CELLS.
+	if (material_fixup)
+	{
+		const char* share_env = getenv("OPENEMS_HIP_FUSED_MAX_FIXUP");
+		const char* cells_env = getenv("OPENEMS_HIP_FUSED_MIN_CELLS");
+		const double max_share = share_env ? atof(share_env) : FUSED_MAX_FIXUP;
+		const double min_cells = cells_env ? atof(cells_env) : FUSED_MIN_CELLS;
+		if (((double)list.size() > max_share*(double)numCells) || ((double)numCells < min_cells))
+		{
+			if (g_settings.GetVerboseLevel()>1)
+				std::cout << "GPU_Backend_HIP: separate voltage and current updates: the fused step would need a current fix-up of "
+				          << list.size() << " of " << numCells << " nodes" << std::endl;
+			return false;
+		}
+	}
 	// The buffers are allocated last, after the field dumps: without them the run is only slower.
 	volt_next = TryAlloc<float>(3*numCells);
 	curr_next = TryAlloc<float>(3*numCells);
@@ -643,6 +665,8 @@ bool GPU_Backend_HIP::Impl::DecideFusedStep()
 		std::cout << "GPU_Backend_HIP: fused voltage and current updates" << (index32 ? ", 32 bit indices" : "");
 		if (fregions.count)
 			std::cout << " (" << fregions.count << " UPML regions in the kernel)";
+		if (fixup_count)
+			std::cout << ", current fix-up of " << fixup_count << " of " << numCells << " nodes";
 		std::cout << std::endl;
 	}
 	return true;

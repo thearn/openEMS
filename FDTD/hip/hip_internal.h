@@ -144,6 +144,7 @@ struct GPU_Backend_HIP::Impl
 	int fused_blockers;                      //!< extensions or grids that do not allow it
 	float *volt_next, *curr_next;
 	std::vector<size_t> volt_modified;       //!< flat indices of the voltages the extensions register as changed between the half-steps (excitation, lumped RLC, Lorentz/Debye materials, Mur ABC)
+	bool material_fixup;                     //!< Lorentz/Debye materials or the Mur ABC registered voltages (see DecideFusedStep())
 	HIP_FusedRegions fregions;              //!< the UPML regions in the kernel (see HIP_Ext_UPML::CanFuse())
 	size_t* fixup;                           //!< main nodes whose currents are recomputed after the voltage extensions
 	unsigned int fixup_count;

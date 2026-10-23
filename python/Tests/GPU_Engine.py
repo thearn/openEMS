@@ -25,8 +25,9 @@
      frequency domain dumps from them on the host (OPENEMS_GPU_DUMPS=snapshot)
    HIP backend, cases mur and materials: the fused step is used with the Mur ABC, the Lorentz, Drude
      and Debye materials and the conducting sheet (their changed voltages are recomputed by its
-     current fix-up), bit-identical to the separate updates (mur_separate, materials_separate:
-     OPENEMS_HIP_FUSED_STEP=0)
+     current fix-up; OPENEMS_HIP_FUSED_MAX_FIXUP=1 and OPENEMS_HIP_FUSED_MIN_CELLS=0 on these small grids),
+     bit-identical to the separate updates (mur_separate, materials_separate: OPENEMS_HIP_FUSED_STEP=0);
+     case mur_share: the default rule takes the separate updates on a small grid
    HIP backend, cases pml, pml_upml_regions and pml_upml_separate: the UPML is updated in the
      fused step, by region kernels (OPENEMS_HIP_FUSED_STEP=0) and by separate kernels
      (OPENEMS_HIP_UPML_FUSION=0), each bit-identical; pml_index32: the fused step with 32 bit
@@ -599,6 +600,7 @@ cases = [('excitation',     case_excitation,     True),
          ('pml_full_separate', case_pml_graded,  True),
          ('mur',            case_mur,            True),
          ('mur_separate',   case_mur,            True),
+         ('mur_share',      case_mur,            True),
          ('materials',      case_materials,      True),
          ('materials_separate', case_materials,  True),
          ('lumped',         case_lumped,         True),
@@ -630,6 +632,8 @@ CASE_ENV = {'dumps_snapshot_host_dft': {'OPENEMS_GPU_DUMPS': 'snapshot'},
             'pml_upml_separate': {'OPENEMS_HIP_UPML_FUSION': '0'},
             'pml_index32': {'OPENEMS_HIP_INDEX': '32'},
             'pml_full_separate': {'OPENEMS_HIP_UPML_FUSION': '0'},
+            'mur': {'OPENEMS_HIP_FUSED_MAX_FIXUP': '1', 'OPENEMS_HIP_FUSED_MIN_CELLS': '0'},
+            'materials': {'OPENEMS_HIP_FUSED_MAX_FIXUP': '1', 'OPENEMS_HIP_FUSED_MIN_CELLS': '0'},
             'mur_separate': {'OPENEMS_HIP_FUSED_STEP': '0'},
             'materials_separate': {'OPENEMS_HIP_FUSED_STEP': '0'}}
 # the messages of the HIP backend for these UPML updates: (expected, not expected)
@@ -641,7 +645,7 @@ UPML_MODES = {'pml': ('UPML regions in the kernel', None),
 
 # cases whose voltages extensions change between the half-steps: whether the HIP backend uses the
 # fused step, and the case each separate-update run must be bit-identical to
-FUSED_STEP = {'mur': True, 'materials': True, 'mur_separate': False, 'materials_separate': False}
+FUSED_STEP = {'mur': True, 'materials': True, 'mur_separate': False, 'materials_separate': False, 'mur_share': False}
 FUSED_PAIRS = {'mur_separate': 'mur', 'materials_separate': 'materials'}
 
 DEVICE_RTOL = 1e-4
@@ -702,6 +706,9 @@ for name, case, on_device in cases:
         if name in FUSED_STEP and backend=='HIP':
             assert ('fused voltage and current updates' in logs['gpu'])==FUSED_STEP[name], \
                 f'FAIL [{name}]: the HIP backend did not take the intended update (fused step expected: {FUSED_STEP[name]})'
+        if name=='mur_share' and backend=='HIP':
+            assert 'the fused step would need a current fix-up' in logs['gpu'], \
+                f'FAIL [{name}]: the HIP backend did not report why it took the separate updates'
         if name in UPML_MODES and backend=='HIP':
             expected, unexpected = UPML_MODES[name]
             assert (expected is None or expected in logs['gpu']) and (unexpected is None or unexpected not in logs['gpu']), \

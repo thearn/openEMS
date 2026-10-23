@@ -147,7 +147,10 @@ void HIP_Ext_LorentzMaterial::Setup(std::vector<Order>& orders, size_t count, un
 		for (unsigned int n=0; n<3; ++n)
 			for (size_t i=0; i<count; ++i)
 				if (c_ext && (c_ext[n][i]!=0))
+				{
 					d->volt_modified.push_back(n*d->numCells + flat[i]);
+					d->material_fixup = true;
+				}
 	ord.pos = d->Alloc<size_t>(count, flat.data());
 
 	ord.ade = d->Alloc<float>(3*(size_t)count);

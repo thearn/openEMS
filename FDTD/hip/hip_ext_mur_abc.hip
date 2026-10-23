@@ -124,6 +124,7 @@ HIP_Ext_Mur_ABC::HIP_Ext_Mur_ABC(GPU_Backend_HIP::Impl* impl, Operator_Ext_Mur_A
 			d->volt_modified.push_back(m_Param.nyP*d->numCells + node);
 			d->volt_modified.push_back(m_Param.nyPP*d->numCells + node);
 		}
+	d->material_fixup = true;
 	m_Volt_nyP  = d->Alloc<float>(count);
 	m_Volt_nyPP = d->Alloc<float>(count);
 	m_Coeff_nyP  = d->Alloc<float>(count, op_ext->m_Mur_Coeff_nyP.data());

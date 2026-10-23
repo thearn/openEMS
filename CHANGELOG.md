@@ -65,9 +65,10 @@ there are unreleased changes. It becomes the next release entry.
 
 - The GPU engine's HIP backend keeps its fused step (one kernel for the voltage
   and the current update) with Lorentz, Drude and Debye materials, conducting
-  sheets and the Mur ABC. It used to fall back to separate voltage and current
-  updates for these, two passes over the fields each timestep. The results are
-  unchanged (bit-identical).
+  sheets and the Mur ABC on grids from 2 million cells, where it is 20-37 %
+  faster. It used to fall back to separate voltage and current updates for
+  these, two passes over the fields each timestep; small grids keep them. The
+  results are unchanged (bit-identical).
 - The Python bindings need Python 3.6 or newer (was 3.4), the oldest version
   CI still tests; CentOS 7 and Ubuntu 14.04 are no longer tested.
 - Time-domain HDF5 field dumps are written in the background instead of
