@@ -250,7 +250,7 @@ __device__ __forceinline__ void fused_ade(const HIP_FusedADE& A, const HIP_GridD
 // voltages of its nodes before they are stored or used (see fused_ade), instead of a launch after
 // the kernel and a recomputation of the currents they feed.
 // MODE (0-2) and REGIONS are compile-time: the coefficient mode and the UPML region checks of the
-// inner loop are compiled out (MODE 3: the mode is read at run time, used with the regions).
+// inner loop are compiled out (MODE 3: the mode read at run time, OPENEMS_HIP_FUSED_SPECIALIZE=0).
 template<typename I, unsigned int TZ, unsigned int TY, unsigned int MODE, bool REGIONS, bool ADE>
 __global__ void __launch_bounds__(TZ*TY) update_fused(
 	const float* __restrict__ volt_in, const float* __restrict__ curr_in, float* volt_out, float* __restrict__ curr_out,
@@ -373,22 +373,20 @@ static void launch_fused(hipStream_t stream, const HIP_FusedArgs& a)
 		a.volt_in, a.curr_in, a.volt_out, a.curr_out, a.index, a.va, a.vb, a.ia, a.ib, a.mode, a.N, a.B, a.E, a.F, a.A, a.xc)
 	static const bool specialize = !(getenv("OPENEMS_HIP_FUSED_SPECIALIZE") && atoi(getenv("OPENEMS_HIP_FUSED_SPECIALIZE"))==0);
 	const bool ade = a.A.count>0;
-	if (!specialize || a.F.count)
-	{
-		if (ade) HIP_FUSED_LAUNCH(3, true, true); else HIP_FUSED_LAUNCH(3, true, false);
-	}
+	const bool regions = a.F.count>0;
+#define HIP_FUSED_LAUNCH_MODE(MODE) \
+	do { if (regions) { if (ade) HIP_FUSED_LAUNCH(MODE, true, true); else HIP_FUSED_LAUNCH(MODE, true, false); } \
+	     else { if (ade) HIP_FUSED_LAUNCH(MODE, false, true); else HIP_FUSED_LAUNCH(MODE, false, false); } } while (0)
+	// with the UPML regions as well: the generic mode costs 8 % of the kernel on an A100 (Rev E, 44 M cells)
+	if (!specialize)
+		HIP_FUSED_LAUNCH_MODE(3);
 	else if (a.mode==0)
-	{
-		if (ade) HIP_FUSED_LAUNCH(0, false, true); else HIP_FUSED_LAUNCH(0, false, false);
-	}
+		HIP_FUSED_LAUNCH_MODE(0);
 	else if (a.mode==1)
-	{
-		if (ade) HIP_FUSED_LAUNCH(1, false, true); else HIP_FUSED_LAUNCH(1, false, false);
-	}
+		HIP_FUSED_LAUNCH_MODE(1);
 	else
-	{
-		if (ade) HIP_FUSED_LAUNCH(2, false, true); else HIP_FUSED_LAUNCH(2, false, false);
-	}
+		HIP_FUSED_LAUNCH_MODE(2);
+#undef HIP_FUSED_LAUNCH_MODE
 #undef HIP_FUSED_LAUNCH
 }
 
