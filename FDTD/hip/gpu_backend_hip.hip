@@ -249,7 +249,9 @@ __device__ __forceinline__ void fused_ade(const HIP_FusedADE& A, const HIP_GridD
 // With ADE, the correction of one voltage ADE group (conducting sheets) is applied to the new
 // voltages of its nodes before they are stored or used (see fused_ade), instead of a launch after
 // the kernel and a recomputation of the currents they feed.
-template<typename I, unsigned int TZ, unsigned int TY, bool ADE>
+// MODE (0-2) and REGIONS are compile-time: the coefficient mode and the UPML region checks of the
+// inner loop are compiled out (MODE 3: the mode is read at run time, used with the regions).
+template<typename I, unsigned int TZ, unsigned int TY, unsigned int MODE, bool REGIONS, bool ADE>
 __global__ void __launch_bounds__(TZ*TY) update_fused(
 	const float* __restrict__ volt_in, const float* __restrict__ curr_in, float* volt_out, float* __restrict__ curr_out,
 	const void* index, const float* va, const float* vb, const float* ia, const float* ib, unsigned int mode,
@@ -265,16 +267,17 @@ __global__ void __launch_bounds__(TZ*TY) update_fused(
 	const bool owner = main_yz && (tz<TZ-1) && (ty<TY-1);  // written by this block
 	const bool in_grid = (z<N.nz) && (y<N.ny);
 	const I sn = (I)N.nx*N.ny*N.nz;
+	const unsigned int cmode = MODE<3 ? MODE : mode;
 
 	// the new voltages at x: computed on main nodes, else from the UPML regions (or unused)
 	auto volt_at = [&](unsigned int x, float v[3])
 	{
 		if (main_yz && (x<E.nx))
 		{
-			const int r = F.count ? fused_region_of(F, x, y, z) : -1;
+			const int r = (REGIONS && F.count) ? fused_region_of(F, x, y, z) : -1;
 			if (r<0)
 			{
-				fused_volt<I>(volt_in, curr_in, index, va, vb, mode, N, x, y, z, v);
+				fused_volt<I>(volt_in, curr_in, index, va, vb, cmode, N, x, y, z, v);
 				if (ADE)
 					fused_ade<I>(A, N, x, y, z, v);
 			}
@@ -314,13 +317,13 @@ __global__ void __launch_bounds__(TZ*TY) update_fused(
 				curl[1] = (sV[0][ty][tz] - sV[0][ty][tz+1] - sV[2][ty][tz] + v1[2]);
 				curl[2] = (sV[1][ty][tz] - v1[1] - sV[0][ty][tz] + sV[0][ty+1][tz]);
 			}
-			const int r = F.count ? fused_region_of(F, x, y, z) : -1;
+			const int r = (REGIONS && F.count) ? fused_region_of(F, x, y, z) : -1;
 			if (r>=0)
 				upml_curr_value<I>(curr_in, curr_out, F.curr[r], N, F.R[r], x, y, z, update, curl);
 			else if (update)
 			{
 				const I i = nijk<I>(N, 0, x, y, z);
-				const HIP_MainCoeffT<I> C = main_coeff<I>(index, ia, ib, mode, sn, i, 6);
+				const HIP_MainCoeffT<I> C = main_coeff<I>(index, ia, ib, cmode, sn, i, 6);
 				float c;
 				//for x
 				c  = curr_in[i] * C.a[0];
@@ -366,12 +369,27 @@ static void launch_fused(hipStream_t stream, const HIP_FusedArgs& a)
 {
 	const dim3 block(TZ, TY, 1);
 	const dim3 grid((a.E.nz-a.B.nz+TZ-2)/(TZ-1), (a.E.ny-a.B.ny+TY-2)/(TY-1), (a.E.nx-a.B.nx+a.xc-1)/a.xc);
-	if (a.A.count)
-		update_fused<I, TZ, TY, true><<<grid, block, 0, stream>>>(a.volt_in, a.curr_in, a.volt_out, a.curr_out, a.index,
-		                                                       a.va, a.vb, a.ia, a.ib, a.mode, a.N, a.B, a.E, a.F, a.A, a.xc);
+#define HIP_FUSED_LAUNCH(MODE, REGIONS, ADE) update_fused<I, TZ, TY, MODE, REGIONS, ADE><<<grid, block, 0, stream>>>( \
+		a.volt_in, a.curr_in, a.volt_out, a.curr_out, a.index, a.va, a.vb, a.ia, a.ib, a.mode, a.N, a.B, a.E, a.F, a.A, a.xc)
+	static const bool specialize = !(getenv("OPENEMS_HIP_FUSED_SPECIALIZE") && atoi(getenv("OPENEMS_HIP_FUSED_SPECIALIZE"))==0);
+	const bool ade = a.A.count>0;
+	if (!specialize || a.F.count)
+	{
+		if (ade) HIP_FUSED_LAUNCH(3, true, true); else HIP_FUSED_LAUNCH(3, true, false);
+	}
+	else if (a.mode==0)
+	{
+		if (ade) HIP_FUSED_LAUNCH(0, false, true); else HIP_FUSED_LAUNCH(0, false, false);
+	}
+	else if (a.mode==1)
+	{
+		if (ade) HIP_FUSED_LAUNCH(1, false, true); else HIP_FUSED_LAUNCH(1, false, false);
+	}
 	else
-		update_fused<I, TZ, TY, false><<<grid, block, 0, stream>>>(a.volt_in, a.curr_in, a.volt_out, a.curr_out, a.index,
-		                                                        a.va, a.vb, a.ia, a.ib, a.mode, a.N, a.B, a.E, a.F, a.A, a.xc);
+	{
+		if (ade) HIP_FUSED_LAUNCH(2, false, true); else HIP_FUSED_LAUNCH(2, false, false);
+	}
+#undef HIP_FUSED_LAUNCH
 }
 
 template<typename I, unsigned int TZ>
