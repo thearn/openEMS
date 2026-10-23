@@ -85,7 +85,7 @@ protected:
 		float *c_int, *c_ext, *c_lor;
 	};
 
-	void Setup(std::vector<Order>& orders, size_t count, unsigned int** pos,
+	void Setup(std::vector<Order>& orders, size_t count, unsigned int** pos, bool voltage,
 	           bool lorentz, FDTD_FLOAT** c_int, FDTD_FLOAT** c_ext, FDTD_FLOAT** c_lor);
 	float* Coefficients(size_t count, FDTD_FLOAT** c);
 	void Pre(Order& o, float* field)
@@ -110,10 +110,10 @@ HIP_Ext_LorentzMaterial::HIP_Ext_LorentzMaterial(GPU_Backend_HIP::Impl* impl, Op
 	{
 		const size_t count = op_ext->m_LM_Count.at(o);
 		if (op_ext->m_volt_ADE_On[o])
-			Setup(m_Volt, count, op_ext->m_LM_pos[o], op_ext->m_volt_Lor_ADE_On[o],
+			Setup(m_Volt, count, op_ext->m_LM_pos[o], true, op_ext->m_volt_Lor_ADE_On[o],
 			      op_ext->v_int_ADE[o], op_ext->v_ext_ADE[o], op_ext->m_volt_Lor_ADE_On[o] ? op_ext->v_Lor_ADE[o] : NULL);
 		if (op_ext->m_curr_ADE_On[o])
-			Setup(m_Curr, count, op_ext->m_LM_pos[o], op_ext->m_curr_Lor_ADE_On[o],
+			Setup(m_Curr, count, op_ext->m_LM_pos[o], false, op_ext->m_curr_Lor_ADE_On[o],
 			      op_ext->i_int_ADE[o], op_ext->i_ext_ADE[o], op_ext->m_curr_Lor_ADE_On[o] ? op_ext->i_Lor_ADE[o] : NULL);
 	}
 }
@@ -128,7 +128,7 @@ float* HIP_Ext_LorentzMaterial::Coefficients(size_t count, FDTD_FLOAT** c)
 	return d->Alloc<float>(data.size(), data.data());
 }
 
-void HIP_Ext_LorentzMaterial::Setup(std::vector<Order>& orders, size_t count, unsigned int** pos,
+void HIP_Ext_LorentzMaterial::Setup(std::vector<Order>& orders, size_t count, unsigned int** pos, bool voltage,
                                      bool lorentz, FDTD_FLOAT** c_int, FDTD_FLOAT** c_ext, FDTD_FLOAT** c_lor)
 {
 	if (count==0)
@@ -141,6 +141,13 @@ void HIP_Ext_LorentzMaterial::Setup(std::vector<Order>& orders, size_t count, un
 	std::vector<size_t> flat(count);
 	for (size_t i=0; i<count; ++i)
 		flat[i] = ((size_t)pos[0][i]*d->dim.ny + pos[1][i])*d->dim.nz + pos[2][i];
+	// the voltage ADE changes these voltages between the half-steps: the fused step recomputes the
+	// currents they feed (see volt_modified); a component whose c_ext is zero keeps a zero ADE state
+	if (voltage)
+		for (unsigned int n=0; n<3; ++n)
+			for (size_t i=0; i<count; ++i)
+				if (c_ext && (c_ext[n][i]!=0))
+					d->volt_modified.push_back(n*d->numCells + flat[i]);
 	ord.pos = d->Alloc<size_t>(count, flat.data());
 
 	ord.ade = d->Alloc<float>(3*(size_t)count);

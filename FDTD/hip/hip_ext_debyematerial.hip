@@ -133,6 +133,11 @@ HIP_Ext_DebyeMaterial::HIP_Ext_DebyeMaterial(GPU_Backend_HIP::Impl* impl, Operat
 	for (size_t i=0; i<count; ++i)
 		flat[i] = ((size_t)pos[0][i]*d->dim.ny + pos[1][i])*d->dim.nz + pos[2][i];
 	m_Pos = d->Alloc<size_t>(count, flat.data());
+	// the ADE changes these voltages between the half-steps: the fused step recomputes the
+	// currents they feed (see volt_modified)
+	for (unsigned int n=0; n<3; ++n)
+		for (size_t i=0; i<count; ++i)
+			d->volt_modified.push_back(n*d->numCells + flat[i]);
 
 	m_Pole  = d->Alloc<float>((size_t)m_Param.poles*3*count);
 	m_Pre   = d->Alloc<float>(3*(size_t)count);

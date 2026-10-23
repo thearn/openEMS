@@ -23,6 +23,10 @@
    device backend, cases dumps_snapshot, multigrid_snapshot and dumps_snapshot_host_dft: the
      dumps read field snapshots (FULL_DEVICE_BACKENDS); dumps_snapshot_host_dft sums the
      frequency domain dumps from them on the host (OPENEMS_GPU_DUMPS=snapshot)
+   HIP backend, cases mur and materials: the fused step is used with the Mur ABC, the Lorentz, Drude
+     and Debye materials and the conducting sheet (their changed voltages are recomputed by its
+     current fix-up), bit-identical to the separate updates (mur_separate, materials_separate:
+     OPENEMS_HIP_FUSED_STEP=0)
    HIP backend, cases pml, pml_upml_regions and pml_upml_separate: the UPML is updated in the
      fused step, by region kernels (OPENEMS_HIP_FUSED_STEP=0) and by separate kernels
      (OPENEMS_HIP_UPML_FUSION=0), each bit-identical; pml_index32: the fused step with 32 bit
@@ -594,7 +598,9 @@ cases = [('excitation',     case_excitation,     True),
          ('pml_index32',    case_pml,            True),
          ('pml_full_separate', case_pml_graded,  True),
          ('mur',            case_mur,            True),
+         ('mur_separate',   case_mur,            True),
          ('materials',      case_materials,      True),
+         ('materials_separate', case_materials,  True),
          ('lumped',         case_lumped,         True),
          ('lumped_pml',     case_lumped_pml,     True),
          ('tfsf',           case_tfsf,           True),
@@ -623,7 +629,9 @@ CASE_ENV = {'dumps_snapshot_host_dft': {'OPENEMS_GPU_DUMPS': 'snapshot'},
             'pml_upml_regions': {'OPENEMS_HIP_FUSED_STEP': '0'},
             'pml_upml_separate': {'OPENEMS_HIP_UPML_FUSION': '0'},
             'pml_index32': {'OPENEMS_HIP_INDEX': '32'},
-            'pml_full_separate': {'OPENEMS_HIP_UPML_FUSION': '0'}}
+            'pml_full_separate': {'OPENEMS_HIP_UPML_FUSION': '0'},
+            'mur_separate': {'OPENEMS_HIP_FUSED_STEP': '0'},
+            'materials_separate': {'OPENEMS_HIP_FUSED_STEP': '0'}}
 # the messages of the HIP backend for these UPML updates: (expected, not expected)
 UPML_MODES = {'pml': ('UPML regions in the kernel', None),
               'pml_index32': ('fused voltage and current updates, 32 bit indices', None),
@@ -631,12 +639,18 @@ UPML_MODES = {'pml': ('UPML regions in the kernel', None),
               'pml_upml_separate': (None, 'UPML regions fused with the main updates'),
               'pml_full_separate': ('full coefficient arrays', 'UPML regions fused with the main updates')}
 
+# cases whose voltages extensions change between the half-steps: whether the HIP backend uses the
+# fused step, and the case each separate-update run must be bit-identical to
+FUSED_STEP = {'mur': True, 'materials': True, 'mur_separate': False, 'materials_separate': False}
+FUSED_PAIRS = {'mur_separate': 'mur', 'materials_separate': 'materials'}
+
 DEVICE_RTOL = 1e-4
 # device backends with a device implementation of every extension
 FULL_DEVICE_BACKENDS = ('HIP', 'Metal')
 # device backends that accumulate the frequency domain dumps
 DEVICE_DFT_BACKENDS = ('HIP',)
 engines = ('basic', 'gpu-reference', 'gpu')
+gpu_paths = {}
 
 for name, case, on_device in cases:
     print(f'Testing case: {name}')
@@ -685,6 +699,9 @@ for name, case, on_device in cases:
         if name=='coeff_full' and backend in FULL_DEVICE_BACKENDS:
             assert 'compressed update coefficients' not in logs['gpu'], \
                 f'FAIL [{name}]: the {backend} backend did not use the full coefficient arrays'
+        if name in FUSED_STEP and backend=='HIP':
+            assert ('fused voltage and current updates' in logs['gpu'])==FUSED_STEP[name], \
+                f'FAIL [{name}]: the HIP backend did not take the intended update (fused step expected: {FUSED_STEP[name]})'
         if name in UPML_MODES and backend=='HIP':
             expected, unexpected = UPML_MODES[name]
             assert (expected is None or expected in logs['gpu']) and (unexpected is None or unexpected not in logs['gpu']), \
@@ -695,6 +712,12 @@ for name, case, on_device in cases:
             ', '.join(f'{n} ({d:.1e})' for n, d in diff)
         if name in UPML_MODES and backend=='HIP':
             assert worst==0, f'FAIL [{name}]: the HIP UPML update is not bit-identical ({worst:.1e})'
+        if name in FUSED_PAIRS and backend=='HIP':
+            diff, _, _, worst = compare_outputs(gpu_paths[FUSED_PAIRS[name]], paths['gpu'])
+            assert not diff and worst==0, \
+                f'FAIL [{name}]: the fused step differs from the separate updates ({worst:.1e})'
+            print(f'  HIP backend: the fused step is bit-identical to the separate updates')
+        gpu_paths[name] = paths['gpu']
     else:
         # no silent fallback to the (slow) reference backend
         assert 'Running FDTD engine' not in logs['gpu'], \
