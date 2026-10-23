@@ -445,9 +445,12 @@ __global__ void field_dft(const float* __restrict__ f, HIP_GatherRegion R, HIP_G
 
 // the currents of the given main nodes again (update_currents), after the voltage extensions
 // changed voltages they read (see GPU_Backend_HIP::Impl::fixup)
+// With the UPML regions in the fused kernel (F.count>0), a node of a region is computed with the
+// region update (upml_curr_value) from the flux before the step, as the kernel did.
 __global__ void update_currents_nodes(const float* __restrict__ curr_in, float* __restrict__ curr_out, const float* __restrict__ volt,
                                       const size_t* nodes, unsigned int count,
-                                      const void* index, const float* ia, const float* ib, unsigned int mode, HIP_GridDim N)
+                                      const void* index, const float* ia, const float* ib, unsigned int mode, HIP_GridDim N,
+                                      HIP_FusedRegions F)
 {
 	const unsigned int k = blockIdx.x*blockDim.x + threadIdx.x;
 	if (k>=count)
@@ -456,6 +459,20 @@ __global__ void update_currents_nodes(const float* __restrict__ curr_in, float* 
 	const size_t i  = nodes[k];
 	const size_t xp = (size_t)N.ny*N.nz;
 	const size_t yp = N.nz;
+	if (F.count)
+	{
+		const unsigned int x = (unsigned int)(i/xp), y = (unsigned int)((i/yp)%N.ny), z = (unsigned int)(i%N.nz);
+		const int r = fused_region_of(F, x, y, z);
+		if (r>=0)
+		{
+			// fix-up nodes are never on the last mesh lines (see DecideFusedStep)
+			const float curl[3] = {(volt[2*sn+i] - volt[2*sn+i+yp] - volt[sn+i] + volt[sn+i+1]),
+			                       (volt[i] - volt[i+1] - volt[2*sn+i] + volt[2*sn+i+xp]),
+			                       (volt[sn+i] - volt[sn+i+xp] - volt[i] + volt[i+yp])};
+			upml_curr_value<size_t>(curr_in, curr_out, F.curr[r], N, F.R[r], x, y, z, true, curl);
+			return;
+		}
+	}
 	const HIP_MainCoeff C = main_coeff(index, ia, ib, mode, sn, i, 6);
 	float c;
 	c  = curr_in[i] * C.a[0];
@@ -634,8 +651,8 @@ bool GPU_Backend_HIP::Impl::DecideFusedStep()
 		return false;
 
 	// The currents of the nodes that read a voltage changed between the half-steps are computed
-	// again. With the UPML regions in the kernel, region nodes cannot (the current flux is
-	// updated in place): then the region kernels update the regions.
+	// again; with the UPML regions in the kernel a region node is computed with the region update
+	// from the current flux before the step (the kernel writes the new flux to a second buffer).
 	// Voltage ADE groups: one group whose nodes are all main nodes (not in a UPML region, not
 	// changed by another extension) is applied in the kernel, which needs no fix-up for it; the
 	// other groups register their changed voltages for the fix-up.
@@ -711,8 +728,6 @@ bool GPU_Backend_HIP::Impl::DecideFusedStep()
 				ok &= (folded || ((c[n]>=start[n]) && (c[n]<stop[n]))) && (c[n]+1<n_lines[n]);
 			if (!ok)
 				continue;
-			if (folded && (fused_region_of(fregions, c[0], c[1], c[2])>=0))
-				fregions.count = 0;   // a region node: no regions in the kernel
 			nodes.insert(((size_t)c[0]*dim.ny + c[1])*dim.nz + c[2]);
 		}
 	}
@@ -1187,7 +1202,7 @@ void GPU_Backend_HIP::UpdateCurrents()
 		if (d->fixup_count)
 			HIP_Launch(d, "update_currents_nodes", update_currents_nodes, d->fixup_count, 1, 1, (const float*)d->curr, d->curr_next, (const float*)d->volt,
 			            (const size_t*)d->fixup, d->fixup_count, (const void*)d->index,
-			            (const float*)(c ? d->coeff : d->ii), (const float*)(c ? d->coeff : d->iv), d->coeff_mode, d->dim);
+			            (const float*)(c ? d->coeff : d->ii), (const float*)(c ? d->coeff : d->iv), d->coeff_mode, d->dim, d->fregions);
 		std::swap(d->curr, d->curr_next);
 		return;
 	}

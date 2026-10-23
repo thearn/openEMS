@@ -35,7 +35,7 @@ __device__ __forceinline__ I upml_local(const UPMLRegion& R, unsigned int n, uns
 struct UPMLFusedArgs
 {
 	float* flux;
-	float* flux_out;   //!< the new voltage flux: flux (in place) or the second buffer of the fused step (see update_fused)
+	float* flux_out;   //!< the new flux: flux (in place) or the second buffer of the fused step (see update_fused)
 	const float* c_old; const float* c_fo; const float* c_fn;   //!< full UPML coefficient arrays (mode 0)
 	const void* u_index; const float* u_sets; unsigned int u_mode;
 	const void* index; const float* ca; const float* cb; unsigned int mode;   //!< main coefficients, see main_coeff()
@@ -172,7 +172,8 @@ __device__ __forceinline__ void upml_volt_value(const float* volt, const float* 
 template<typename I>
 __device__ __forceinline__ void upml_curr_value(const float* curr_in, float* curr_out, const UPMLFusedArgs& A,
                                                 const HIP_GridDim& N, const UPMLRegion& R,
-                                                unsigned int gx, unsigned int gy, unsigned int gz, bool update, const float curl[3])
+                                                unsigned int gx, unsigned int gy, unsigned int gz, bool update, const float curl[3],
+                                                unsigned int mask=7)
 {
 	const unsigned int x = gx-R.sx, y = gy-R.sy, z = gz-R.sz;
 	const I sn = (I)N.nx*N.ny*N.nz;
@@ -184,6 +185,8 @@ __device__ __forceinline__ void upml_curr_value(const float* curr_in, float* cur
 		C = main_coeff<I>(A.index, A.ca, A.cb, A.mode, sn, i, 6);
 	for (unsigned int n=0; n<3; ++n)
 	{
+		if (!((mask>>n)&1))
+			continue;
 		const I l = upml_local<I>(R, n, x, y, z);
 		const I g = n*sn + i;
 		const float f_help = U.old[n*U.s]*curr_in[g] - U.fo[n*U.s]*A.flux[l];
@@ -193,7 +196,7 @@ __device__ __forceinline__ void upml_curr_value(const float* curr_in, float* cur
 			c  = c * C.a[n*C.s];
 			c += C.b[n*C.s] * curl[n];
 		}
-		A.flux[l] = c;
+		A.flux_out[l] = c;
 		curr_out[g] = f_help + U.fn[n*U.s]*c;
 	}
 }
