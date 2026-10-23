@@ -578,7 +578,9 @@ bool GPU_Backend_HIP::Impl::DecideFusedStep()
 	// again. With the UPML regions in the kernel, region nodes cannot (the current flux is
 	// updated in place): then the region kernels update the regions.
 	const bool folded = fregions.count>0;
-	std::set<size_t> nodes;
+	// the nodes as one bit each, listed in ascending order below: linear in the number of nodes, where a
+	// tree of millions of nodes (the Mur ABC on a large mesh) took seconds of the first timestep
+	std::vector<uint64_t> nodes((numCells+63)/64, 0);
 	for (size_t k=0; k<volt_modified.size(); ++k)
 	{
 		const size_t node = volt_modified[k] % numCells;
@@ -602,18 +604,21 @@ bool GPU_Backend_HIP::Impl::DecideFusedStep()
 				continue;
 			if (folded && (fused_region_of(fregions, c[0], c[1], c[2])>=0))
 				fregions.count = 0;   // a region node: no regions in the kernel
-			nodes.insert(((size_t)c[0]*dim.ny + c[1])*dim.nz + c[2]);
+			const size_t node = ((size_t)c[0]*dim.ny + c[1])*dim.nz + c[2];
+			nodes[node>>6] |= uint64_t(1)<<(node&63);
 		}
 	}
 	std::vector<size_t> list;
-	for (std::set<size_t>::const_iterator it=nodes.begin(); it!=nodes.end(); ++it)
-	{
-		const unsigned int c[3] = {(unsigned int)(*it/((size_t)dim.ny*dim.nz)), (unsigned int)((*it/dim.nz)%dim.ny), (unsigned int)(*it%dim.nz)};
-		if ((c[0]>=main_start.nx) && (c[0]<main_stop.nx) && (c[1]>=main_start.ny) && (c[1]<main_stop.ny) && (c[2]>=main_start.nz) && (c[2]<main_stop.nz))
-			list.push_back(*it);   // main nodes only, the region kernels update the others after the extensions
-		else if (fregions.count)
-			list.push_back(*it);
-	}
+	for (size_t w=0; w<nodes.size(); ++w)
+		for (uint64_t bits=nodes[w]; bits; bits&=bits-1)
+		{
+			const size_t node = w*64 + __builtin_ctzll(bits);
+			const unsigned int c[3] = {(unsigned int)(node/((size_t)dim.ny*dim.nz)), (unsigned int)((node/dim.nz)%dim.ny), (unsigned int)(node%dim.nz)};
+			if ((c[0]>=main_start.nx) && (c[0]<main_stop.nx) && (c[1]>=main_start.ny) && (c[1]<main_stop.ny) && (c[2]>=main_start.nz) && (c[2]<main_stop.nz))
+				list.push_back(node);   // main nodes only, the region kernels update the others after the extensions
+			else if (fregions.count)
+				list.push_back(node);
+		}
 	// The buffers are allocated last, after the field dumps: without them the run is only slower.
 	volt_next = TryAlloc<float>(3*numCells);
 	curr_next = TryAlloc<float>(3*numCells);
