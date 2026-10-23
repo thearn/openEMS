@@ -16,6 +16,7 @@
 */
 
 #include "hip/hip_runtime.h"
+#include <algorithm>
 #include <map>
 #include <vector>
 #include "hip_internal.h"
@@ -23,47 +24,76 @@
 #include "FDTD/extensions/operator_ext_lorentzmaterial.h"
 #include "FDTD/extensions/engine_ext_lorentzmaterial.h"
 
-// Drude/Lorentz materials and conducting sheets, see Engine_Ext_LorentzMaterial
-// and Engine_Ext_Dispersive. One launch per dispersion order, one thread per mesh
-// position of that order (unique within an order). The ADE state and coefficients
-// are stored per order as [direction][position].
-struct ADEParam { size_t count; unsigned int lorentz; size_t sn; };
+// Drude/Lorentz/Debye materials and conducting sheets, see Engine_Ext_LorentzMaterial
+// and Engine_Ext_Dispersive. One thread per mesh position of a group of orders. The ADE
+// state and coefficients are stored per order as [direction][position].
+//
+// Orders that share their mesh positions (e.g. the four branches of a conducting sheet) are one
+// group with one launch per phase: the field is read (pre) or written (apply) once per active
+// component, the orders are processed in their order with the operations of the engine. A
+// component whose c_ext is zero in every order keeps a zero ADE state and never changes its
+// field: it is skipped (mask).
+struct ADEGroup
+{
+	size_t count, sn;
+	unsigned int orders, lorentz;
+	const size_t* pos;
+	const unsigned char* mask;
+	float* ade[ADE_GROUP_MAX];
+	float* lor[ADE_GROUP_MAX];
+	const float* c_int[ADE_GROUP_MAX];
+	const float* c_ext[ADE_GROUP_MAX];
+	const float* c_lor[ADE_GROUP_MAX];
+};
 
 // ADE update before the main update, reads the field
-__global__ void lorentz_pre(const float* field, float* ade, float* lor, const float* c_int, const float* c_ext,
-                            const float* c_lor, const size_t* pos, ADEParam P)
+__global__ void lorentz_pre_group(const float* field, ADEGroup G)
 {
 	const size_t i = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
-	if (i>=P.count)
+	if (i>=G.count)
 		return;
+	const unsigned int m = G.mask[i];
 	for (unsigned int n=0; n<3; ++n)
 	{
-		const size_t k = n*P.count + i;
-		const float f = field[n*P.sn + pos[i]];
-		if (P.lorentz)
+		if (!((m>>n)&1))
+			continue;
+		const size_t k = n*G.count + i;
+		const float f = field[n*G.sn + G.pos[i]];
+		for (unsigned int o=0; o<G.orders; ++o)
 		{
-			lor[k] = lor[k] + c_lor[k]*ade[k];
-			ade[k] = ade[k] * c_int[k];
-			ade[k] = ade[k] + c_ext[k]*(f - lor[k]);
-		}
-		else
-		{
-			ade[k] = ade[k] * c_int[k];
-			ade[k] = ade[k] + c_ext[k]*f;
+			float* ade = G.ade[o];
+			if (G.lorentz)
+			{
+				float* lor = G.lor[o];
+				lor[k] = lor[k] + G.c_lor[o][k]*ade[k];
+				ade[k] = ade[k] * G.c_int[o][k];
+				ade[k] = ade[k] + G.c_ext[o][k]*(f - lor[k]);
+			}
+			else
+			{
+				ade[k] = ade[k] * G.c_int[o][k];
+				ade[k] = ade[k] + G.c_ext[o][k]*f;
+			}
 		}
 	}
 }
 
-// subtract the ADE current from the field
-__global__ void dispersive_apply(float* field, const float* ade, const size_t* pos, ADEParam P)
+// subtract the ADE currents of the orders from the field, in their order
+__global__ void dispersive_apply_group(float* field, ADEGroup G)
 {
 	const size_t i = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
-	if (i>=P.count)
+	if (i>=G.count)
 		return;
+	const unsigned int m = G.mask[i];
 	for (unsigned int n=0; n<3; ++n)
 	{
-		const size_t g = n*P.sn + pos[i];
-		field[g] = field[g] - ade[n*P.count + i];
+		if (!((m>>n)&1))
+			continue;
+		const size_t g = n*G.sn + G.pos[i];
+		float v = field[g];
+		for (unsigned int o=0; o<G.orders; ++o)
+			v = v - G.ade[o][n*G.count + i];
+		field[g] = v;
 	}
 }
 
@@ -72,95 +102,63 @@ class HIP_Ext_LorentzMaterial : public GPU_Extension
 public:
 	HIP_Ext_LorentzMaterial(GPU_Backend_HIP::Impl* impl, Operator_Ext_LorentzMaterial* op_ext);
 
-	virtual void DoPreVoltageUpdates() {for (size_t o=0; o<m_Volt.size(); ++o) Pre(m_Volt[o], d->volt);}
-	virtual void Apply2Voltages()      {for (size_t o=0; o<m_Volt.size(); ++o) if (!m_Volt[o].folded) Apply(m_Volt[o], d->volt);}
-	virtual void DoPreCurrentUpdates() {for (size_t o=0; o<m_Curr.size(); ++o) Pre(m_Curr[o], d->curr);}
-	virtual void Apply2Current()       {for (size_t o=0; o<m_Curr.size(); ++o) Apply(m_Curr[o], d->curr);}
+	virtual void DoPreVoltageUpdates() {for (size_t g=0; g<m_Volt.size(); ++g) Pre(m_Volt[g].G, d->volt);}
+	virtual void Apply2Voltages()      {for (size_t g=0; g<m_Volt.size(); ++g) if (!m_Volt[g].folded) Apply(m_Volt[g].G, d->volt);}
+	virtual void DoPreCurrentUpdates() {for (size_t g=0; g<m_Curr.size(); ++g) Pre(m_Curr[g].G, d->curr);}
+	virtual void Apply2Current()       {for (size_t g=0; g<m_Curr.size(); ++g) Apply(m_Curr[g].G, d->curr);}
 
 protected:
-	//! one dispersion order of the voltages or currents
-	struct Order
+	//! the host description of an order, grouped with the orders at the same positions in Build()
+	struct HostOrder
 	{
-		ADEParam param;
-		size_t* pos;                //!< flat NIJK index of direction 0
-		float *ade, *lor;           //!< state
-		float *c_int, *c_ext, *c_lor;
-		bool folded;                //!< applied in the fused kernel (see HIP_ADECandidate)
-		std::vector<size_t> flat;   //!< host copy of pos (voltage orders, for the candidate groups)
-		std::vector<unsigned char> mask;   //!< active components of each position (voltage orders)
+		size_t count;
+		bool lorentz;
+		std::vector<size_t> flat;
+		FDTD_FLOAT **c_int, **c_ext, **c_lor;
 	};
-	//! the voltage orders as ADE groups of the fused step, orders at the same positions together
-	void RegisterCandidates();
-
-	void Setup(std::vector<Order>& orders, size_t count, unsigned int** pos, bool voltage,
-	           bool lorentz, FDTD_FLOAT** c_int, FDTD_FLOAT** c_ext, FDTD_FLOAT** c_lor);
+	struct Group
+	{
+		ADEGroup G;
+		bool folded;   //!< voltage group applied in the fused kernel (see HIP_ADECandidate)
+	};
+	void Build(std::vector<Group>& groups, const std::vector<HostOrder>& orders, bool voltage);
 	float* Coefficients(size_t count, FDTD_FLOAT** c);
-	void Pre(Order& o, float* field)
+	void Pre(ADEGroup& g, float* field)
 	{
-		HIP_Launch(d, "lorentz_pre", lorentz_pre, o.param.count, 1, 1, (const float*)field, o.ade, o.lor,
-		            (const float*)o.c_int, (const float*)o.c_ext, (const float*)o.c_lor, (const size_t*)o.pos, o.param);
+		HIP_Launch(d, "lorentz_pre_group", lorentz_pre_group, g.count, 1, 1, (const float*)field, g);
 	}
-	void Apply(Order& o, float* field)
+	void Apply(ADEGroup& g, float* field)
 	{
-		HIP_Launch(d, "dispersive_apply", dispersive_apply, o.param.count, 1, 1, field, (const float*)o.ade, (const size_t*)o.pos, o.param);
+		HIP_Launch(d, "dispersive_apply_group", dispersive_apply_group, g.count, 1, 1, field, g);
 	}
 
 	GPU_Backend_HIP::Impl* d;
-	std::vector<Order> m_Volt;
-	std::vector<Order> m_Curr;
+	std::vector<Group> m_Volt;
+	std::vector<Group> m_Curr;
 };
 
 HIP_Ext_LorentzMaterial::HIP_Ext_LorentzMaterial(GPU_Backend_HIP::Impl* impl, Operator_Ext_LorentzMaterial* op_ext)
 {
 	d = impl;
+	std::vector<HostOrder> volt, curr;
 	for (int o=0; o<op_ext->m_Order; ++o)
 	{
 		const size_t count = op_ext->m_LM_Count.at(o);
+		if (count==0)
+			continue;
+		std::vector<size_t> flat(count);
+		unsigned int** pos = op_ext->m_LM_pos[o];
+		for (size_t i=0; i<count; ++i)
+			flat[i] = ((size_t)pos[0][i]*d->dim.ny + pos[1][i])*d->dim.nz + pos[2][i];
 		if (op_ext->m_volt_ADE_On[o])
-			Setup(m_Volt, count, op_ext->m_LM_pos[o], true, op_ext->m_volt_Lor_ADE_On[o],
-			      op_ext->v_int_ADE[o], op_ext->v_ext_ADE[o], op_ext->m_volt_Lor_ADE_On[o] ? op_ext->v_Lor_ADE[o] : NULL);
+			volt.push_back({count, op_ext->m_volt_Lor_ADE_On[o], flat, op_ext->v_int_ADE[o], op_ext->v_ext_ADE[o],
+			                op_ext->m_volt_Lor_ADE_On[o] ? op_ext->v_Lor_ADE[o] : NULL});
 		if (op_ext->m_curr_ADE_On[o])
-			Setup(m_Curr, count, op_ext->m_LM_pos[o], false, op_ext->m_curr_Lor_ADE_On[o],
-			      op_ext->i_int_ADE[o], op_ext->i_ext_ADE[o], op_ext->m_curr_Lor_ADE_On[o] ? op_ext->i_Lor_ADE[o] : NULL);
+			curr.push_back({count, op_ext->m_curr_Lor_ADE_On[o], flat, op_ext->i_int_ADE[o], op_ext->i_ext_ADE[o],
+			                op_ext->m_curr_Lor_ADE_On[o] ? op_ext->i_Lor_ADE[o] : NULL});
 	}
-	RegisterCandidates();
-}
-
-void HIP_Ext_LorentzMaterial::RegisterCandidates()
-{
-	// The voltage ADE changes voltages between the half-steps: the fused step applies one group in
-	// its kernel, or recomputes the currents the changed voltages feed (see DecideFusedStep()).
-	std::map<std::vector<size_t>, std::vector<size_t>> groups;   // positions -> voltage orders
-	for (size_t o=0; o<m_Volt.size(); ++o)
-		groups[m_Volt[o].flat].push_back(o);
-	for (auto& g : groups)
-	{
-		for (size_t k=0; k<g.second.size(); k+=ADE_GROUP_MAX)
-		{
-			HIP_ADECandidate C;
-			const Order& first = m_Volt[g.second[k]];
-			C.count = (unsigned int)first.param.count;
-			C.flat = g.first;
-			C.mask.assign(C.count, 0);
-			std::vector<size_t> members;
-			for (size_t j=k; j<std::min(g.second.size(), k+(size_t)ADE_GROUP_MAX); ++j)
-			{
-				const Order& ord = m_Volt[g.second[j]];
-				C.ade[members.size()] = ord.ade;
-				for (size_t i=0; i<C.count; ++i)
-					C.mask[i] |= ord.mask[i];
-				members.push_back(g.second[j]);
-			}
-			C.orders = (unsigned int)members.size();
-			C.fold = [this, members]() {for (size_t o : members) m_Volt[o].folded = true;};
-			d->ade_candidates.push_back(C);
-		}
-	}
-	for (size_t o=0; o<m_Volt.size(); ++o)
-	{
-		std::vector<size_t>().swap(m_Volt[o].flat);
-		std::vector<unsigned char>().swap(m_Volt[o].mask);
-	}
+	Build(m_Volt, volt, true);
+	Build(m_Curr, curr, false);
 }
 
 float* HIP_Ext_LorentzMaterial::Coefficients(size_t count, FDTD_FLOAT** c)
@@ -173,38 +171,60 @@ float* HIP_Ext_LorentzMaterial::Coefficients(size_t count, FDTD_FLOAT** c)
 	return d->Alloc<float>(data.size(), data.data());
 }
 
-void HIP_Ext_LorentzMaterial::Setup(std::vector<Order>& orders, size_t count, unsigned int** pos, bool voltage,
-                                     bool lorentz, FDTD_FLOAT** c_int, FDTD_FLOAT** c_ext, FDTD_FLOAT** c_lor)
+void HIP_Ext_LorentzMaterial::Build(std::vector<Group>& groups, const std::vector<HostOrder>& orders, bool voltage)
 {
-	if (count==0)
-		return;
-	Order ord;
-	ord.param.count = count;
-	ord.param.lorentz = lorentz;
-	ord.param.sn = d->numCells;
-
-	std::vector<size_t> flat(count);
-	for (size_t i=0; i<count; ++i)
-		flat[i] = ((size_t)pos[0][i]*d->dim.ny + pos[1][i])*d->dim.nz + pos[2][i];
-	ord.folded = false;
-	if (voltage)
+	// consecutive runs of orders with the same positions and the same kind (Lorentz or not), at
+	// most ADE_GROUP_MAX each: the engine processes the orders in order, so a group keeps it
+	std::vector<size_t> starts;
+	for (size_t o=0; o<orders.size(); ++o)
+		if (starts.empty() || (o-starts.back()>=ADE_GROUP_MAX) || (orders[o].flat!=orders[starts.back()].flat)
+		    || (orders[o].lorentz!=orders[starts.back()].lorentz))
+			starts.push_back(o);
+	starts.push_back(orders.size());
+	for (size_t s=0; s+1<starts.size(); ++s)
 	{
-		// a component is active where its coefficients are not zero (else its ADE stays zero)
-		ord.flat = flat;
-		ord.mask.assign(count, 0);
-		for (unsigned int n=0; n<3; ++n)
-			for (size_t i=0; i<count; ++i)
-				if ((c_int && c_int[n][i]!=0) || (c_ext && c_ext[n][i]!=0) || (c_lor && c_lor[n][i]!=0))
-					ord.mask[i] |= 1u<<n;
+		const HostOrder& first = orders[starts[s]];
+		Group grp;
+		grp.folded = false;
+		ADEGroup& G = grp.G;
+		G.count = first.count;
+		G.sn = d->numCells;
+		G.orders = (unsigned int)(starts[s+1]-starts[s]);
+		G.lorentz = first.lorentz;
+		std::vector<unsigned char> mask(G.count, 0);
+		for (size_t o=starts[s]; o<starts[s+1]; ++o)
+			for (unsigned int n=0; n<3; ++n)
+				for (size_t i=0; i<G.count; ++i)
+					if (orders[o].c_ext && orders[o].c_ext[n][i]!=0)
+						mask[i] |= 1u<<n;
+		G.pos = d->Alloc<size_t>(G.count, first.flat.data());
+		G.mask = d->Alloc<unsigned char>(G.count, mask.data());
+		for (unsigned int k=0; k<G.orders; ++k)
+		{
+			const HostOrder& o = orders[starts[s]+k];
+			G.ade[k] = d->Alloc<float>(3*G.count);
+			G.lor[k] = d->Alloc<float>(3*G.count);
+			G.c_int[k] = Coefficients(G.count, o.c_int);
+			G.c_ext[k] = Coefficients(G.count, o.c_ext);
+			G.c_lor[k] = Coefficients(G.count, o.c_lor);
+		}
+		groups.push_back(grp);
+		if (voltage)
+		{
+			// the voltage ADE changes voltages between the half-steps: the fused step applies the
+			// group in its kernel, or recomputes the currents they feed (see DecideFusedStep())
+			HIP_ADECandidate C;
+			C.count = (unsigned int)G.count;
+			C.orders = G.orders;
+			C.flat = first.flat;
+			C.mask = mask;
+			for (unsigned int k=0; k<G.orders; ++k)
+				C.ade[k] = G.ade[k];
+			const size_t index = groups.size()-1;
+			C.fold = [this, index]() {m_Volt[index].folded = true;};
+			d->ade_candidates.push_back(C);
+		}
 	}
-	ord.pos = d->Alloc<size_t>(count, flat.data());
-
-	ord.ade = d->Alloc<float>(3*(size_t)count);
-	ord.lor = d->Alloc<float>(3*(size_t)count);
-	ord.c_int = Coefficients(count, c_int);
-	ord.c_ext = Coefficients(count, c_ext);
-	ord.c_lor = Coefficients(count, c_lor);
-	orders.push_back(ord);
 }
 
 GPU_Extension* HIP_CreateExt_LorentzMaterial(GPU_Backend_HIP::Impl* d, Engine_Extension* eng_ext, Engine* eng)
