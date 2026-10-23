@@ -941,6 +941,14 @@ GPU_Backend_HIP* GPU_Backend_HIP::New(int device)
 	HIP_Check(hipGetDeviceProperties(&prop, impl->ctx->device), "hipGetDeviceProperties");
 	impl->ctx->name = prop.name;
 	impl->ctx->warp_size = prop.warpSize > 0 ? prop.warpSize : 32;
+	// x lines per fused block: 8 on NVIDIA compute capability 8.9 (RTX 40: 2.4 % faster stepping than 4 on an RTX
+	// 4060, a 44 M-cell helix with conducting sheets; 4.9 % on a 48 M-cell model), else FUSED_XC;
+	// OPENEMS_HIP_FUSED_XC overrides
+	impl->ctx->fused_xc = FUSED_XC;
+#ifndef __HIP_PLATFORM_AMD__
+	if ((prop.major==8) && (prop.minor==9))
+		impl->ctx->fused_xc = 8;
+#endif
 #ifdef OPENEMS_HIP_ARCHITECTURES
 	// Some AMD runtimes (ROCm 7.2 with assertions) abort in the query below on a device
 	// the build has no code for, instead of returning an error: compare with the list first.
@@ -1118,7 +1126,7 @@ void GPU_Backend_HIP::UpdateVoltages()
 			B.nx = B.ny = B.nz = 0;
 			E = d->dim;
 		}
-		static const unsigned int xc = getenv("OPENEMS_HIP_FUSED_XC") ? std::max(1, atoi(getenv("OPENEMS_HIP_FUSED_XC"))) : FUSED_XC;
+		static const unsigned int xc = getenv("OPENEMS_HIP_FUSED_XC") ? std::max(1, atoi(getenv("OPENEMS_HIP_FUSED_XC"))) : d->ctx->fused_xc;
 		const bool timed = HIP_KernelTimes::Enabled();
 		if (timed)
 			HIP_KernelTimes::Begin(d->Stream());

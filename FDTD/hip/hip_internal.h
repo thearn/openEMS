@@ -136,6 +136,7 @@ struct HIP_Context
 	hipStream_t copy_stream;   //!< downloads of field snapshots, overlapping the work (see GPU_Backend_HIP::SnapshotFields())
 	std::string name;
 	unsigned int warp_size;    //!< threads that run in lockstep: 32 on NVIDIA, 64 on the CDNA GPUs of AMD
+	unsigned int fused_xc;     //!< x lines per block of the fused step (see update_fused)
 
 	HIP_Context();
 	~HIP_Context();
