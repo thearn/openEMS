@@ -28,7 +28,7 @@
 
 // Soft voltage/current excitation, see Engine_Ext_Excitation.
 // One thread per excitation point, or one thread per edge if points share an edge.
-struct ExcitationParam { int numTS; int period; int length; unsigned int count; };
+struct ExcitationParam { int numTS; int period; int length; unsigned int count; int zero_start; };
 
 __device__ __forceinline__ void excite(float* field, const size_t* index, const float* amp,
                                        const unsigned int* delay, const float* signal, const ExcitationParam& P, unsigned int n)
@@ -37,6 +37,11 @@ __device__ __forceinline__ void excite(float* field, const size_t* index, const 
 	exc_pos *= (exc_pos>0);
 	exc_pos %= P.period;
 	exc_pos *= (exc_pos<P.length);
+	// outside its window an entry adds amp*signal[0], and signal[0] is 0 (every built-in signal starts at 0; checked at
+	// setup, P.zero_start): skip the index, amplitude and field traffic (bit-identical; the adjoint's delayed sources
+	// are mostly outside their windows)
+	if (exc_pos==0 && P.zero_start)
+		return;
 	field[index[n]] = field[index[n]] + amp[n]*signal[exc_pos];
 }
 
@@ -80,6 +85,9 @@ protected:
 		float* amp;
 		unsigned int* delay;
 		float* signal;
+		unsigned int min_delay;   //!< no entry is in its window before this step ...
+		unsigned int max_delay;   //!< ... nor after max_delay + length (a non-periodic signal starting at 0)
+		bool zero_start;          //!< signal[0] == 0
 	};
 
 	void Setup(Sources& s, unsigned int count, unsigned int* const index[3], const unsigned short* dir,
@@ -118,6 +126,9 @@ void HIP_Ext_Excitation::Setup(Sources& s, unsigned int count, unsigned int* con
 	s.serial = false;
 	if (count==0)
 		return;
+	s.min_delay = *std::min_element(delay, delay+count);
+	s.max_delay = *std::max_element(delay, delay+count);
+	s.zero_start = (signal[0]==0);
 
 	std::vector<size_t> flat(count);
 	std::set<size_t> edges;
@@ -168,10 +179,16 @@ void HIP_Ext_Excitation::Apply(Sources& s, float* field)
 	ExcitationParam param;
 	param.numTS = m_Eng->GetNumberOfTimesteps();
 	param.period = param.numTS+1;
-	if (m_Op_Exc->m_Exc->GetSignalPeriod()>0)
+	const bool periodic = m_Op_Exc->m_Exc->GetSignalPeriod()>0;
+	if (periodic)
 		param.period = int(m_Op_Exc->m_Exc->GetSignalPeriod()/m_Op_Exc->m_Exc->GetTimestep());
 	param.length = m_Op_Exc->m_Exc->GetLength();
 	param.count = s.count;
+	param.zero_start = s.zero_start;
+	// every entry outside its window (before the first delay, or after the last delay's whole signal): nothing to add
+	if (s.zero_start && !periodic &&
+	    ((param.numTS<=(int)s.min_delay) || (param.numTS>=(int)s.max_delay+param.length)))
+		return;
 
 	if (s.serial)
 		HIP_Launch(d, "excitation_apply_segments", excitation_apply_segments, s.num_segments, 1, 1,
