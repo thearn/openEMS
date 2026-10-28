@@ -91,6 +91,7 @@ openEMS::openEMS()
 	FDTD_Op=NULL;
 	FDTD_Eng=NULL;
 	m_DeviceLockFD=-1;
+	m_SetupLockFD=-1;
 	Eng_Ext_SSD=NULL;
 	m_CSX=NULL;
 	PA=NULL;
@@ -127,6 +128,7 @@ void openEMS::FreeEngine()
 	PA=0;
 	delete FDTD_Eng;
 	FDTD_Eng=0;
+	ReleaseSetupLock();
 	ReleaseDeviceLock();
 	Eng_Ext_SSD=0; // non-owning observer; deleted by the engine (m_Eng_exts) in 'delete FDTD_Eng' above
 }
@@ -1489,6 +1491,12 @@ int openEMS::SetupFDTD()
 		SetupAbsorbingSheets();
 
 
+	// the operator built under the setup lock (OPENEMS_SETUP_LOCK, when set): solves started together (an optimiser's
+	// trials) build one at a time on all the cores, so the first steps on the device while the others build, instead
+	// of all of them building at once on shared cores and reaching the device together, late (TFP-1 Rev C on an A100:
+	// three trials' operators 4.5 min together against 1.7 min alone, the device idle meanwhile)
+	AcquireSetupLock();
+
 	//check all properties to request material storage during operator creation...
 	SetupMaterialStorages();
 
@@ -1502,6 +1510,7 @@ int openEMS::SetupFDTD()
 		debugFlags |= Operator::debugPEC;
 
 	FDTD_Op->CalcECOperator( debugFlags );
+	ReleaseSetupLock();
 	/*******************************************************************************/
 
 	//reset flags for material storage, if no dump-box resets it to true, it will be cleaned up...
@@ -1911,6 +1920,42 @@ void openEMS::AcquireDeviceLock()
 		}
 	gettimeofday(&end,NULL);
 	cout << "openEMS: device lock " << path << " acquired after " << CalcDiffTime(end,start) << " s" << endl;
+#endif
+}
+
+void openEMS::AcquireSetupLock()
+{
+#ifndef _WIN32
+	const char* path = getenv("OPENEMS_SETUP_LOCK");
+	if ((path==NULL) || (path[0]==0) || (m_SetupLockFD>=0))
+		return;
+	m_SetupLockFD = open(path, O_CREAT | O_RDWR, 0666);
+	if (m_SetupLockFD<0)
+	{
+		cerr << "openEMS: cannot open the setup lock " << path << endl;
+		return;
+	}
+	timeval start, end;
+	gettimeofday(&start,NULL);
+	while (flock(m_SetupLockFD, LOCK_EX)!=0)
+		if (errno!=EINTR)
+		{
+			cerr << "openEMS: cannot lock " << path << endl;
+			break;
+		}
+	gettimeofday(&end,NULL);
+	cout << "openEMS: setup lock " << path << " acquired after " << CalcDiffTime(end,start) << " s" << endl;
+#endif
+}
+
+void openEMS::ReleaseSetupLock()
+{
+#ifndef _WIN32
+	if (m_SetupLockFD<0)
+		return;
+	flock(m_SetupLockFD, LOCK_UN);
+	close(m_SetupLockFD);
+	m_SetupLockFD = -1;
 #endif
 }
 

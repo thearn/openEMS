@@ -181,8 +181,11 @@ protected:
 	//! engine is released after the run, so that concurrent processes build their operators in parallel
 	//! but use the device one at a time
 	int m_DeviceLockFD;
+	int m_SetupLockFD;
 	void AcquireDeviceLock();
 	void ReleaseDeviceLock();
+	void AcquireSetupLock();
+	void ReleaseSetupLock();
 
 	Excitation* m_Exc;
 
