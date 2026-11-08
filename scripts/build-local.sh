@@ -5,23 +5,23 @@
 #   scripts/build-local.sh [PYTHON]
 #
 # PYTHON        interpreter whose environment gets the bindings
-#               (default: $HOME/.venvs/antenna-foundry/bin/python)
+#               (default: $HOME/.venvs/designloop-rf/bin/python)
 # CONDA_PREFIX_OPENEMS  conda environment providing the compilers, CUDA,
 #               CSXCAD, fparser, HDF5 and Boost, and the HIP headers of AMD's
 #               hip-dev package in opt/rocm-* (the GPU backend is HIP compiled
 #               as CUDA, OPENEMS_HIP_AS_CUDA)
 #               (default: $HOME/miniforge-speedup/envs/openems-upstream)
-# CUDA_ARCHS    default "75;80;86;89" (T4, A100, RTX 30, RTX 40)
+# CUDA_ARCHS    default "75;80;86;89;120" (T4, A100, RTX 30, RTX 40, RTX 50/PRO 6000)
 #
 # Configure runs every time so the embedded `git describe` version matches
 # HEAD; antenna-foundry refuses a build whose version differs from the repo.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PYTHON="${1:-$HOME/.venvs/antenna-foundry/bin/python}"
+PYTHON="${1:-$HOME/.venvs/designloop-rf/bin/python}"
 E="${CONDA_PREFIX_OPENEMS:-$HOME/miniforge-speedup/envs/openems-upstream}"
 ROCM="$(ls -d "$E"/opt/rocm-* | tail -n1)"
-ARCHS="${CUDA_ARCHS:-75;80;86;89}"
+ARCHS="${CUDA_ARCHS:-75;80;86;89;120}"
 PREFIX="$REPO/build/install"
 export PATH="$E/bin:$PATH"
 
