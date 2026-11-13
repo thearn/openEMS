@@ -912,7 +912,9 @@ bool openEMS::SetupOperator()
 	}
 	else if (gpu)
 	{
-		FDTD_Op = Operator_GPU::New(gpu_backend);
+		Operator_GPU* op_gpu = Operator_GPU::New(gpu_backend);
+		op_gpu->SetBackendKind(m_engine == EngineType_GPU_Reference ? "reference" : "auto");
+		FDTD_Op = op_gpu;
 	}
 	else
 	{
@@ -1568,6 +1570,9 @@ int openEMS::SetupFDTD()
 
 	//create FDTD engine
 	AcquireDeviceLock();
+	// a GPU operator kept for RestartFDTD keeps its host coefficients for the next engine
+	if (Operator_GPU* op_gpu = dynamic_cast<Operator_GPU*>(FDTD_Op))
+		op_gpu->SetKeepCoefficients(m_KeepOperator);
 	try
 	{
 		FDTD_Eng = FDTD_Op->CreateEngine();
@@ -1650,6 +1655,8 @@ int openEMS::RestartFDTD()
 
 	FreeEngine();
 	AcquireDeviceLock();
+	if (Operator_GPU* op_gpu = dynamic_cast<Operator_GPU*>(FDTD_Op))
+		op_gpu->SetKeepCoefficients(m_KeepOperator);
 	FDTD_Eng = FDTD_Op->CreateEngine();
 
 	for (size_t n=0; n<FDTD_Op->GetNumberOfExtentions(); ++n)

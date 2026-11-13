@@ -20,6 +20,7 @@
 
 #include "operator.h"
 
+#include <string>
 #include <vector>
 
 class GPU_Backend;
@@ -37,6 +38,11 @@ public:
 	virtual ~Operator_GPU();
 
 	virtual Engine* CreateEngine();
+
+	//! the GPU backend kind a later engine of this operator is created on (GPU_Backend::New): "auto" or "reference"
+	void SetBackendKind(const std::string& kind) {m_BackendKind = kind;}
+	//! keep the host coefficients after CreateEngine(), for a later engine of the same operator (openEMS::RestartFDTD)
+	void SetKeepCoefficients(bool keep) {m_KeepCoefficients = keep;}
 
 protected:
 	//! use New() for creating a new Operator
@@ -57,6 +63,8 @@ protected:
 	void ThreadRanges(std::vector<unsigned int>& start, std::vector<unsigned int>& stop) const;
 
 	GPU_Backend* m_Backend; //!< until CreateEngine()
+	std::string m_BackendKind = "auto";
+	bool m_KeepCoefficients = false;
 };
 
 #endif // OPERATOR_GPU_H

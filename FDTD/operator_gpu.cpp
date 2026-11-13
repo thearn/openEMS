@@ -21,6 +21,8 @@
 
 #include "engine_gpu.h"
 #include "operator_gpu.h"
+
+#include <stdexcept>
 #include "tools/useful.h"
 
 using std::cout;
@@ -48,13 +50,22 @@ Engine* Operator_GPU::CreateEngine()
 {
 	GPU_Backend* backend = m_Backend;
 	m_Backend = NULL;
+	// a reused operator (openEMS::RestartFDTD): the engine of its first run took and freed the backend of SetupFDTD
+	if (backend==NULL)
+		backend = GPU_Backend::New(m_BackendKind);
+	if (backend==NULL)
+		throw std::runtime_error("Operator_GPU::CreateEngine: no GPU backend with a usable device for a reused operator");
 	m_Engine = Engine_GPU::New(this, backend);
 	// The device holds the coefficients now: free the host arrays (48 bytes per node), as
-	// Operator_SSE_Compressed frees its full arrays. GetVV() and friends are invalid after this.
-	delete vv_ptr; vv_ptr = NULL;
-	delete vi_ptr; vi_ptr = NULL;
-	delete ii_ptr; ii_ptr = NULL;
-	delete iv_ptr; iv_ptr = NULL;
+	// Operator_SSE_Compressed frees its full arrays, unless a later engine of this operator uploads
+	// them again (SetKeepCoefficients). GetVV() and friends are invalid after the free.
+	if (!m_KeepCoefficients)
+	{
+		delete vv_ptr; vv_ptr = NULL;
+		delete vi_ptr; vi_ptr = NULL;
+		delete ii_ptr; ii_ptr = NULL;
+		delete iv_ptr; iv_ptr = NULL;
+	}
 	return m_Engine;
 }
 
