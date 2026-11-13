@@ -19,6 +19,7 @@
 #include <set>
 #include <algorithm>
 #include <vector>
+#include <cstdlib>
 
 #include "hip_internal.h"
 #include "FDTD/engine.h"
@@ -66,6 +67,38 @@ __global__ void excitation_apply_segments(float* field, const size_t* index, con
 		excite(field, index, amp, delay, signal, P, n);
 }
 
+// every edge has the same delays in the same order (the adjoint's delayed replays on the far-field surface: one entry
+// per delay per edge): one thread per edge keeps the edge's value in a register and applies its entries in their
+// order (the same additions as excitation_apply_segments, bit-identical), the amplitudes delay by delay so a warp's
+// reads are coalesced, and the edge's field read and written once
+__global__ void excitation_apply_dense(float* field, const size_t* seg_index, const float* amp_dm, const unsigned int* delays,
+                                       unsigned int num_delays, const float* signal, ExcitationParam P, unsigned int num_segments)
+{
+	const unsigned int s = blockIdx.x*blockDim.x + threadIdx.x;
+	if (s>=num_segments)
+		return;
+	const size_t idx = seg_index[s];
+	float f = 0;
+	bool read = false;
+	for (unsigned int k=0; k<num_delays; ++k)
+	{
+		int exc_pos = P.numTS - (int)delays[k];
+		exc_pos *= (exc_pos>0);
+		exc_pos %= P.period;
+		exc_pos *= (exc_pos<P.length);
+		if (exc_pos==0 && P.zero_start)
+			continue;
+		if (!read)
+		{
+			f = field[idx];
+			read = true;
+		}
+		f = f + amp_dm[(size_t)k*num_segments + s]*signal[exc_pos];
+	}
+	if (read)
+		field[idx] = f;
+}
+
 class HIP_Ext_Excitation : public GPU_Extension
 {
 public:
@@ -81,6 +114,11 @@ protected:
 		bool serial;            //!< points share an edge: sorted by edge, applied per edge (excitation_apply_segments)
 		unsigned int num_segments; //!< distinct edges when serial
 		unsigned int* seg_start;   //!< first entry of each distinct edge (num_segments+1)
+		bool dense;               //!< serial, and every edge has the same delays in the same order (excitation_apply_dense)
+		unsigned int num_delays;  //!< entries per edge when dense
+		unsigned int* delays;     //!< those delays when dense
+		size_t* seg_index;        //!< each edge's flat index when dense
+		float* amp_dm;            //!< amplitudes delay by delay when dense: amp_dm[k*num_segments + edge]
 		size_t* index;          //!< flat NIJK index of the excited edge
 		float* amp;
 		unsigned int* delay;
@@ -125,6 +163,7 @@ void HIP_Ext_Excitation::Setup(Sources& s, unsigned int count, unsigned int* con
 {
 	s.count = count;
 	s.serial = false;
+	s.dense = false;
 	if (count==0)
 		return;
 	s.min_delay = *std::min_element(delay, delay+count);
@@ -164,10 +203,38 @@ void HIP_Ext_Excitation::Setup(Sources& s, unsigned int count, unsigned int* con
 		}
 		s.num_segments = starts.size();
 		starts.push_back(count);
-		s.index = d->Alloc<size_t>(count, f.data());
-		s.amp = d->Alloc<float>(count, am.data());
-		s.delay = d->Alloc<unsigned int>(count, dl.data());
-		s.seg_start = d->Alloc<unsigned int>(starts.size(), starts.data());
+		// the same delays in the same order on every edge: the dense layout
+		const unsigned int m = starts[1]-starts[0];
+		bool dense = (m>1) && ((size_t)m*s.num_segments==count) && (getenv("OPENEMS_HIP_EXC_DENSE")==NULL || atoi(getenv("OPENEMS_HIP_EXC_DENSE"))!=0);
+		for (unsigned int g=0; dense && g<s.num_segments; ++g)
+			for (unsigned int k=0; dense && k<m; ++k)
+				dense = (starts[g+1]-starts[g]==m) && (dl[starts[g]+k]==dl[k]);
+		if (dense)
+		{
+			std::vector<size_t> si(s.num_segments);
+			std::vector<float> adm((size_t)m*s.num_segments);
+			for (unsigned int g=0; g<s.num_segments; ++g)
+			{
+				si[g] = f[starts[g]];
+				for (unsigned int k=0; k<m; ++k)
+					adm[(size_t)k*s.num_segments + g] = am[starts[g]+k];
+			}
+			s.dense = true;
+			s.num_delays = m;
+			s.delays = d->Alloc<unsigned int>(m, dl.data());
+			s.seg_index = d->Alloc<size_t>(s.num_segments, si.data());
+			s.amp_dm = d->Alloc<float>(adm.size(), adm.data());
+			s.index = NULL;
+			s.amp = NULL;
+			s.delay = NULL;
+		}
+		else
+		{
+			s.index = d->Alloc<size_t>(count, f.data());
+			s.amp = d->Alloc<float>(count, am.data());
+			s.delay = d->Alloc<unsigned int>(count, dl.data());
+			s.seg_start = d->Alloc<unsigned int>(starts.size(), starts.data());
+		}
 	}
 	s.signal = d->Alloc<float>(m_Op_Exc->m_Exc->GetLength(), signal);
 }
@@ -191,7 +258,11 @@ bool HIP_Ext_Excitation::Apply(Sources& s, float* field)
 	    ((param.numTS<=(int)s.min_delay) || (param.numTS>=(int)s.max_delay+param.length)))
 		return false;
 
-	if (s.serial)
+	if (s.dense)
+		HIP_Launch(d, "excitation_apply_dense", excitation_apply_dense, s.num_segments, 1, 1,
+		            field, (const size_t*)s.seg_index, (const float*)s.amp_dm, (const unsigned int*)s.delays, s.num_delays,
+		            (const float*)s.signal, param, s.num_segments);
+	else if (s.serial)
 		HIP_Launch(d, "excitation_apply_segments", excitation_apply_segments, s.num_segments, 1, 1,
 		            field, (const size_t*)s.index, (const float*)s.amp, (const unsigned int*)s.delay, (const float*)s.signal, param,
 		            (const unsigned int*)s.seg_start, s.num_segments);
