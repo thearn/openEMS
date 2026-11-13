@@ -615,6 +615,8 @@ GPU_Backend_HIP::Impl::Impl()
 	fold_group = -1;
 	index32 = false;
 	fixup_count = 0;
+	fixup_persistent = 0;
+	exc_changed_volt = false;
 	snap_nv = snap_n = 0;
 	snap_dev = NULL;
 	snap_host = NULL;
@@ -657,6 +659,7 @@ bool GPU_Backend_HIP::Impl::DecideFusedStep()
 	{
 		const bool fold_env = !getenv("OPENEMS_HIP_FUSED_ADE") || atoi(getenv("OPENEMS_HIP_FUSED_ADE"))!=0;
 		std::set<size_t> others(volt_modified.begin(), volt_modified.end());
+		others.insert(volt_modified_exc.begin(), volt_modified_exc.end());
 		bool folded_one = false;
 		fold_group = -1;
 		for (size_t g=0; g<ade_candidates.size(); ++g)
@@ -704,40 +707,54 @@ bool GPU_Backend_HIP::Impl::DecideFusedStep()
 	}
 
 	const bool folded = fregions.count>0;
-	std::set<size_t> nodes;
-	for (size_t k=0; k<volt_modified.size(); ++k)
-	{
-		const size_t node = volt_modified[k] % numCells;
-		const unsigned int p[3] = {(unsigned int)(node/((size_t)dim.ny*dim.nz)), (unsigned int)((node/dim.nz)%dim.ny), (unsigned int)(node%dim.nz)};
-		const unsigned int start[3] = {main_start.nx, main_start.ny, main_start.nz};
-		const unsigned int stop[3] = {main_stop.nx, main_stop.ny, main_stop.nz};
-		const unsigned int n_lines[3] = {dim.nx, dim.ny, dim.nz};
-		for (int m=-1; m<3; ++m)   // the node itself and its lower neighbours
+	// the nodes whose currents read a changed voltage: the node itself and its lower neighbours
+	auto nodes_of = [&](const std::vector<size_t>& modified) {
+		std::set<size_t> nodes;
+		for (size_t k=0; k<modified.size(); ++k)
 		{
-			unsigned int c[3] = {p[0], p[1], p[2]};
-			if (m>=0)
+			const size_t node = modified[k] % numCells;
+			const unsigned int p[3] = {(unsigned int)(node/((size_t)dim.ny*dim.nz)), (unsigned int)((node/dim.nz)%dim.ny), (unsigned int)(node%dim.nz)};
+			const unsigned int start[3] = {main_start.nx, main_start.ny, main_start.nz};
+			const unsigned int stop[3] = {main_stop.nx, main_stop.ny, main_stop.nz};
+			const unsigned int n_lines[3] = {dim.nx, dim.ny, dim.nz};
+			for (int m=-1; m<3; ++m)
 			{
-				if (c[m]==0)
+				unsigned int c[3] = {p[0], p[1], p[2]};
+				if (m>=0)
+				{
+					if (c[m]==0)
+						continue;
+					--c[m];
+				}
+				bool ok = true;
+				for (int n=0; n<3; ++n)
+					ok &= (folded || ((c[n]>=start[n]) && (c[n]<stop[n]))) && (c[n]+1<n_lines[n]);
+				if (!ok)
 					continue;
-				--c[m];
+				nodes.insert(((size_t)c[0]*dim.ny + c[1])*dim.nz + c[2]);
 			}
-			bool ok = true;
-			for (int n=0; n<3; ++n)
-				ok &= (folded || ((c[n]>=start[n]) && (c[n]<stop[n]))) && (c[n]+1<n_lines[n]);
-			if (!ok)
-				continue;
-			nodes.insert(((size_t)c[0]*dim.ny + c[1])*dim.nz + c[2]);
 		}
-	}
+		return nodes;
+	};
+	auto keep = [&](size_t node) {
+		const unsigned int c[3] = {(unsigned int)(node/((size_t)dim.ny*dim.nz)), (unsigned int)((node/dim.nz)%dim.ny), (unsigned int)(node%dim.nz)};
+		// main nodes only, the region kernels update the others after the extensions
+		return ((c[0]>=main_start.nx) && (c[0]<main_stop.nx) && (c[1]>=main_start.ny) && (c[1]<main_stop.ny) && (c[2]>=main_start.nz) && (c[2]<main_stop.nz))
+		       || (fregions.count>0);
+	};
+	// the nodes of the other extensions first (recomputed every step), then those only an excitation's voltages
+	// reach (recomputed on the steps an excitation changed a voltage, see UpdateCurrents): each node once, so
+	// skipping the second part on the other steps recomputes nothing that changed (bit-identical)
+	const std::set<size_t> persistent = nodes_of(volt_modified);
+	const std::set<size_t> excited = nodes_of(volt_modified_exc);
 	std::vector<size_t> list;
-	for (std::set<size_t>::const_iterator it=nodes.begin(); it!=nodes.end(); ++it)
-	{
-		const unsigned int c[3] = {(unsigned int)(*it/((size_t)dim.ny*dim.nz)), (unsigned int)((*it/dim.nz)%dim.ny), (unsigned int)(*it%dim.nz)};
-		if ((c[0]>=main_start.nx) && (c[0]<main_stop.nx) && (c[1]>=main_start.ny) && (c[1]<main_stop.ny) && (c[2]>=main_start.nz) && (c[2]<main_stop.nz))
-			list.push_back(*it);   // main nodes only, the region kernels update the others after the extensions
-		else if (fregions.count)
-			list.push_back(*it);
-	}
+	for (size_t node : persistent)
+		if (keep(node))
+			list.push_back(node);
+	const size_t n_persistent = list.size();
+	for (size_t node : excited)
+		if (!persistent.count(node) && keep(node))
+			list.push_back(node);
 	// The buffers are allocated last, after the field dumps: without them the run is only slower.
 	volt_next = TryAlloc<float>(3*numCells);
 	curr_next = TryAlloc<float>(3*numCells);
@@ -751,6 +768,7 @@ bool GPU_Backend_HIP::Impl::DecideFusedStep()
 		return false;
 	}
 	fixup_count = list.size();
+	fixup_persistent = n_persistent;
 	fixup = Alloc<size_t>(fixup_count, list.data());
 
 	// both buffers start with the current fields
@@ -1205,9 +1223,11 @@ void GPU_Backend_HIP::UpdateCurrents()
 	if (d->fused_step>0)
 	{
 		// done by update_fused, but for the currents next to voltages changed by extensions since
-		if (d->fixup_count)
-			HIP_Launch(d, "update_currents_nodes", update_currents_nodes, d->fixup_count, 1, 1, (const float*)d->curr, d->curr_next, (const float*)d->volt,
-			            (const size_t*)d->fixup, d->fixup_count, (const void*)d->index,
+		const unsigned int count = d->exc_changed_volt ? d->fixup_count : d->fixup_persistent;
+		d->exc_changed_volt = false;
+		if (count)
+			HIP_Launch(d, "update_currents_nodes", update_currents_nodes, count, 1, 1, (const float*)d->curr, d->curr_next, (const float*)d->volt,
+			            (const size_t*)d->fixup, count, (const void*)d->index,
 			            (const float*)(c ? d->coeff : d->ii), (const float*)(c ? d->coeff : d->iv), d->coeff_mode, d->dim, d->fregions);
 		std::swap(d->curr, d->curr_next);
 		return;

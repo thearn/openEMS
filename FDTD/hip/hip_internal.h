@@ -174,13 +174,17 @@ struct GPU_Backend_HIP::Impl
 	int fused_step;                          //!< -1: not decided yet, 0: off, 1: on
 	int fused_blockers;                      //!< extensions or grids that do not allow it
 	float *volt_next, *curr_next;
-	std::vector<size_t> volt_modified;       //!< flat indices of the voltages the extensions register as changed between the half-steps (excitation, lumped RLC)
+	std::vector<size_t> volt_modified;       //!< flat indices of the voltages the extensions register as changed between the half-steps (lumped RLC, Mur ABC, ADE)
+	std::vector<size_t> volt_modified_exc;   //!< those of the soft excitations: changed only on steps an entry is in its window
+	bool exc_changed_volt;                   //!< an excitation changed a voltage this step (its fix-up nodes are recomputed)
 	HIP_FusedRegions fregions;              //!< the UPML regions in the kernel (see HIP_Ext_UPML::CanFuse())
 	std::vector<HIP_ADECandidate> ade_candidates; //!< voltage ADE groups of the extensions (see HIP_ADECandidate)
 	HIP_FusedADE fade;                      //!< the group applied in the fused kernel (count 0: none)
 	int fold_group;                         //!< index of that group in ade_candidates (-1: none)
 	size_t* fixup;                           //!< main nodes whose currents are recomputed after the voltage extensions
 	unsigned int fixup_count;
+	unsigned int fixup_persistent;           //!< the first fixup_persistent nodes read a voltage of an extension other than an excitation;
+	                                         //!< the rest only excitation voltages, recomputed on the steps an excitation changed one
 	bool index32;                            //!< the fused step indexes with 32 bit (see Init())
 	//! Decide once whether the fused step is used, and prepare it
 	bool DecideFusedStep();

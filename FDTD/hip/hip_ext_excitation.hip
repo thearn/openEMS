@@ -71,7 +71,7 @@ class HIP_Ext_Excitation : public GPU_Extension
 public:
 	HIP_Ext_Excitation(GPU_Backend_HIP::Impl* impl, Operator_Ext_Excitation* op_ext, Engine* eng);
 
-	virtual void Apply2Voltages() {Apply(m_Volt, d->volt);}
+	virtual void Apply2Voltages() {if (Apply(m_Volt, d->volt)) d->exc_changed_volt = true;}
 	virtual void Apply2Current() {Apply(m_Curr, d->curr);}
 
 protected:
@@ -92,7 +92,8 @@ protected:
 
 	void Setup(Sources& s, unsigned int count, unsigned int* const index[3], const unsigned short* dir,
 	           const FDTD_FLOAT* amp, const unsigned int* delay, const FDTD_FLOAT* signal);
-	void Apply(Sources& s, float* field);
+	//! false when no entry is in its window this step (nothing added)
+	bool Apply(Sources& s, float* field);
 
 	GPU_Backend_HIP::Impl* d;
 	Operator_Ext_Excitation* m_Op_Exc;
@@ -113,7 +114,7 @@ HIP_Ext_Excitation::HIP_Ext_Excitation(GPU_Backend_HIP::Impl* impl, Operator_Ext
 	// fused step (see update_fused): the currents next to the excited voltages are recomputed;
 	// excited currents on the last mesh lines (never updated) would differ between its buffers
 	for (unsigned int n=0; n<op_ext->Volt_Count; ++n)
-		d->volt_modified.push_back((((size_t)op_ext->Volt_dir[n]*d->dim.nx + op_ext->Volt_index[0][n])*d->dim.ny + op_ext->Volt_index[1][n])*d->dim.nz + op_ext->Volt_index[2][n]);
+		d->volt_modified_exc.push_back((((size_t)op_ext->Volt_dir[n]*d->dim.nx + op_ext->Volt_index[0][n])*d->dim.ny + op_ext->Volt_index[1][n])*d->dim.nz + op_ext->Volt_index[2][n]);
 	for (unsigned int n=0; n<op_ext->Curr_Count; ++n)
 		if ((op_ext->Curr_index[0][n]+1>=d->dim.nx) || (op_ext->Curr_index[1][n]+1>=d->dim.ny) || (op_ext->Curr_index[2][n]+1>=d->dim.nz))
 			d->fused_blockers++;
@@ -171,10 +172,10 @@ void HIP_Ext_Excitation::Setup(Sources& s, unsigned int count, unsigned int* con
 	s.signal = d->Alloc<float>(m_Op_Exc->m_Exc->GetLength(), signal);
 }
 
-void HIP_Ext_Excitation::Apply(Sources& s, float* field)
+bool HIP_Ext_Excitation::Apply(Sources& s, float* field)
 {
 	if (s.count==0)
-		return;
+		return false;
 
 	ExcitationParam param;
 	param.numTS = m_Eng->GetNumberOfTimesteps();
@@ -188,7 +189,7 @@ void HIP_Ext_Excitation::Apply(Sources& s, float* field)
 	// every entry outside its window (before the first delay, or after the last delay's whole signal): nothing to add
 	if (s.zero_start && !periodic &&
 	    ((param.numTS<=(int)s.min_delay) || (param.numTS>=(int)s.max_delay+param.length)))
-		return;
+		return false;
 
 	if (s.serial)
 		HIP_Launch(d, "excitation_apply_segments", excitation_apply_segments, s.num_segments, 1, 1,
@@ -197,6 +198,7 @@ void HIP_Ext_Excitation::Apply(Sources& s, float* field)
 	else
 		HIP_Launch(d, "excitation_apply", excitation_apply, s.count, 1, 1,
 		            field, (const size_t*)s.index, (const float*)s.amp, (const unsigned int*)s.delay, (const float*)s.signal, param);
+	return true;
 }
 
 GPU_Extension* HIP_CreateExt_Excitation(GPU_Backend_HIP::Impl* d, Engine_Extension* eng_ext, Engine* eng)
